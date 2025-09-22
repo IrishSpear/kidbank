@@ -13,6 +13,8 @@ and rewards in an easy-to-read and fully tested code base.
   progress with percentage calculations.
 - **Comprehensive statements** – generate readable account summaries that list
   recent activity, goals, and rewards.
+- **Investing** – simulate portfolios with certificates of deposit that earn
+  interest at an adjustable rate.
 - **Test coverage** – unit tests exercise the core behaviours to keep the
   system reliable.
 

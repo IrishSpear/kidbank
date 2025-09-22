@@ -2080,7 +2080,11 @@ def admin_chore_payout(request: Request, instance_id: int = Form(...), amount: s
         child = session.exec(select(Child).where(Child.kid_id == chore.kid_id)).first()
         if not child:
             return RedirectResponse("/admin", status_code=302)
-        payout_c = chore.award_cents if not amount.strip() else to_cents_from_dollars_str(amount, chore.award_cents)
+        raw_amount = (amount or "").strip()
+        if not raw_amount:
+            body = "<div class='card'><p style='color:#ff6b6b;'>Enter an override amount before approving the payout.</p><p><a href='/admin'>Back to admin</a></p></div>"
+            return HTMLResponse(frame("Admin", body), status_code=400)
+        payout_c = to_cents_from_dollars_str(raw_amount, chore.award_cents)
         payout_c = max(0, payout_c)
         child.balance_cents += payout_c
         child.updated_at = datetime.utcnow()

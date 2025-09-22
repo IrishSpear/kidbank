@@ -86,3 +86,21 @@ def test_transfer_moves_funds_between_accounts() -> None:
 
     with pytest.raises(InsufficientFundsError):
         giver.transfer_to(receiver, 100)
+
+
+def test_generate_statement_includes_goals_and_rewards() -> None:
+    account = Account("Ava")
+    account.deposit(Decimal("30.00"), "Weekly allowance")
+    account.add_goal("Bicycle", 100, description="Big goal for summer")
+    account.contribute_to_goal("Bicycle", Decimal("20.00"))
+    account.redeem_reward("Sticker pack", 3)
+
+    statement = account.generate_statement()
+
+    assert "Account holder: Ava" in statement
+    assert "Recent transactions:" in statement
+    assert "Savings goals:" in statement
+    assert "Bicycle" in statement
+    assert "20.0%" in statement  # 20 / 100 saved
+    assert "Redeemed rewards:" in statement
+    assert "Sticker pack" in statement
