@@ -237,6 +237,8 @@ def run_migrations() -> None:
             );
             """
         )
+        if not _column_exists(raw, "certificate", "matured_at"):
+            raw.execute("ALTER TABLE certificate ADD COLUMN matured_at TEXT;")
         raw.execute(
             """
             CREATE TABLE IF NOT EXISTS investmenttx (
