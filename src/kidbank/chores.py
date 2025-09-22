@@ -1,0 +1,324 @@
+"""Chore scheduling, streak logic and pack handling for KidBank."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from datetime import datetime, time, timedelta
+from decimal import Decimal
+from enum import IntEnum
+from typing import Dict, List, Optional, Sequence
+
+
+class Weekday(IntEnum):
+    """Enum representing days of the week for scheduling."""
+
+    MONDAY = 0
+    TUESDAY = 1
+    WEDNESDAY = 2
+    THURSDAY = 3
+    FRIDAY = 4
+    SATURDAY = 5
+    SUNDAY = 6
+
+    @classmethod
+    def from_datetime(cls, moment: datetime) -> "Weekday":
+        return cls(moment.weekday())
+
+
+@dataclass(slots=True)
+class TimeWindow:
+    """Simple inclusive time window constraint for a chore."""
+
+    start: time | None = None
+    end: time | None = None
+
+    def includes(self, moment: datetime) -> bool:
+        if not self.start and not self.end:
+            return True
+        current = moment.time()
+        if self.start and current < self.start:
+            return False
+        if self.end and current > self.end:
+            return False
+        return True
+
+
+@dataclass(slots=True)
+class ChoreSchedule:
+    """Schedule describing when a chore should be available."""
+
+    weekdays: frozenset[Weekday]
+    window: TimeWindow | None = None
+
+    def is_due(self, moment: datetime) -> bool:
+        return Weekday.from_datetime(moment) in self.weekdays and (
+            self.window is None or self.window.includes(moment)
+        )
+
+    @classmethod
+    def daily(cls) -> "ChoreSchedule":
+        return cls(weekdays=frozenset(Weekday), window=None)
+
+
+@dataclass(slots=True)
+class ChoreCompletion:
+    """Represents a single completion entry for a chore."""
+
+    chore_name: str
+    timestamp: datetime
+    base_value: Decimal
+    multiplier: Decimal
+    proof: Optional[str]
+
+    @property
+    def awarded_value(self) -> Decimal:
+        return (self.base_value * self.multiplier).quantize(Decimal("0.01"))
+
+
+@dataclass(slots=True)
+class Chore:
+    """A chore with scheduling information and streak logic."""
+
+    name: str
+    value: Decimal
+    schedule: ChoreSchedule
+    requires_proof: bool = False
+    proof_type: str | None = None  # "photo" or "note"
+    pending_since: Optional[datetime] = None
+    last_completed: Optional[datetime] = None
+    streak: int = 0
+    history: List[ChoreCompletion] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if self.requires_proof and not self.proof_type:
+            raise ValueError("Proof type must be provided for special chores.")
+        self.value = Decimal(self.value).quantize(Decimal("0.01"))
+
+    def multiplier(self) -> Decimal:
+        """Return the multiplier associated with the current streak."""
+
+        if self.streak >= 7:
+            bonus_steps = self.streak - 6
+            return (Decimal("1.0") + (Decimal("0.1") * bonus_steps)).quantize(Decimal("0.01"))
+        return Decimal("1.0")
+
+    def current_value(self) -> Decimal:
+        return (self.value * self.multiplier()).quantize(Decimal("0.01"))
+
+    def mark_completed(self, *, at: Optional[datetime] = None, proof: Optional[str] = None) -> ChoreCompletion:
+        moment = at or datetime.utcnow()
+        if self.requires_proof and not proof:
+            raise ValueError("Proof is required to complete this chore.")
+        if proof and not self.requires_proof and not proof.strip():
+            proof = None
+        if not self.schedule.is_due(moment):
+            # Allow completion but do not update streak when outside scheduled window
+            self.pending_since = None
+            completion = ChoreCompletion(
+                chore_name=self.name,
+                timestamp=moment,
+                base_value=self.value,
+                multiplier=Decimal("1.0"),
+                proof=proof,
+            )
+            self.history.append(completion)
+            self.last_completed = moment
+            self.streak = 1
+            return completion
+
+        last = self.last_completed.date() if self.last_completed else None
+        today = moment.date()
+        if last and (today - last) == timedelta(days=1):
+            self.streak += 1
+        elif last == today:
+            # repeat completion in same day keeps streak as-is
+            pass
+        else:
+            self.streak = 1
+        completion = ChoreCompletion(
+            chore_name=self.name,
+            timestamp=moment,
+            base_value=self.value,
+            multiplier=self.multiplier(),
+            proof=proof,
+        )
+        self.history.append(completion)
+        self.last_completed = moment
+        self.pending_since = None
+        return completion
+
+    def advance_day(self, *, at: Optional[datetime] = None) -> bool:
+        """Mark the chore as pending if due but not completed."""
+
+        moment = at or datetime.utcnow()
+        if self.schedule.is_due(moment):
+            if self.last_completed and self.last_completed.date() == moment.date():
+                self.pending_since = None
+                return False
+            if not self.pending_since or self.pending_since.date() != moment.date():
+                self.pending_since = datetime.combine(moment.date(), time())
+                return True
+        else:
+            # reset pending flag if outside schedule
+            if self.pending_since and self.pending_since.date() < moment.date():
+                self.pending_since = None
+        return False
+
+    def pending_for_hours(self, hours: int, *, at: Optional[datetime] = None) -> bool:
+        if not self.pending_since:
+            return False
+        moment = at or datetime.utcnow()
+        return moment - self.pending_since >= timedelta(hours=hours)
+
+
+@dataclass(slots=True)
+class ChorePack:
+    """Group of chores that can be completed together."""
+
+    name: str
+    chore_names: Sequence[str]
+    bonus_value: Decimal = Decimal("0.00")
+    description: str = ""
+    last_completed: Optional[datetime] = None
+
+    def includes(self, chore_name: str) -> bool:
+        return chore_name in self.chore_names
+
+
+class ChoreBoard:
+    """Manage chores and completions for a single child."""
+
+    def __init__(self) -> None:
+        self._chores: Dict[str, Chore] = {}
+        self._packs: Dict[str, ChorePack] = {}
+        self._completions: List[ChoreCompletion] = []
+
+    def add_chore(self, chore: Chore) -> None:
+        if chore.name in self._chores:
+            raise ValueError(f"Chore '{chore.name}' already exists.")
+        self._chores[chore.name] = chore
+
+    def chores(self) -> Sequence[Chore]:
+        return tuple(self._chores.values())
+
+    def remove_chore(self, name: str) -> None:
+        self._chores.pop(name, None)
+
+    def get(self, name: str) -> Chore:
+        try:
+            return self._chores[name]
+        except KeyError as exc:
+            raise KeyError(f"Unknown chore '{name}'.") from exc
+
+    def schedule_pack(self, pack: ChorePack) -> None:
+        if pack.name in self._packs:
+            raise ValueError(f"Pack '{pack.name}' already exists.")
+        for name in pack.chore_names:
+            if name not in self._chores:
+                raise ValueError(f"Chore '{name}' must exist before creating a pack.")
+        self._packs[pack.name] = pack
+
+    def deactivate_pack(self, name: str) -> None:
+        self._packs.pop(name, None)
+
+    def complete_chore(
+        self,
+        name: str,
+        *,
+        at: Optional[datetime] = None,
+        proof: Optional[str] = None,
+    ) -> ChoreCompletion:
+        chore = self.get(name)
+        completion = chore.mark_completed(at=at, proof=proof)
+        self._completions.append(completion)
+        return completion
+
+    def complete_pack(self, name: str, *, at: Optional[datetime] = None) -> Decimal:
+        pack = self._packs.get(name)
+        if not pack:
+            raise KeyError(f"Pack '{name}' does not exist.")
+        moment = at or datetime.utcnow()
+        chore_dates = [self._chores[chore_name].last_completed for chore_name in pack.chore_names]
+        if not all(chore_dates):
+            raise ValueError("All chores in the pack must be completed before claiming the pack bonus.")
+        reference_date = moment.date()
+        if not all(entry.date() == reference_date for entry in chore_dates if entry):
+            raise ValueError("Pack bonus must be claimed on the day chores were completed.")
+        pack.last_completed = moment
+        bonus = Decimal(pack.bonus_value).quantize(Decimal("0.01"))
+        if bonus <= Decimal("0.00"):
+            return Decimal("0.00")
+        completion = ChoreCompletion(
+            chore_name=pack.name,
+            timestamp=moment,
+            base_value=bonus,
+            multiplier=Decimal("1.0"),
+            proof=None,
+        )
+        self._completions.append(completion)
+        return completion.awarded_value
+
+    def auto_republish(self, *, at: Optional[datetime] = None) -> Sequence[str]:
+        moment = at or datetime.utcnow()
+        republished: List[str] = []
+        for chore in self._chores.values():
+            if chore.advance_day(at=moment):
+                republished.append(chore.name)
+        return tuple(republished)
+
+    def pending(self, *, at: Optional[datetime] = None) -> Sequence[Chore]:
+        moment = at or datetime.utcnow()
+        return tuple(chore for chore in self._chores.values() if chore.advance_day(at=moment) or chore.pending_since)
+
+    def pending_overdue(self, hours: int, *, at: Optional[datetime] = None) -> Sequence[Chore]:
+        moment = at or datetime.utcnow()
+        overdue: List[Chore] = []
+        for chore in self._chores.values():
+            chore.advance_day(at=moment)
+            if chore.pending_for_hours(hours, at=moment):
+                overdue.append(chore)
+        return tuple(overdue)
+
+    def completions_since(self, since: datetime) -> Sequence[ChoreCompletion]:
+        return tuple(entry for entry in self._completions if entry.timestamp >= since)
+
+    def streak(self, name: str) -> int:
+        return self.get(name).streak
+
+    def multiplier(self, name: str) -> Decimal:
+        return self.get(name).multiplier()
+
+    def special_chores(self) -> Sequence[Chore]:
+        return tuple(chore for chore in self._chores.values() if chore.requires_proof)
+
+    def completion_rate(self, *, days: int = 7, at: Optional[datetime] = None) -> Decimal:
+        if not self._chores:
+            return Decimal("0")
+        moment = at or datetime.utcnow()
+        start = moment - timedelta(days=days)
+        completions = [entry for entry in self._completions if entry.timestamp >= start]
+        expected = len(self._chores) * days
+        if expected == 0:
+            return Decimal("0")
+        ratio = Decimal(len(completions)) / Decimal(expected)
+        return max(Decimal("0"), min(ratio.quantize(Decimal("0.01")), Decimal("1.00")))
+
+    def total_completions(self) -> int:
+        return len(self._completions)
+
+    def leaderboard_score(self) -> int:
+        return sum(int(entry.awarded_value) for entry in self._completions)
+
+    def goal_gallery(self) -> Sequence[str]:
+        return tuple(self._chores)
+
+
+__all__ = [
+    "Chore",
+    "ChoreBoard",
+    "ChoreCompletion",
+    "ChorePack",
+    "ChoreSchedule",
+    "TimeWindow",
+    "Weekday",
+]
