@@ -61,3 +61,35 @@ print(ava.generate_statement())
 ```bash
 python -m pytest
 ```
+
+## Running the web frontend
+
+The project now ships with a self-contained FastAPI frontend that persists data
+in SQLite.  It reuses the KidBank domain model to provide parent and kid
+dashboards, chores, allowances, goal tracking, rewards, CSV export, and the
+stock-investing simulator described in the feature list.
+
+1. Install the optional web dependencies:
+
+   ```bash
+   pip install fastapi uvicorn sqlmodel python-dotenv
+   ```
+
+2. (Optional) create a `.env` file with custom PINs and session secret:
+
+   ```env
+   MOM_PIN=1234
+   DAD_PIN=9876
+   SESSION_SECRET=replace-me
+   ```
+
+3. Launch the app:
+
+   ```bash
+   uvicorn kidbank.webapp:app --reload --host 0.0.0.0 --port 8000
+   ```
+
+Deploying into a Debian-based Proxmox LXC container only requires installing
+the dependencies above, copying the repository, and starting Uvicorn.  The
+SQLite database (`kidbank.db` by default) lives alongside the application and
+will be created with all tables and migrations automatically on first run.
