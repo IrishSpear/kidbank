@@ -22,7 +22,6 @@ import os
 import sqlite3
 from decimal import Decimal, ROUND_HALF_UP
 from datetime import date, datetime, timedelta
-from html import escape
 from typing import Iterable, List, Literal, Optional, Tuple
 from urllib.error import HTTPError, URLError
 from urllib.request import Request as URLRequest, urlopen
@@ -134,21 +133,6 @@ class Goal(SQLModel, table=True):
     achieved_at: Optional[datetime] = None
 
 
- codex/add-payout-button-features-and-enhancements-jq7osw
-class PeerRequest(SQLModel, table=True):
-    id: Optional[int] = Field(default=None, primary_key=True)
-    requester_kid: str
-    target_kid: str
-    amount_cents: int
-    reason: str = ""
-    status: str = "pending"
-    created_at: datetime = Field(default_factory=datetime.utcnow)
-    resolved_at: Optional[datetime] = None
-    resolved_by: Optional[str] = None
-
-
-
-main
 class Certificate(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     kid_id: str
@@ -240,11 +224,6 @@ def run_migrations() -> None:
             );
             """
         )
-        codex/add-payout-button-features-and-enhancements-jq7osw
-        if not _column_exists(raw, "certificate", "matured_at"):
-            raw.execute("ALTER TABLE certificate ADD COLUMN matured_at TEXT;")
-      
-        main
         raw.execute(
             """
             CREATE TABLE IF NOT EXISTS investmenttx (
@@ -257,21 +236,6 @@ def run_migrations() -> None:
                 price_cents INTEGER,
                 amount_cents INTEGER,
                 realized_pl_cents INTEGER
-            );
-            """
-        )
-        raw.execute(
-            """
-            CREATE TABLE IF NOT EXISTS peerrequest (
-                id INTEGER PRIMARY KEY,
-                requester_kid TEXT,
-                target_kid TEXT,
-                amount_cents INTEGER,
-                reason TEXT,
-                status TEXT,
-                created_at TEXT,
-                resolved_at TEXT,
-                resolved_by TEXT
             );
             """
         )
@@ -1049,128 +1013,12 @@ def kid_home(request: Request) -> HTMLResponse:
                 .where(Goal.kid_id == kid_id)
                 .order_by(desc(Goal.created_at))
             ).all()
-            siblings = session.exec(
-                select(Child)
-                .where(Child.kid_id != kid_id)
-                .order_by(Child.name)
-            ).all()
-            incoming_requests = session.exec(
-                select(PeerRequest)
-                .where(PeerRequest.target_kid == kid_id)
-                .where(PeerRequest.status == "pending")
-                .order_by(desc(PeerRequest.created_at))
-            ).all()
-            outgoing_requests = session.exec(
-                select(PeerRequest)
-                .where(PeerRequest.requester_kid == kid_id)
-                .order_by(desc(PeerRequest.created_at))
-                .limit(20)
-            ).all()
         event_rows = "".join(
             f"<tr><td data-label='When'>{event.timestamp.strftime('%Y-%m-%d %H:%M')}</td>"
             f"<td data-label='Δ Amount' class='right'>{'+' if event.change_cents>=0 else ''}{usd(event.change_cents)}</td>"
             f"<td data-label='Reason'>{event.reason}</td></tr>"
             for event in events
         ) or "<tr><td>(no events)</td></tr>"
-        kid_names = {child.kid_id: child.name}
-        for sibling in siblings:
-            kid_names[sibling.kid_id] = sibling.name
-
-        def kid_label(kid: str) -> str:
-            name = kid_names.get(kid, kid)
-            return f"{escape(name)} <span class='muted'>({escape(kid)})</span>"
-
-        def reason_display(text: Optional[str]) -> str:
-            val = (text or "").strip()
-            if not val:
-                return "<span class='muted'>(no reason)</span>"
-            return escape(val)
-
-        sibling_options = "".join(
-            f"<option value='{escape(s.kid_id)}'>{escape(s.name)} ({escape(s.kid_id)})</option>"
-            for s in siblings
-        )
-        select_prompt = (
-            "<option value='' disabled selected>Pick a sibling</option>" + sibling_options
-            if sibling_options
-            else ""
-        )
-        if sibling_options:
-            send_form = (
-                "<form method='post' action='/kid/send'>"
-                "<label>Send to</label>"
-                f"<select name='to_kid' required>{select_prompt}</select>"
-                "<input name='amount' type='text' data-money placeholder='amount $' required>"
-                "<textarea name='reason' placeholder='Why are you sending money?' rows='2'></textarea>"
-                "<button type='submit' style='margin-top:6px;'>Send Money</button>"
-                "</form>"
-            )
-            request_form = (
-                "<form method='post' action='/kid/request_money' style='margin-top:12px;'>"
-                "<label>Request from</label>"
-                f"<select name='target_kid' required>{select_prompt}</select>"
-                "<input name='amount' type='text' data-money placeholder='amount $' required>"
-                "<textarea name='reason' placeholder='Why do you need it?' rows='2'></textarea>"
-                "<button type='submit' style='margin-top:6px;'>Request Money</button>"
-                "</form>"
-            )
-        else:
-            send_form = "<p class='muted'>No other kids are linked yet for transfers.</p>"
-            request_form = ""
-
-        incoming_rows = "".join(
-            (
-                "<tr>"
-                f"<td data-label='From'>{kid_label(req.requester_kid)}</td>"
-                f"<td data-label='Amount' class='right'>{usd(req.amount_cents)}</td>"
-                f"<td data-label='Reason'>{reason_display(req.reason)}</td>"
-                f"<td data-label='Requested' class='muted'>{req.created_at.strftime('%Y-%m-%d %H:%M')}</td>"
-                "<td data-label='Actions' class='right'>"
-                f"<form method='post' action='/kid/request/respond' class='inline'>"
-                f"<input type='hidden' name='request_id' value='{req.id}'>"
-                "<input type='hidden' name='action' value='fulfill'>"
-                "<button type='submit'>Send</button></form> "
-                f"<form method='post' action='/kid/request/respond' class='inline' style='margin-left:4px;'>"
-                f"<input type='hidden' name='request_id' value='{req.id}'>"
-                "<input type='hidden' name='action' value='decline'>"
-                "<button type='submit' class='danger'>Decline</button></form>"
-                "</td>"
-                "</tr>"
-            )
-            for req in incoming_requests
-        ) or "<tr><td colspan='5' class='muted'>(no pending requests)</td></tr>"
-
-        def status_badge(req: PeerRequest) -> str:
-            if req.status == "fulfilled":
-                return "<span class='pill' style='background:var(--good);'>Fulfilled</span>"
-            if req.status == "declined":
-                return "<span class='pill' style='background:var(--bad);'>Declined</span>"
-            if req.status == "cancelled":
-                return "<span class='pill'>Cancelled</span>"
-            return "<span class='pill'>Pending</span>"
-
-        outgoing_rows = "".join(
-            (
-                "<tr>"
-                f"<td data-label='To'>{kid_label(req.target_kid)}</td>"
-                f"<td data-label='Amount' class='right'>{usd(req.amount_cents)}</td>"
-                f"<td data-label='Reason'>{reason_display(req.reason)}</td>"
-                f"<td data-label='Status'>{status_badge(req)}</td>"
-                f"<td data-label='Requested' class='muted'>{req.created_at.strftime('%Y-%m-%d %H:%M')}</td>"
-                "<td data-label='Actions' class='right'>"
-                + (
-                    f"<form method='post' action='/kid/request/cancel' class='inline'>"
-                    f"<input type='hidden' name='request_id' value='{req.id}'>"
-                    "<button type='submit'>Cancel</button></form>"
-                    if req.status == "pending"
-                    else ""
-                )
-                + "</td>"
-                "</tr>"
-            )
-            for req in outgoing_requests
-        ) or "<tr><td colspan='6' class='muted'>(no requests yet)</td></tr>"
-
         chore_cards = ""
         for chore, inst in chores:
             status = inst.status if inst else "available"
@@ -1211,24 +1059,6 @@ def kid_home(request: Request) -> HTMLResponse:
             for goal in goals
         ) or "<tr><td>(no goals)</td></tr>"
         investing_card = _safe_investing_card(kid_id)
-        peer_card = f"""
-          <div class='card'>
-            <h3>Send &amp; Request Money</h3>
-            <p class='muted'>Share funds with siblings and explain why.</p>
-            {send_form}
-            {request_form}
-            <h4 style='margin-top:12px;'>Requests for Me</h4>
-            <table>
-              <tr><th>From</th><th>Amount</th><th>Reason</th><th>Requested</th><th>Actions</th></tr>
-              {incoming_rows}
-            </table>
-            <h4 style='margin-top:12px;'>My Requests</h4>
-            <table>
-              <tr><th>To</th><th>Amount</th><th>Reason</th><th>Status</th><th>Requested</th><th>Actions</th></tr>
-              {outgoing_rows}
-            </table>
-          </div>
-        """
         inner = f"""
         <div class='card kiosk'>
           <div>
@@ -1243,7 +1073,6 @@ def kid_home(request: Request) -> HTMLResponse:
             {chore_cards}
           </div>
           {investing_card}
-          {peer_card}
           <div class='card'>
             <h3>My Goals</h3>
             <form method='post' action='/kid/goal_create' class='inline'>
@@ -1425,170 +1254,6 @@ def kid_goal_delete(request: Request, goal_id: int = Form(...)):
         session.delete(goal)
         child.updated_at = datetime.utcnow()
         session.add(child)
-        session.commit()
-    return RedirectResponse("/kid", status_code=302)
-
-
-@app.post("/kid/send")
-def kid_send_money(
-    request: Request,
-    to_kid: str = Form(...),
-    amount: str = Form(...),
-    reason: str = Form(""),
-):
-    if (redirect := require_kid(request)) is not None:
-        return redirect
-    kid_id = kid_authed(request)
-    assert kid_id
-    target = (to_kid or "").strip()
-    if not target or target == kid_id:
-        return RedirectResponse("/kid", status_code=302)
-    amount_c = to_cents_from_dollars_str(amount, 0)
-    if amount_c <= 0:
-        return RedirectResponse("/kid", status_code=302)
-    note = (reason or "").strip()
-    with Session(engine) as session:
-        sender = session.exec(select(Child).where(Child.kid_id == kid_id)).first()
-        recipient = session.exec(select(Child).where(Child.kid_id == target)).first()
-        if not sender or not recipient:
-            return RedirectResponse("/kid", status_code=302)
-        if amount_c > sender.balance_cents:
-            return RedirectResponse("/kid", status_code=302)
-        sender.balance_cents -= amount_c
-        recipient.balance_cents += amount_c
-        now = datetime.utcnow()
-        sender.updated_at = now
-        recipient.updated_at = now
-        suffix = f" ({note})" if note else ""
-        session.add(sender)
-        session.add(recipient)
-        session.add(
-            Event(
-                child_id=kid_id,
-                change_cents=-amount_c,
-                reason=f"peer_transfer_to:{target}{suffix}",
-            )
-        )
-        session.add(
-            Event(
-                child_id=target,
-                change_cents=amount_c,
-                reason=f"peer_transfer_from:{kid_id}{suffix}",
-            )
-        )
-        session.commit()
-    return RedirectResponse("/kid", status_code=302)
-
-
-@app.post("/kid/request_money")
-def kid_request_money(
-    request: Request,
-    target_kid: str = Form(...),
-    amount: str = Form(...),
-    reason: str = Form(""),
-):
-    if (redirect := require_kid(request)) is not None:
-        return redirect
-    kid_id = kid_authed(request)
-    assert kid_id
-    target = (target_kid or "").strip()
-    if not target or target == kid_id:
-        return RedirectResponse("/kid", status_code=302)
-    amount_c = to_cents_from_dollars_str(amount, 0)
-    if amount_c <= 0:
-        return RedirectResponse("/kid", status_code=302)
-    note = (reason or "").strip()
-    with Session(engine) as session:
-        sibling = session.exec(select(Child).where(Child.kid_id == target)).first()
-        if not sibling:
-            return RedirectResponse("/kid", status_code=302)
-        session.add(
-            PeerRequest(
-                requester_kid=kid_id,
-                target_kid=target,
-                amount_cents=amount_c,
-                reason=note,
-            )
-        )
-        session.commit()
-    return RedirectResponse("/kid", status_code=302)
-
-
-@app.post("/kid/request/respond")
-def kid_request_respond(
-    request: Request,
-    request_id: int = Form(...),
-    action: str = Form(...),
-):
-    if (redirect := require_kid(request)) is not None:
-        return redirect
-    kid_id = kid_authed(request)
-    assert kid_id
-    action_name = (action or "").strip().lower()
-    with Session(engine) as session:
-        peer_request = session.get(PeerRequest, request_id)
-        if not peer_request or peer_request.status != "pending" or peer_request.target_kid != kid_id:
-            return RedirectResponse("/kid", status_code=302)
-        if action_name == "fulfill":
-            payer = session.exec(select(Child).where(Child.kid_id == kid_id)).first()
-            receiver = session.exec(select(Child).where(Child.kid_id == peer_request.requester_kid)).first()
-            if not payer or not receiver or peer_request.amount_cents <= 0:
-                return RedirectResponse("/kid", status_code=302)
-            if peer_request.amount_cents > payer.balance_cents:
-                return RedirectResponse("/kid", status_code=302)
-            payer.balance_cents -= peer_request.amount_cents
-            receiver.balance_cents += peer_request.amount_cents
-            now = datetime.utcnow()
-            payer.updated_at = now
-            receiver.updated_at = now
-            suffix = ""
-            note = (peer_request.reason or "").strip()
-            if note:
-                suffix = f" ({note})"
-            session.add(payer)
-            session.add(receiver)
-            session.add(
-                Event(
-                    child_id=kid_id,
-                    change_cents=-peer_request.amount_cents,
-                    reason=f"peer_request_pay:{peer_request.requester_kid}{suffix}",
-                )
-            )
-            session.add(
-                Event(
-                    child_id=peer_request.requester_kid,
-                    change_cents=peer_request.amount_cents,
-                    reason=f"peer_request_receive:{kid_id}{suffix}",
-                )
-            )
-            peer_request.status = "fulfilled"
-            peer_request.resolved_at = datetime.utcnow()
-            peer_request.resolved_by = kid_id
-            session.add(peer_request)
-            session.commit()
-        elif action_name == "decline":
-            peer_request.status = "declined"
-            peer_request.resolved_at = datetime.utcnow()
-            peer_request.resolved_by = kid_id
-            session.add(peer_request)
-            session.commit()
-    return RedirectResponse("/kid", status_code=302)
-
-
-@app.post("/kid/request/cancel")
-def kid_request_cancel(request: Request, request_id: int = Form(...)):
-    if (redirect := require_kid(request)) is not None:
-        return redirect
-    kid_id = kid_authed(request)
-    assert kid_id
-    with Session(engine) as session:
-        peer_request = session.get(PeerRequest, request_id)
-        if not peer_request or peer_request.status != "pending" or peer_request.requester_kid != kid_id:
-            return RedirectResponse("/kid", status_code=302)
-        peer_request.status = "cancelled"
-        peer_request.resolved_at = datetime.utcnow()
-        peer_request.resolved_by = kid_id
-        session.add(peer_request)
         session.commit()
     return RedirectResponse("/kid", status_code=302)
 
