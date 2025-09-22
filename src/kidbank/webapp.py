@@ -134,6 +134,7 @@ class Goal(SQLModel, table=True):
     achieved_at: Optional[datetime] = None
 
 
+ codex/add-payout-button-features-and-enhancements-jq7osw
 class PeerRequest(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     requester_kid: str
@@ -146,6 +147,8 @@ class PeerRequest(SQLModel, table=True):
     resolved_by: Optional[str] = None
 
 
+
+main
 class Certificate(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     kid_id: str
@@ -237,8 +240,11 @@ def run_migrations() -> None:
             );
             """
         )
+        codex/add-payout-button-features-and-enhancements-jq7osw
         if not _column_exists(raw, "certificate", "matured_at"):
             raw.execute("ALTER TABLE certificate ADD COLUMN matured_at TEXT;")
+      
+        main
         raw.execute(
             """
             CREATE TABLE IF NOT EXISTS investmenttx (
