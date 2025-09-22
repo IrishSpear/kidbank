@@ -20,6 +20,7 @@ import io
 import json
 import os
 import sqlite3
+from decimal import Decimal, ROUND_HALF_UP
 from datetime import date, datetime, timedelta
 from typing import Iterable, List, Literal, Optional, Tuple
 from urllib.error import HTTPError, URLError
@@ -132,6 +133,16 @@ class Goal(SQLModel, table=True):
     achieved_at: Optional[datetime] = None
 
 
+class Certificate(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    kid_id: str
+    principal_cents: int
+    rate_bps: int
+    term_months: int
+    opened_at: datetime = Field(default_factory=datetime.utcnow)
+    matured_at: Optional[datetime] = None
+
+
 class Investment(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     kid_id: str
@@ -202,6 +213,19 @@ def run_migrations() -> None:
         )
         raw.execute(
             """
+            CREATE TABLE IF NOT EXISTS certificate (
+                id INTEGER PRIMARY KEY,
+                kid_id TEXT,
+                principal_cents INTEGER,
+                rate_bps INTEGER,
+                term_months INTEGER,
+                opened_at TEXT,
+                matured_at TEXT
+            );
+            """
+        )
+        raw.execute(
+            """
             CREATE TABLE IF NOT EXISTS investmenttx (
                 id INTEGER PRIMARY KEY,
                 kid_id TEXT,
@@ -227,6 +251,10 @@ run_migrations()
 # ---------------------------------------------------------------------------
 # Money helpers
 # ---------------------------------------------------------------------------
+CD_RATE_KEY = "cd_rate_bps"
+DEFAULT_CD_RATE_BPS = 250
+
+
 def usd(cents: int) -> str:
     try:
         return f"${(cents or 0) / 100:.2f}"
@@ -249,6 +277,29 @@ def to_cents_from_dollars_str(raw: str, default: int = 0) -> int:
         return int(round(float(raw) * 100))
     except Exception:
         return default
+
+
+def percent_complete(saved: int, target: int) -> Optional[float]:
+    if target <= 0:
+        return None
+    pct = (saved / target) * 100 if target else 0
+    if pct < 0:
+        pct = 0
+    if pct > 100:
+        pct = 100
+    return pct
+
+
+def format_percent(pct: Optional[float]) -> str:
+    if pct is None:
+        return "—"
+    if pct <= 0:
+        return "0%"
+    if pct < 1:
+        return f"{pct:.1f}%"
+    if pct < 100:
+        return f"{pct:.0f}%"
+    return "100%"
 
 
 # ---------------------------------------------------------------------------
@@ -526,6 +577,59 @@ class MetaDAO:
             session.add(row)
         else:
             session.add(MetaKV(k=key, v=value))
+
+
+def get_cd_rate_bps(session: Session) -> int:
+    raw = MetaDAO.get(session, CD_RATE_KEY)
+    if raw is None:
+        return DEFAULT_CD_RATE_BPS
+    try:
+        rate = int(raw)
+    except ValueError:
+        return DEFAULT_CD_RATE_BPS
+    return max(0, rate)
+
+
+def certificate_term_days(certificate: Certificate) -> int:
+    return max(0, certificate.term_months) * 30
+
+
+def certificate_maturity_date(certificate: Certificate) -> datetime:
+    return certificate.opened_at + timedelta(days=certificate_term_days(certificate))
+
+
+def certificate_maturity_value_cents(certificate: Certificate) -> int:
+    principal = Decimal(certificate.principal_cents)
+    rate = Decimal(certificate.rate_bps) / Decimal(10000)
+    interest = (principal * rate).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+    return int(principal + interest)
+
+
+def certificate_value_cents(certificate: Certificate, *, at: Optional[datetime] = None) -> int:
+    principal = Decimal(certificate.principal_cents)
+    total_days = certificate_term_days(certificate)
+    if total_days <= 0:
+        return int(principal)
+    moment = at or datetime.utcnow()
+    if certificate.matured_at:
+        moment = max(moment, certificate.matured_at)
+    elapsed = max(0, min((moment - certificate.opened_at).days, total_days))
+    progress = Decimal(elapsed) / Decimal(total_days) if total_days else Decimal(0)
+    rate = Decimal(certificate.rate_bps) / Decimal(10000)
+    interest = (principal * rate * progress).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+    return int(principal + interest)
+
+
+def certificate_progress_percent(certificate: Certificate, *, at: Optional[datetime] = None) -> float:
+    if certificate.matured_at:
+        return 100.0
+    total_days = certificate_term_days(certificate)
+    if total_days <= 0:
+        return 100.0
+    moment = at or datetime.utcnow()
+    elapsed = max(0, min((moment - certificate.opened_at).days, total_days))
+    pct = (elapsed / total_days) * 100
+    return min(100.0, max(0.0, pct))
 
 
 def sunday_key(moment: datetime) -> str:
@@ -941,7 +1045,8 @@ def kid_home(request: Request) -> HTMLResponse:
             f"<tr><td data-label='Goal'><b>{goal.name}</b>"
             + (" <span class='pill' title='Goal reached'>Reached</span>" if goal.saved_cents >= goal.target_cents else "")
             + "</td>"
-            f"<td data-label='Saved' class='right'>{usd(goal.saved_cents)} / {usd(goal.target_cents)}</td>"
+            f"<td data-label='Saved' class='right'>{usd(goal.saved_cents)} / {usd(goal.target_cents)}"
+            f"<div class='muted'>{format_percent(percent_complete(goal.saved_cents, goal.target_cents))} complete</div></td>"
             "<td data-label='Actions' class='right'>"
             f"<form class='inline' method='post' action='/kid/goal_deposit'>"
             f"<input type='hidden' name='goal_id' value='{goal.id}'>"
@@ -1000,18 +1105,47 @@ def _safe_investing_card(kid_id: str) -> str:
     try:
         price_c = sp500_price_cents()
         shares = 0.0
+        cd_total_c = 0
+        cd_count = 0
+        ready_count = 0
+        rate_bps = DEFAULT_CD_RATE_BPS
+        moment = datetime.utcnow()
         with Session(engine) as session:
             holding = session.exec(
                 select(Investment).where(Investment.kid_id == kid_id, Investment.fund == "SP500")
             ).first()
             shares = holding.shares if holding else 0.0
+            certificates = session.exec(
+                select(Certificate)
+                .where(Certificate.kid_id == kid_id)
+                .where(Certificate.matured_at == None)  # noqa: E711
+                .order_by(desc(Certificate.opened_at))
+            ).all()
+            rate_bps = get_cd_rate_bps(session)
+        if certificates:
+            for certificate in certificates:
+                cd_total_c += certificate_value_cents(certificate, at=moment)
+                if moment >= certificate_maturity_date(certificate):
+                    ready_count += 1
+            cd_count = len(certificates)
         value_c = int(round(shares * price_c))
+        total_c = value_c + cd_total_c
+        rate_pct = rate_bps / 100
+        if cd_count:
+            ready_text = f" • {ready_count} ready" if ready_count else ""
+            cd_line = (
+                f"Certificates: <b>{usd(cd_total_c)}</b> across {cd_count} active{ready_text}"
+            )
+        else:
+            cd_line = "Certificates: <span class='muted'>none yet</span>"
         return f"""
           <div class='card'>
             <h3>Investing</h3>
-            <div class='muted'>S&amp;P 500 (cached every 5 min)</div>
-            <div style='margin-top:6px;'>Price: <b>{usd(price_c)}</b> • Shares: <b>{shares:.4f}</b> • Value: <b>{usd(value_c)}</b></div>
-            <a href='/kid/invest'><button style='margin-top:8px;'>Open Stock Simulator</button></a>
+            <div class='muted'>Stocks &amp; certificates of deposit</div>
+            <div style='margin-top:6px;'>Stocks: <b>{usd(value_c)}</b> ({shares:.4f} sh @ {usd(price_c)})</div>
+            <div style='margin-top:4px;'>{cd_line}</div>
+            <div class='muted' style='margin-top:4px;'>Total invested: <b>{usd(total_c)}</b> • CD rate {rate_pct:.2f}% APR</div>
+            <a href='/kid/invest'><button style='margin-top:8px;'>Open Investing Dashboard</button></a>
           </div>
         """
     except Exception:
@@ -1137,9 +1271,71 @@ def kid_invest_home(request: Request) -> HTMLResponse:
         with Session(engine) as session:
             child = session.exec(select(Child).where(Child.kid_id == kid_id)).first()
             balance_c = child.balance_cents if child else 0
+            certificates = session.exec(
+                select(Certificate)
+                .where(Certificate.kid_id == kid_id)
+                .order_by(desc(Certificate.opened_at))
+            ).all()
+            rate_bps = get_cd_rate_bps(session)
 
         def fmt(value: int) -> str:
             return f"{'+' if value >= 0 else ''}{usd(value)}"
+
+        moment = datetime.utcnow()
+        cd_total_c = 0
+        matured_ready = 0
+        next_maturity: Optional[datetime] = None
+        cert_rows = ""
+        for certificate in certificates:
+            value_c = certificate_value_cents(certificate, at=moment)
+            maturity = certificate_maturity_date(certificate)
+            progress_pct = certificate_progress_percent(certificate, at=moment)
+            rate_display = certificate.rate_bps / 100
+            if certificate.matured_at:
+                status = f"Cashed out on {certificate.matured_at.strftime('%Y-%m-%d')}"
+                progress_pct = 100.0
+            elif moment >= maturity:
+                status = "Matured — ready to cash out"
+                matured_ready += 1
+            else:
+                days_left = max(0, (maturity.date() - moment.date()).days)
+                status = f"Matures {maturity:%Y-%m-%d} ({days_left} days left)"
+            if certificate.matured_at is None:
+                cd_total_c += value_c
+                if next_maturity is None or maturity < next_maturity:
+                    next_maturity = maturity
+            progress_text = format_percent(progress_pct)
+            cert_rows += (
+                f"<tr>"
+                f"<td data-label='Principal'>{usd(certificate.principal_cents)}</td>"
+                f"<td data-label='Rate'>{rate_display:.2f}%</td>"
+                f"<td data-label='Term'>{certificate.term_months} mo</td>"
+                f"<td data-label='Value Today' class='right'>{usd(value_c)}</td>"
+                f"<td data-label='Progress' class='right'>{progress_text}</td>"
+                f"<td data-label='Status'>{status}</td>"
+                "</tr>"
+            )
+        if not cert_rows:
+            cert_rows = "<tr><td colspan='6' class='muted'>(no certificates yet)</td></tr>"
+        rate_pct_display = (rate_bps / 100) if 'rate_bps' in locals() else (DEFAULT_CD_RATE_BPS / 100)
+        summary_bits = [
+            f"<div><b>Current rate:</b> {rate_pct_display:.2f}% APR</div>",
+            f"<div>Total active value: <b>{usd(cd_total_c)}</b></div>",
+        ]
+        if next_maturity:
+            summary_bits.append(f"<div>Next maturity: <b>{next_maturity:%Y-%m-%d}</b></div>")
+        if matured_ready:
+            summary_bits.append(
+                f"<div class='muted'>{matured_ready} certificate{'s' if matured_ready != 1 else ''} ready to cash out.</div>"
+            )
+        cd_summary_html = "".join(summary_bits)
+        cash_out_form = ""
+        if matured_ready:
+            cash_out_form = (
+                "<form method='post' action='/kid/invest/cd/mature' style='margin-top:10px;'>"
+                "<button type='submit'>Cash out matured</button>"
+                "</form>"
+            )
 
         inner = f"""
         <div class='card'>
@@ -1173,8 +1369,27 @@ def kid_invest_home(request: Request) -> HTMLResponse:
             <input name='amount' type='text' data-money placeholder='amount $' required>
             <button type='submit' class='danger'>Sell Shares</button>
           </form>
-          <p class='muted' style='margin-top:10px;'><a href='/kid'>← Back to My Account</a></p>
         </div>
+        <div class='card'>
+          <h3>Certificates of Deposit</h3>
+          <p class='muted'>Lock part of your balance to earn interest.</p>
+          {cd_summary_html}
+          {cash_out_form}
+          <h4 style='margin-top:12px;'>Open a certificate</h4>
+          <form method='post' action='/kid/invest/cd/open' class='inline'>
+            <input name='amount' type='text' data-money placeholder='amount $' required>
+            <label style='margin-left:6px;'>Term</label>
+            <select name='term_months'>
+              <option value='3'>3 months</option>
+              <option value='6'>6 months</option>
+              <option value='12' selected>12 months</option>
+            </select>
+            <button type='submit' style='margin-left:6px;'>Lock Savings</button>
+          </form>
+          <p class='muted' style='margin-top:6px;'>Funds move from your balance into the certificate.</p>
+          <table style='margin-top:10px;'><tr><th>Principal</th><th>Rate</th><th>Term</th><th>Value Today</th><th>Progress</th><th>Status</th></tr>{cert_rows}</table>
+        </div>
+        <p class='muted' style='margin-top:10px;'><a href='/kid'>← Back to My Account</a></p>
         """
         return HTMLResponse(frame("Investing — S&P 500 Simulator", inner))
     except Exception:
@@ -1290,6 +1505,91 @@ def kid_invest_sell(request: Request, amount: str = Form(...)):
         session.commit()
     return RedirectResponse("/kid/invest", status_code=302)
 
+
+@app.post("/kid/invest/cd/open")
+def kid_invest_cd_open(
+    request: Request,
+    amount: str = Form(...),
+    term_months: int = Form(...),
+):
+    if (redirect := require_kid(request)) is not None:
+        return redirect
+    kid_id = kid_authed(request)
+    assert kid_id
+    amount_c = to_cents_from_dollars_str(amount, 0)
+    term = max(1, int(term_months))
+    if amount_c <= 0:
+        return RedirectResponse("/kid/invest", status_code=302)
+    with Session(engine) as session:
+        child = session.exec(select(Child).where(Child.kid_id == kid_id)).first()
+        if not child or amount_c > child.balance_cents:
+            return RedirectResponse("/kid/invest", status_code=302)
+        rate_bps = get_cd_rate_bps(session)
+        certificate = Certificate(
+            kid_id=kid_id,
+            principal_cents=amount_c,
+            rate_bps=rate_bps,
+            term_months=term,
+            opened_at=datetime.utcnow(),
+        )
+        child.balance_cents -= amount_c
+        child.updated_at = datetime.utcnow()
+        rate_pct = rate_bps / 100
+        session.add(child)
+        session.add(certificate)
+        session.add(
+            Event(
+                child_id=kid_id,
+                change_cents=-amount_c,
+                reason=f"invest_cd_open:{term}m @ {rate_pct:.2f}%",
+            )
+        )
+        session.commit()
+    return RedirectResponse("/kid/invest", status_code=302)
+
+
+@app.post("/kid/invest/cd/mature")
+def kid_invest_cd_mature(request: Request):
+    if (redirect := require_kid(request)) is not None:
+        return redirect
+    kid_id = kid_authed(request)
+    assert kid_id
+    with Session(engine) as session:
+        child = session.exec(select(Child).where(Child.kid_id == kid_id)).first()
+        if not child:
+            return RedirectResponse("/kid/invest", status_code=302)
+        certificates = session.exec(
+            select(Certificate)
+            .where(Certificate.kid_id == kid_id)
+            .where(Certificate.matured_at == None)  # noqa: E711
+        ).all()
+        moment = datetime.utcnow()
+        payout_total = 0
+        matured_count = 0
+        for certificate in certificates:
+            if moment >= certificate_maturity_date(certificate):
+                payout = certificate_maturity_value_cents(certificate)
+                payout_total += payout
+                matured_count += 1
+                certificate.matured_at = moment
+                session.add(certificate)
+        if payout_total > 0 and matured_count > 0:
+            child.balance_cents += payout_total
+            child.updated_at = datetime.utcnow()
+            session.add(child)
+            session.add(
+                Event(
+                    child_id=kid_id,
+                    change_cents=payout_total,
+                    reason=f"invest_cd_mature:{matured_count}x",
+                )
+            )
+            session.commit()
+        else:
+            session.rollback()
+    return RedirectResponse("/kid/invest", status_code=302)
+
+
 # ---------------------------------------------------------------------------
 # Admin routes
 # ---------------------------------------------------------------------------
@@ -1367,6 +1667,10 @@ def admin_home(request: Request):
             .where(Goal.saved_cents >= Goal.target_cents)
             .order_by(desc(Goal.created_at))
         ).all()
+        cd_rate_bps = get_cd_rate_bps(session)
+        active_certs = session.exec(
+            select(Certificate).where(Certificate.matured_at == None)  # noqa: E711
+        ).all()
     kids_rows = "".join(
         f"<tr>"
         f"<td data-label='Child'><b>{child.name}</b><div class='muted'>{child.kid_id} • Level {child.level} • Streak {child.streak_days} • {_badges_html(child.badges)}</div></td>"
@@ -1376,6 +1680,7 @@ def admin_home(request: Request):
         f"<a href='/admin/kiosk_full?kid_id={child.kid_id}' style='margin-left:6px;'><button type='button'>Kiosk (auto)</button></a> "
         f"<a href='/admin/chores?kid_id={child.kid_id}' style='margin-left:6px;'><button type='button'>Manage Chores</button></a> "
         f"<a href='/admin/goals?kid_id={child.kid_id}' style='margin-left:6px;'><button type='button'>Goals</button></a> "
+        f"<a href='/admin/statement?kid_id={child.kid_id}' style='margin-left:6px;'><button type='button'>Statement</button></a> "
         f"<form class='inline' method='post' action='/admin/set_allowance' style='margin-left:6px;'>"
         f"<input type='hidden' name='kid_id' value='{child.kid_id}'>"
         f"<input name='allowance' type='text' data-money value='{dollars_value(child.allowance_cents)}' style='max-width:130px' placeholder='allowance $'>"
@@ -1428,7 +1733,8 @@ def admin_home(request: Request):
         f"<tr>"
         f"<td data-label='Kid'><b>{child.name}</b><div class='muted'>{child.kid_id}</div></td>"
         f"<td data-label='Goal'><b>{goal.name}</b></td>"
-        f"<td data-label='Saved' class='right'>{usd(goal.saved_cents)} / {usd(goal.target_cents)}</td>"
+        f"<td data-label='Saved' class='right'>{usd(goal.saved_cents)} / {usd(goal.target_cents)}"
+        f"<div class='muted'>{format_percent(percent_complete(goal.saved_cents, goal.target_cents))} complete</div></td>"
         f"<td data-label='Actions' class='right'>"
         f"<form class='inline' method='post' action='/admin/goal_grant'>"
         f"<input type='hidden' name='goal_id' value='{goal.id}'><button type='submit'>Grant Goal</button></form> "
@@ -1437,11 +1743,34 @@ def admin_home(request: Request):
         f"</td></tr>"
         for goal, child in needs
     ) or "<tr><td>(none)</td></tr>"
+    moment_admin = datetime.utcnow()
+    active_cd_total = sum(certificate_value_cents(cert, at=moment_admin) for cert in active_certs)
+    active_cd_count = len(active_certs)
+    ready_cd = sum(1 for cert in active_certs if moment_admin >= certificate_maturity_date(cert))
+    cd_rate_pct = cd_rate_bps / 100
+    ready_note = (
+        f"<div class='muted' style='margin-top:4px;'>{ready_cd} certificate{'s' if ready_cd != 1 else ''} ready to cash out.</div>"
+        if ready_cd
+        else "<div class='muted' style='margin-top:4px;'>Kids manage certificates from their investing page.</div>"
+    )
     goals_card = f"""
     <div class='card'>
       <h3>Goals Needing Action</h3>
       <table><tr><th>Kid</th><th>Goal</th><th>Saved</th><th>Actions</th></tr>{goals_rows}</table>
       <p class='muted' style='margin-top:6px;'>When a goal is fully funded, approve the purchase (Grant) or return funds.</p>
+    </div>
+    """
+    investing_card = f"""
+    <div class='card'>
+      <h3>Investing Controls</h3>
+      <div><b>Current CD rate:</b> {cd_rate_pct:.2f}% APR</div>
+      <div>Active certificates: <b>{active_cd_count}</b> worth <b>{usd(active_cd_total)}</b></div>
+      {ready_note}
+      <form method='post' action='/admin/certificates/rate' style='margin-top:10px;'>
+        <label>Set CD rate (% APR)</label>
+        <input name='rate' type='number' step='0.01' min='0' value='{cd_rate_pct:.2f}' required>
+        <button type='submit' style='margin-top:8px;'>Save Rate</button>
+      </form>
     </div>
     """
     rules_card = f"""
@@ -1498,6 +1827,18 @@ def admin_home(request: Request):
         </form>
       </div>
       <div class='card'>
+        <h3>Family Transfer</h3>
+        <form method='post' action='/admin/transfer'>
+          <label>From</label>
+          <select name='from_kid' required>{_kid_options(kids)}</select>
+          <label style='margin-top:6px;'>To</label>
+          <select name='to_kid' required>{_kid_options(kids)}</select>
+          <label style='margin-top:6px;'>Amount (dollars)</label><input name='amount' type='text' data-money value='1.00'>
+          <label style='margin-top:6px;'>Note</label><input name='note' placeholder='optional note'>
+          <button type='submit' style='margin-top:10px;'>Transfer</button>
+        </form>
+      </div>
+      <div class='card'>
         <h3>Prize Catalog</h3>
         <form method='post' action='/add_prize'>
           <label>Name</label><input name='name' placeholder='Ice cream' required>
@@ -1510,6 +1851,7 @@ def admin_home(request: Request):
     </div>
     <div class='grid'>
       {goals_card}
+      {investing_card}
       <div class='card'>
         <h3>Chores</h3>
         <form method='post' action='/admin/chores/create'>
@@ -1769,7 +2111,8 @@ def admin_goals(request: Request, kid_id: str = Query(...)):
     rows = "".join(
         f"<tr>"
         f"<td data-label='Goal'><b>{goal.name}</b>" + (" <span class='pill' title='Goal reached'>Reached</span>" if goal.saved_cents >= goal.target_cents else "") + "</td>"
-        f"<td data-label='Saved' class='right'>{usd(goal.saved_cents)} / {usd(goal.target_cents)}</td>"
+        f"<td data-label='Saved' class='right'>{usd(goal.saved_cents)} / {usd(goal.target_cents)}"
+        f"<div class='muted'>{format_percent(percent_complete(goal.saved_cents, goal.target_cents))} complete</div></td>"
         f"<td data-label='Actions' class='right'>"
         f"<form class='inline' method='post' action='/admin/goal_update'>"
         f"<input type='hidden' name='goal_id' value='{goal.id}'>"
@@ -1803,6 +2146,145 @@ def admin_goals(request: Request, kid_id: str = Query(...)):
     </div>
     """
     return HTMLResponse(frame("Goals", inner))
+
+
+@app.get("/admin/statement", response_class=HTMLResponse)
+def admin_statement(request: Request, kid_id: str = Query(...)):
+    if (redirect := require_admin(request)) is not None:
+        return redirect
+    with Session(engine) as session:
+        child = session.exec(select(Child).where(Child.kid_id == kid_id)).first()
+        if not child:
+            return HTMLResponse(frame("Statement", "<div class='card'>Kid not found.</div>"))
+        events = session.exec(
+            select(Event)
+            .where(Event.child_id == kid_id)
+            .order_by(desc(Event.timestamp))
+            .limit(50)
+        ).all()
+        goals = session.exec(select(Goal).where(Goal.kid_id == kid_id).order_by(desc(Goal.created_at))).all()
+        certificates = session.exec(
+            select(Certificate)
+            .where(Certificate.kid_id == kid_id)
+            .order_by(desc(Certificate.opened_at))
+        ).all()
+        cd_rate_bps = get_cd_rate_bps(session)
+    metrics = compute_holdings_metrics(kid_id)
+    moment = datetime.utcnow()
+    goal_rows = "".join(
+        f"<tr><td data-label='Goal'><b>{goal.name}</b></td>"
+        f"<td data-label='Saved' class='right'>{usd(goal.saved_cents)} / {usd(goal.target_cents)}</td>"
+        f"<td data-label='Progress' class='right'>{format_percent(percent_complete(goal.saved_cents, goal.target_cents))}</td>"
+        f"<td data-label='Status'>{'Reached' if goal.saved_cents >= goal.target_cents else 'In progress'}</td></tr>"
+        for goal in goals
+    ) or "<tr><td>(no goals yet)</td></tr>"
+    reward_events = [
+        event
+        for event in events
+        if isinstance(event.reason, str) and event.reason.startswith("prize:")
+    ][:10]
+    reward_rows = "".join(
+        f"<tr><td data-label='When'>{event.timestamp.strftime('%Y-%m-%d')}</td>"
+        f"<td data-label='Reward'>{event.reason.split(':', 1)[1]}</td>"
+        f"<td data-label='Cost' class='right'>{usd(-event.change_cents)}</td></tr>"
+        for event in reward_events
+    ) or "<tr><td>(no rewards)</td></tr>"
+    activity_rows = "".join(
+        f"<tr><td data-label='When'>{event.timestamp.strftime('%Y-%m-%d %H:%M')}</td>"
+        f"<td data-label='Δ Amount' class='right'>{'+' if event.change_cents>=0 else ''}{usd(event.change_cents)}</td>"
+        f"<td data-label='Reason'>{event.reason}</td></tr>"
+        for event in events
+    ) or "<tr><td>(no events)</td></tr>"
+    cert_rows = ""
+    active_cd_total = 0
+    active_cd_count = 0
+    ready_cd = 0
+    for certificate in certificates:
+        value_c = certificate_value_cents(certificate, at=moment)
+        maturity = certificate_maturity_date(certificate)
+        progress_pct = certificate_progress_percent(certificate, at=moment)
+        rate_display = certificate.rate_bps / 100
+        if certificate.matured_at:
+            status = f"Cashed out on {certificate.matured_at.strftime('%Y-%m-%d')}"
+            progress_pct = 100.0
+        elif moment >= maturity:
+            status = "Matured — ready to cash out"
+            ready_cd += 1
+        else:
+            status = f"Matures {maturity:%Y-%m-%d}"
+        if certificate.matured_at is None:
+            active_cd_total += value_c
+            active_cd_count += 1
+        cert_rows += (
+            f"<tr>"
+            f"<td data-label='Principal'>{usd(certificate.principal_cents)}</td>"
+            f"<td data-label='Rate'>{rate_display:.2f}%</td>"
+            f"<td data-label='Term'>{certificate.term_months} mo</td>"
+            f"<td data-label='Value' class='right'>{usd(value_c)}</td>"
+            f"<td data-label='Progress' class='right'>{format_percent(progress_pct)}</td>"
+            f"<td data-label='Status'>{status}</td>"
+            "</tr>"
+        )
+    if not cert_rows:
+        cert_rows = "<tr><td colspan='6' class='muted'>(no certificates)</td></tr>"
+    cd_rate_pct = cd_rate_bps / 100
+    ready_note = (
+        f"<div class='muted' style='margin-top:4px;'>{ready_cd} certificate{'s' if ready_cd != 1 else ''} ready to cash out.</div>"
+        if ready_cd
+        else "<div class='muted' style='margin-top:4px;'>All active certificates are still growing.</div>"
+    )
+    snapshot_card = f"""
+    <div class='card'>
+      <h3>Account Snapshot</h3>
+      <div><b>Balance:</b> {usd(child.balance_cents)}</div>
+      <div><b>Weekly allowance:</b> {usd(child.allowance_cents)}</div>
+      <div><b>Level:</b> {child.level} • Streak: {child.streak_days} days</div>
+      <div style='margin-top:6px;'><b>Badges:</b> {_badges_html(child.badges)}</div>
+      <div class='muted' style='margin-top:6px;'>Last updated {(child.updated_at or datetime.utcnow()):%Y-%m-%d %H:%M}</div>
+    </div>
+    """
+    investing_card = f"""
+    <div class='card'>
+      <h3>Investing Overview</h3>
+      <div><b>Stocks:</b> {usd(metrics['market_value_c'])} ({metrics['shares']:.4f} sh @ {usd(metrics['price_c'])})</div>
+      <div>Certificates: <b>{usd(active_cd_total)}</b> across {active_cd_count} active • Rate {cd_rate_pct:.2f}% APR</div>
+      {ready_note}
+      <table style='margin-top:10px;'><tr><th>Principal</th><th>Rate</th><th>Term</th><th>Value</th><th>Progress</th><th>Status</th></tr>{cert_rows}</table>
+    </div>
+    """
+    goals_card = f"""
+    <div class='card'>
+      <h3>Savings Goals</h3>
+      <table><tr><th>Goal</th><th>Saved</th><th>Progress</th><th>Status</th></tr>{goal_rows}</table>
+    </div>
+    """
+    rewards_card = f"""
+    <div class='card'>
+      <h3>Rewards &amp; Prizes</h3>
+      <table><tr><th>When</th><th>Reward</th><th>Cost</th></tr>{reward_rows}</table>
+    </div>
+    """
+    activity_card = f"""
+    <div class='card'>
+      <h3>Recent Activity</h3>
+      <table><tr><th>When</th><th>Δ Amount</th><th>Reason</th></tr>{activity_rows}</table>
+    </div>
+    """
+    inner = f"""
+    <div class='topbar'><h3>Account Statement — {child.name} <span class='pill' style='margin-left:8px;'>{child.kid_id}</span></h3>
+      <a href='/admin'><button>Back</button></a>
+    </div>
+    <div class='grid'>
+      {snapshot_card}
+      {investing_card}
+    </div>
+    <div class='grid'>
+      {goals_card}
+      {rewards_card}
+    </div>
+    {activity_card}
+    """
+    return HTMLResponse(frame("Account Statement", inner))
 
 
 @app.post("/admin/goal_create")
@@ -1946,6 +2428,8 @@ def delete_kid(request: Request, kid_id: str = Form(...), pin: str = Form(...)):
         holding = session.exec(select(Investment).where(Investment.kid_id == kid_id)).first()
         if holding:
             session.delete(holding)
+        for certificate in session.exec(select(Certificate).where(Certificate.kid_id == kid_id)).all():
+            session.delete(certificate)
         session.delete(child)
         session.commit()
     return RedirectResponse("/admin", status_code=302)
@@ -2004,6 +2488,48 @@ def adjust_balance(request: Request, kid_id: str = Form(...), amount: str = Form
             session.add(Event(child_id=kid_id, change_cents=-amount_c, reason=reason or "debit"))
         child.updated_at = datetime.utcnow()
         session.add(child)
+        session.commit()
+    return RedirectResponse("/admin", status_code=302)
+
+
+@app.post("/admin/transfer")
+def admin_transfer(
+    request: Request,
+    from_kid: str = Form(...),
+    to_kid: str = Form(...),
+    amount: str = Form("0.00"),
+    note: str = Form(""),
+):
+    if (redirect := require_admin(request)) is not None:
+        return redirect
+    from_kid = (from_kid or "").strip()
+    to_kid = (to_kid or "").strip()
+    if not from_kid or not to_kid or from_kid == to_kid:
+        body = "<div class='card'><p style='color:#ff6b6b;'>Choose two different kids for a transfer.</p><p><a href='/admin'>Back</a></p></div>"
+        return HTMLResponse(frame("Admin", body), status_code=400)
+    amount_c = to_cents_from_dollars_str(amount, 0)
+    if amount_c <= 0:
+        return RedirectResponse("/admin", status_code=302)
+    with Session(engine) as session:
+        sender = session.exec(select(Child).where(Child.kid_id == from_kid)).first()
+        recipient = session.exec(select(Child).where(Child.kid_id == to_kid)).first()
+        if not sender or not recipient:
+            body = "<div class='card'><p style='color:#ff6b6b;'>Child not found.</p><p><a href='/admin'>Back</a></p></div>"
+            return HTMLResponse(frame("Admin", body), status_code=404)
+        if amount_c > sender.balance_cents:
+            body = "<div class='card'><p style='color:#ff6b6b;'>Insufficient funds for this transfer.</p><p><a href='/admin'>Back</a></p></div>"
+            return HTMLResponse(frame("Admin", body), status_code=400)
+        sender.balance_cents -= amount_c
+        recipient.balance_cents += amount_c
+        sender.updated_at = datetime.utcnow()
+        recipient.updated_at = datetime.utcnow()
+        note_text = (note or "").strip()
+        reason_out = f"transfer_to:{to_kid}" + (f" ({note_text})" if note_text else "")
+        reason_in = f"transfer_from:{from_kid}" + (f" ({note_text})" if note_text else "")
+        session.add(sender)
+        session.add(recipient)
+        session.add(Event(child_id=from_kid, change_cents=-amount_c, reason=reason_out))
+        session.add(Event(child_id=to_kid, change_cents=amount_c, reason=reason_in))
         session.commit()
     return RedirectResponse("/admin", status_code=302)
 
@@ -2080,7 +2606,11 @@ def admin_chore_payout(request: Request, instance_id: int = Form(...), amount: s
         child = session.exec(select(Child).where(Child.kid_id == chore.kid_id)).first()
         if not child:
             return RedirectResponse("/admin", status_code=302)
-        payout_c = chore.award_cents if not amount.strip() else to_cents_from_dollars_str(amount, chore.award_cents)
+        raw_amount = (amount or "").strip()
+        if not raw_amount:
+            body = "<div class='card'><p style='color:#ff6b6b;'>Enter an override amount before approving the payout.</p><p><a href='/admin'>Back to admin</a></p></div>"
+            return HTMLResponse(frame("Admin", body), status_code=400)
+        payout_c = to_cents_from_dollars_str(raw_amount, chore.award_cents)
         payout_c = max(0, payout_c)
         child.balance_cents += payout_c
         child.updated_at = datetime.utcnow()
@@ -2108,6 +2638,23 @@ def admin_rules(request: Request, bonus_all: Optional[str] = Form(None), bonus: 
         MetaDAO.set(session, "rule_bonus_cents", str(bonus_c))
         MetaDAO.set(session, "rule_penalty_on_miss", "1" if penalty_miss else "0")
         MetaDAO.set(session, "rule_penalty_cents", str(penalty_c))
+        session.commit()
+    return RedirectResponse("/admin", status_code=302)
+
+
+@app.post("/admin/certificates/rate")
+def admin_set_certificate_rate(request: Request, rate: str = Form(...)):
+    if (redirect := require_admin(request)) is not None:
+        return redirect
+    raw = (rate or "").strip()
+    try:
+        rate_value = float(raw)
+    except ValueError:
+        body = "<div class='card'><p style='color:#ff6b6b;'>Enter a numeric rate in percent.</p><p><a href='/admin'>Back</a></p></div>"
+        return HTMLResponse(frame("Admin", body), status_code=400)
+    rate_bps = max(0, int(round(rate_value * 100)))
+    with Session(engine) as session:
+        MetaDAO.set(session, CD_RATE_KEY, str(rate_bps))
         session.commit()
     return RedirectResponse("/admin", status_code=302)
 

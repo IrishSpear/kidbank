@@ -2,10 +2,61 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from decimal import Decimal, ROUND_UP
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
+
+from .money import require_positive
+
+
+def _to_decimal(value: Decimal | float | int) -> Decimal:
+    return Decimal(value).quantize(Decimal("0.01"))
+
+
+@dataclass(slots=True)
+class CertificateOfDeposit:
+    """Represents a time-bound savings product with a fixed rate."""
+
+    principal: Decimal
+    rate: Decimal
+    term_months: int
+    opened_on: datetime = field(default_factory=datetime.utcnow)
+
+    def __post_init__(self) -> None:
+        principal = _to_decimal(self.principal)
+        require_positive(principal)
+        if self.term_months <= 0:
+            raise ValueError("term_months must be positive")
+        rate = Decimal(self.rate).quantize(Decimal("0.0001"))
+        object.__setattr__(self, "principal", principal)
+        object.__setattr__(self, "rate", rate)
+
+    @property
+    def term(self) -> timedelta:
+        return timedelta(days=self.term_months * 30)
+
+    @property
+    def matures_on(self) -> datetime:
+        return self.opened_on + self.term
+
+    def value(self, *, at: Optional[datetime] = None) -> Decimal:
+        """Return the accrued value as of ``at`` using simple interest."""
+
+        moment = at or datetime.utcnow()
+        total_days = self.term.days
+        if total_days == 0:
+            return self.payout_amount()
+        elapsed_days = max(0, min((moment - self.opened_on).days, total_days))
+        progress = Decimal(elapsed_days) / Decimal(total_days)
+        interest = (self.principal * self.rate * progress).quantize(Decimal("0.01"))
+        return self.principal + interest
+
+    def payout_amount(self) -> Decimal:
+        """Return the amount released upon maturity."""
+
+        interest = (self.principal * self.rate).quantize(Decimal("0.01"))
+        return self.principal + interest
 
 
 @dataclass(slots=True)
@@ -20,7 +71,7 @@ class DCAConfig:
 
 
 class InvestmentPortfolio:
-    """Track cash and simulated stock/bond balances for a child."""
+    """Track cash, simulated stock/bond balances, and time deposits for a child."""
 
     def __init__(self) -> None:
         self.positions: Dict[str, Decimal] = {
@@ -36,10 +87,12 @@ class InvestmentPortfolio:
             "p_l": "Profit and loss shows how much your investments changed from what you put in.",
             "diversification": "Putting money in different buckets keeps your eggs out of one basket.",
         }
+        self._cd_rate = Decimal("0.02")
+        self._certificates: list[CertificateOfDeposit] = []
 
     # Cash handling ---------------------------------------------------------
     def record_deposit(self, amount: Decimal) -> Decimal:
-        amount = Decimal(amount).quantize(Decimal("0.01"))
+        amount = _to_decimal(amount)
         self.positions["cash"] += amount
         if self.auto_sweep_enabled:
             swept = self.auto_cash_sweep(amount)
@@ -47,8 +100,11 @@ class InvestmentPortfolio:
             swept = Decimal("0.00")
         return swept
 
+    def available_cash(self) -> Decimal:
+        return self.positions["cash"]
+
     def auto_cash_sweep(self, deposit_amount: Decimal) -> Decimal:
-        value = Decimal(deposit_amount).quantize(Decimal("0.01"))
+        value = _to_decimal(deposit_amount)
         ceiling = value.quantize(Decimal("1"), rounding=ROUND_UP)
         spare = (ceiling - value).quantize(Decimal("0.01"))
         if spare <= Decimal("0.00"):
@@ -73,6 +129,61 @@ class InvestmentPortfolio:
         residual = amount - allocated
         if residual != Decimal("0.00"):
             self.positions["cash"] += residual
+
+    # Certificates of deposit ------------------------------------------------
+    def set_cd_rate(self, rate: float, *, update_existing: bool = True) -> Decimal:
+        """Update the annual rate used for certificates of deposit."""
+
+        new_rate = Decimal(rate).quantize(Decimal("0.0001"))
+        if new_rate < Decimal("0"):
+            raise ValueError("rate cannot be negative")
+        self._cd_rate = new_rate
+        if update_existing:
+            for certificate in self._certificates:
+                object.__setattr__(certificate, "rate", new_rate)
+        return new_rate
+
+    def open_certificate(
+        self,
+        amount: Decimal,
+        *,
+        term_months: int = 12,
+        opened_on: Optional[datetime] = None,
+    ) -> CertificateOfDeposit:
+        value = _to_decimal(amount)
+        require_positive(value)
+        if self.positions["cash"] < value:
+            raise ValueError("Insufficient cash to purchase certificate.")
+        self.positions["cash"] -= value
+        certificate = CertificateOfDeposit(
+            principal=value,
+            rate=self._cd_rate,
+            term_months=term_months,
+            opened_on=opened_on or datetime.utcnow(),
+        )
+        self._certificates.append(certificate)
+        return certificate
+
+    def certificates(self) -> Tuple[CertificateOfDeposit, ...]:
+        return tuple(self._certificates)
+
+    def total_certificate_value(self, *, at: Optional[datetime] = None) -> Decimal:
+        return sum((certificate.value(at=at) for certificate in self._certificates), Decimal("0.00"))
+
+    def mature_certificates(self, *, at: Optional[datetime] = None) -> Decimal:
+        """Return matured certificates to cash and remove them from the ladder."""
+
+        matured_total = Decimal("0.00")
+        moment = at or datetime.utcnow()
+        remaining: list[CertificateOfDeposit] = []
+        for certificate in self._certificates:
+            if moment >= certificate.matures_on:
+                payout = certificate.payout_amount()
+                matured_total += payout
+            else:
+                remaining.append(certificate)
+        self._certificates = remaining
+        return matured_total
 
     # DCA -------------------------------------------------------------------
     def configure_dca(
@@ -110,14 +221,16 @@ class InvestmentPortfolio:
         return amount
 
     # Portfolio summaries ---------------------------------------------------
-    def total_value(self) -> Decimal:
-        return sum(self.positions.values())
+    def total_value(self, *, at: Optional[datetime] = None) -> Decimal:
+        return sum(self.positions.values()) + self.total_certificate_value(at=at)
 
-    def allocation_breakdown(self) -> Dict[str, float]:
-        total = float(self.total_value())
+    def allocation_breakdown(self, *, at: Optional[datetime] = None) -> Dict[str, float]:
+        total = float(self.total_value(at=at))
+        assets = dict(self.positions)
+        assets["cd"] = self.total_certificate_value(at=at)
         if total == 0:
-            return {asset: 0.0 for asset in self.positions}
-        return {asset: float(balance / total) for asset, balance in self.positions.items()}
+            return {asset: 0.0 for asset in assets}
+        return {asset: float(balance / total) for asset, balance in assets.items()}
 
     def set_allocation(self, *, stock: float, bond: float) -> None:
         total = stock + bond
@@ -130,4 +243,4 @@ class InvestmentPortfolio:
         return self.explainers.get(topic, "Ask a grown-up for details about this topic!")
 
 
-__all__ = ["DCAConfig", "InvestmentPortfolio"]
+__all__ = ["CertificateOfDeposit", "DCAConfig", "InvestmentPortfolio"]
