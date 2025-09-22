@@ -12,9 +12,9 @@ from .account import Account
 from .admin import AuditLog, FeatureFlagRegistry, UndoManager
 from .api import ApiExporter, WebhookDispatcher
 from .chores import Chore, ChoreBoard, ChorePack, ChoreSchedule, TimeWindow, Weekday
-from .exceptions import AccountNotFoundError, DuplicateAccountError
+from .exceptions import AccountNotFoundError, DuplicateAccountError, InsufficientFundsError
 from .i18n import Translator
-from .investing import InvestmentPortfolio
+from .investing import CertificateOfDeposit, InvestmentPortfolio
 from .models import (
     EventCategory,
     Goal,
@@ -619,6 +619,61 @@ class KidBank:
     # ------------------------------------------------------------------
     def portfolio(self, child_name: str) -> InvestmentPortfolio:
         return self._portfolios[child_name]
+
+    def certificates(self, child_name: str) -> tuple[CertificateOfDeposit, ...]:
+        return self._portfolios[child_name].certificates()
+
+    def set_certificate_rate(
+        self, child_name: str, rate: float, *, update_existing: bool = True
+    ) -> Decimal:
+        return self._portfolios[child_name].set_cd_rate(rate, update_existing=update_existing)
+
+    def open_certificate(
+        self,
+        child_name: str,
+        amount: AmountLike,
+        *,
+        term_months: int = 12,
+        description: str | None = None,
+        opened_on: datetime | None = None,
+    ) -> CertificateOfDeposit:
+        account = self.get_account(child_name)
+        portfolio = self._portfolios[child_name]
+        value = to_decimal(amount)
+        if portfolio.available_cash() < value:
+            raise InsufficientFundsError(
+                f"Portfolio for '{child_name}' has insufficient cash for certificate purchase."
+            )
+        metadata = {
+            "investment": "certificate_of_deposit",
+            "term_months": str(term_months),
+        }
+        transaction = account.withdraw(
+            value,
+            description or "Certificate of deposit purchase",
+            category=EventCategory.INVEST,
+            metadata=metadata,
+        )
+        self._after_transaction(child_name, transaction)
+        certificate = portfolio.open_certificate(
+            transaction.amount,
+            term_months=term_months,
+            opened_on=opened_on,
+        )
+        return certificate
+
+    def mature_certificates(self, child_name: str, *, at: datetime | None = None) -> Decimal:
+        portfolio = self._portfolios[child_name]
+        payout = portfolio.mature_certificates(at=at)
+        if payout > Decimal("0"):
+            transaction = self.get_account(child_name).deposit(
+                payout,
+                "Certificate of deposit matured",
+                category=EventCategory.INVEST,
+                metadata={"investment": "certificate_of_deposit"},
+            )
+            self._after_transaction(child_name, transaction)
+        return payout
 
     def run_investing_jobs(self, *, at: Optional[datetime] = None) -> Dict[str, Decimal]:
         invested: Dict[str, Decimal] = {}

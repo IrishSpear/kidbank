@@ -13,7 +13,7 @@ from .exceptions import (
     KidBankError,
 )
 from .i18n import Translator
-from .investing import InvestmentPortfolio
+from .investing import CertificateOfDeposit, InvestmentPortfolio
 from .models import (
     BackupMetadata,
     EventCategory,
@@ -58,6 +58,7 @@ __all__ = [
     "NotificationCenter",
     "NotificationChannel",
     "NotificationType",
+    "CertificateOfDeposit",
     "InvestmentPortfolio",
     "ScheduledDigest",
     "Reward",

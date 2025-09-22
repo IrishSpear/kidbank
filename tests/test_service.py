@@ -1,3 +1,4 @@
+from datetime import timedelta
 from decimal import Decimal
 
 import pytest
@@ -79,3 +80,24 @@ def test_summary_lists_accounts() -> None:
     assert "KidBank summary:" in summary
     assert "Ava" in summary and "Ben" in summary
     assert "Total balance" in summary
+
+
+def test_certificate_of_deposit_flow() -> None:
+    bank = KidBank()
+    bank.create_account("Ava")
+    bank.deposit("Ava", 100, description="Gift")
+
+    new_rate = bank.set_certificate_rate("Ava", 0.05)
+    assert new_rate == Decimal("0.0500")
+
+    certificate = bank.open_certificate("Ava", 40, term_months=6)
+    assert certificate.principal == Decimal("40.00")
+    assert certificate.rate == Decimal("0.0500")
+    assert bank.get_account("Ava").balance == Decimal("60.00")
+    assert bank.portfolio("Ava").total_certificate_value() >= Decimal("40.00")
+
+    payout = bank.mature_certificates("Ava", at=certificate.matures_on + timedelta(days=1))
+    assert payout == certificate.payout_amount()
+    assert bank.get_account("Ava").balance == Decimal("60.00") + payout
+    assert bank.portfolio("Ava").total_certificate_value() == Decimal("0.00")
+    assert bank.certificates("Ava") == ()

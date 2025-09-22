@@ -8,11 +8,15 @@ and rewards in an easy-to-read and fully tested code base.
 
 - **Account management** – create accounts, deposit allowances, withdraw funds,
   and transfer money between siblings.
+- **Kid kiosk transfers** – kids can send and request money from each other
+  with clear notes explaining why.
 - **Reward tracking** – redeem rewards and keep a history of what was earned.
 - **Savings goals** – define goals, contribute towards them, and monitor
   progress with percentage calculations.
 - **Comprehensive statements** – generate readable account summaries that list
   recent activity, goals, and rewards.
+- **Investing** – simulate portfolios with certificates of deposit that earn
+  interest at an adjustable rate.
 - **Test coverage** – unit tests exercise the core behaviours to keep the
   system reliable.
 
