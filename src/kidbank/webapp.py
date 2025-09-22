@@ -252,6 +252,21 @@ def run_migrations() -> None:
             );
             """
         )
+        raw.execute(
+            """
+            CREATE TABLE IF NOT EXISTS peerrequest (
+                id INTEGER PRIMARY KEY,
+                requester_kid TEXT,
+                target_kid TEXT,
+                amount_cents INTEGER,
+                reason TEXT,
+                status TEXT,
+                created_at TEXT,
+                resolved_at TEXT,
+                resolved_by TEXT
+            );
+            """
+        )
         raw.commit()
     finally:
         raw.close()
