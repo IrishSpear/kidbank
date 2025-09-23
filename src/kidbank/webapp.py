@@ -2985,6 +2985,7 @@ def kid_invest_home(
         if selected_symbol not in instrument_map:
             selected_symbol = default_symbol if default_symbol in instrument_map else next(iter(instrument_map.keys()))
         active_instrument = instrument_map[selected_symbol]
+        instrument_symbol_raw = active_instrument.symbol
         selected_range = normalize_history_range(range_code)
         chart_mode = normalize_chart_view(chart_view)
         metrics = compute_holdings_metrics(kid_id, selected_symbol)
@@ -3082,7 +3083,6 @@ def kid_invest_home(
             penalty_summary = "<div>No penalty for early withdrawals right now.</div>"
         summary_bits.append(penalty_summary)
         cd_summary_html = "".join(summary_bits)
-        instrument_symbol_raw = active_instrument.symbol
         cash_out_form = ""
         if matured_ready:
             cash_out_form = (
