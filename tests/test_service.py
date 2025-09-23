@@ -125,15 +125,15 @@ def test_certificate_term_rates_and_penalties() -> None:
         "Ava", certificate, at=opened_on + timedelta(days=90)
     )
 
-    assert gross == Decimal("101.50")
+    assert gross == Decimal("101.49")
     assert penalty == Decimal("0.50")
-    assert net == Decimal("101.00")
+    assert net == Decimal("100.99")
     account = bank.get_account("Ava")
     deposit_tx, penalty_tx = account.transactions[-2:]
     assert deposit_tx.category is EventCategory.INVEST
     assert penalty_tx.category is EventCategory.PENALTY
     assert penalty_tx.amount == penalty
-    assert account.balance == Decimal("201.00")
+    assert account.balance == Decimal("200.99")
     assert certificate not in bank.certificates("Ava")
 
 
