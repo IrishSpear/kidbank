@@ -15,6 +15,7 @@ straight-forward for the target environment.
 
 from __future__ import annotations
 
+import calendar
 import csv
 import io
 import json
@@ -547,6 +548,75 @@ def base_styles() -> str:
       .pill{display:inline-block; padding:4px 8px; border-radius:999px; background:#1f2937; color:#cbd5e1; font-size:12px}
       .kiosk{display:flex; gap:16px; align-items:center; justify-content:space-between}
       .kiosk .balance{font-size:52px; font-weight:900}
+      .hero-card{display:flex; gap:24px; align-items:flex-start; justify-content:space-between;}
+      .hero-card__intro{display:flex; flex-direction:column; gap:8px; max-width:60%;}
+      .hero-card__greeting{font-size:28px; font-weight:700;}
+      .hero-card__meta{color:var(--muted); font-size:14px;}
+      .hero-card__badges .pill{margin-right:6px; margin-top:4px;}
+      .hero-card__progress{margin-top:4px;}
+      .hero-card__progress-label{font-weight:600; font-size:14px;}
+      .progress-bar{width:100%; height:8px; border-radius:999px; background:rgba(148,163,184,0.2); overflow:hidden; margin-top:6px;}
+      .progress-bar__fill{height:100%; background:var(--accent);}
+      .hero-card__balance{text-align:right; min-width:200px;}
+      .hero-card__amount{font-size:42px; font-weight:800;}
+      .hero-card__allowance{margin-top:6px; font-size:14px;}
+      .hero-card__pill{background:rgba(37,99,235,0.18); color:var(--text);}
+      .overview-stats-grid{display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:16px; margin:16px 0;}
+      .stat-card{background:rgba(15,23,42,0.6); border-radius:12px; padding:16px; display:flex; flex-direction:column; gap:6px; box-shadow:inset 0 0 0 1px rgba(148,163,184,0.08);}
+      .stat-card__label{font-size:13px; color:var(--muted); text-transform:uppercase; letter-spacing:0.04em;}
+      .stat-card__value{font-size:26px; font-weight:700;}
+      .stat-card__meta{font-size:13px; color:var(--muted);}
+      .stat-card__action{align-self:flex-start; margin-top:8px; padding:8px 14px; border-radius:10px; background:rgba(148,163,184,0.16); color:var(--text); text-decoration:none; font-weight:600;}
+      .stat-card__action:hover{filter:brightness(1.08);}
+      .analytics-card{margin-top:18px;}
+      .insight-grid{display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); gap:14px; margin-top:12px;}
+      .insight-label{font-size:13px; color:var(--muted); text-transform:uppercase; letter-spacing:0.04em;}
+      .insight-value{font-size:24px; font-weight:700;}
+      .insight-meta{font-size:13px; color:var(--muted); margin-top:4px;}
+      .insight-note{margin-top:12px; font-size:13px;}
+      .insight-grid--tight .insight-value{font-size:20px;}
+      .insight-link{display:inline-block; margin-top:12px;}
+      .text-good{color:#22c55e;}
+      .text-bad{color:#f97316;}
+      .distribution-bar{display:flex; height:12px; border-radius:999px; overflow:hidden; background:rgba(148,163,184,0.18); margin-top:12px;}
+      .distribution-bar__segment{height:100%;}
+      .distribution-bar__segment--market{background:#38bdf8;}
+      .distribution-bar__segment--cd{background:#facc15;}
+      .distribution-legend{display:flex; justify-content:space-between; color:var(--muted); font-size:13px; margin-top:6px;}
+      .chore-dashboard{display:flex; flex-direction:column; gap:20px;}
+      .chore-header{display:flex; justify-content:space-between; align-items:flex-start; gap:16px;}
+      .chore-header__date{text-align:right;}
+      .chore-header__label{font-size:13px; color:var(--muted); text-transform:uppercase; letter-spacing:0.08em;}
+      .chore-header__value{font-size:18px; font-weight:700;}
+      .chore-columns{display:grid; grid-template-columns:2fr 1fr; gap:20px;}
+      .chore-column{display:flex; flex-direction:column; gap:12px;}
+      .chore-column__headline{font-weight:600; font-size:14px; color:var(--muted);}
+      .chore-intro{font-size:14px;}
+      .chore-item{display:flex; justify-content:space-between; gap:16px; padding:12px 0; border-bottom:1px solid #243041;}
+      .chore-item:last-child{border-bottom:none;}
+      .chore-item__info{flex:1; min-width:0;}
+      .chore-item__title{display:flex; align-items:center; gap:8px;}
+      .chore-item__type{background:rgba(37,99,235,0.18); color:var(--text);}
+      .chore-item__meta{font-size:13px;}
+      .chore-item__schedule{font-size:12px; margin-top:4px;}
+      .chore-item__action{display:flex; align-items:center;}
+      .chore-empty{padding:14px; border-radius:10px; background:rgba(148,163,184,0.08);}
+      .calendar-nav{display:flex; justify-content:space-between; align-items:center; gap:10px;}
+      .calendar-nav__btn{padding:6px 12px; border-radius:999px; background:rgba(148,163,184,0.16); color:var(--text); text-decoration:none; font-size:13px;}
+      .calendar-nav__btn:hover{filter:brightness(1.1);}
+      .calendar-nav__title{font-weight:600;}
+      .calendar-nav__today{font-size:13px; color:var(--accent); text-decoration:none; margin-top:4px; display:inline-block;}
+      .calendar-table{width:100%; border-collapse:collapse;}
+      .calendar-table th{padding:6px 4px; font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing:0.04em;}
+      .calendar-table td{padding:6px 4px; border:none; text-align:center;}
+      .calendar-table a{display:flex; align-items:center; justify-content:center; width:36px; height:36px; margin:0 auto; border-radius:999px; text-decoration:none; color:var(--text); background:rgba(148,163,184,0.12); transition:filter .15s ease, transform .15s ease;}
+      .calendar-table a:hover{filter:brightness(1.05); transform:scale(1.02);}
+      .calendar-cell--selected a{background:var(--accent); color:#fff;}
+      .calendar-cell--today a{border:2px solid var(--accent);}
+      .calendar-cell--faded a{background:rgba(148,163,184,0.06); color:var(--muted);}
+      .pill.status-available{background:rgba(148,163,184,0.18); color:var(--text);}
+      .pill.status-pending{background:#f59e0b; color:#78350f;}
+      .pill.status-paid{background:#16a34a; color:#dcfce7;}
       .admin-top{ grid-template-columns: repeat(12, minmax(0,1fr)); gap:16px; }
       .admin-top > .card{ grid-column: span 6; }
       @media (min-width:1100px){ .admin-top > .card{ grid-column: span 4; } }
@@ -572,6 +642,14 @@ def base_styles() -> str:
         .layout{grid-template-columns:1fr;}
         .sidebar{flex-direction:row; position:static; overflow-x:auto;}
         .sidebar a{white-space:nowrap;}
+        .hero-card{flex-direction:column; align-items:flex-start; gap:16px;}
+        .hero-card__intro{max-width:100%;}
+        .hero-card__balance{text-align:left;}
+        .hero-card__amount{font-size:34px;}
+        .overview-stats-grid{grid-template-columns:1fr;}
+        .chore-columns{grid-template-columns:1fr;}
+        .calendar-nav{flex-wrap:wrap;}
+        .calendar-table a{width:32px; height:32px;}
         table, thead, tbody, th, td, tr { display:block; width:100%; }
         thead { display:none; }
         tr { margin-bottom:12px; border:1px solid #243041; border-radius:8px; padding:8px; background:var(--card); }
@@ -861,10 +939,15 @@ def ensure_instances_for_kid(kid_id: str) -> None:
         session.commit()
 
 
-def list_chore_instances_for_kid(kid_id: str) -> List[Tuple[Chore, Optional[ChoreInstance]]]:
-    ensure_instances_for_kid(kid_id)
-    moment = now_local()
-    today = moment.date()
+def list_chore_instances_for_kid(
+    kid_id: str, target_day: Optional[date] = None
+) -> List[Tuple[Chore, Optional[ChoreInstance]]]:
+    now_moment = now_local()
+    selected_day = target_day or now_moment.date()
+    if target_day is None or target_day == now_moment.date():
+        ensure_instances_for_kid(kid_id)
+    moment = datetime.combine(selected_day, datetime.min.time())
+    today = selected_day
     pk_daily = period_key_for("daily", moment)
     pk_weekly = period_key_for("weekly", moment)
     pk_monthly = period_key_for("monthly", moment)
@@ -2119,7 +2202,11 @@ def kid_login(request: Request, kid_id: str = Form(...), kid_pin: str = Form(...
 
 
 @app.get("/kid", response_class=HTMLResponse)
-def kid_home(request: Request, section: str = Query("overview")) -> HTMLResponse:
+def kid_home(
+    request: Request,
+    section: str = Query("overview"),
+    chore_day: Optional[str] = Query(None),
+) -> HTMLResponse:
     if (redirect := require_kid(request)) is not None:
         return redirect
     kid_id = kid_authed(request)
@@ -2127,9 +2214,15 @@ def kid_home(request: Request, section: str = Query("overview")) -> HTMLResponse
     selected_section = (section or "overview").strip().lower()
     moment = now_local()
     today = moment.date()
+    requested_day = (chore_day or "").strip()
+    try:
+        selected_chore_day = date.fromisoformat(requested_day) if requested_day else today
+    except ValueError:
+        selected_chore_day = today
     global_infos: List[Dict[str, Any]] = []
     kid_global_claims: List[GlobalChoreClaim] = []
     global_chore_lookup: Dict[int, Chore] = {}
+    chores_today: List[Tuple[Chore, Optional[ChoreInstance]]] = []
     try:
         others: List[Child] = []
         incoming_requests: List[MoneyRequest] = []
@@ -2139,7 +2232,11 @@ def kid_home(request: Request, section: str = Query("overview")) -> HTMLResponse
             if not child:
                 request.session.pop("kid_authed", None)
                 return RedirectResponse("/", status_code=302)
-            chores = list_chore_instances_for_kid(kid_id)
+            chores_today = list_chore_instances_for_kid(kid_id, target_day=today)
+            if selected_chore_day == today:
+                chores = chores_today
+            else:
+                chores = list_chore_instances_for_kid(kid_id, target_day=selected_chore_day)
             events = session.exec(
                 select(Event)
                 .where(Event.child_id == kid_id)
@@ -2209,34 +2306,142 @@ def kid_home(request: Request, section: str = Query("overview")) -> HTMLResponse
             f"<td data-label='Reason'>{html_escape(event.reason)}</td></tr>"
             for event in events
         ) or "<tr><td>(no events)</td></tr>"
-        chore_cards = ""
+        is_selected_today = selected_chore_day == today
+        day_label = "Today" if is_selected_today else selected_chore_day.strftime("%A")
+        day_full = selected_chore_day.strftime("%B %d, %Y")
+        status_lookup: Dict[str, Tuple[str, str]] = {
+            "available": ("available", "Not started"),
+            "pending": ("pending", "Awaiting review"),
+            "paid": ("paid", "Completed"),
+        }
+        chore_tiles: List[str] = []
         for chore, inst in chores:
-            status = inst.status if inst else "available"
-            if status == "available":
-                action = (
+            status = (inst.status if inst else "available") or "available"
+            status_class, status_text = status_lookup.get(status, ("available", status.title()))
+            if is_selected_today and status == "available":
+                action_html = (
                     f"<form class='inline' method='post' action='/kid/checkoff'>"
                     f"<input type='hidden' name='chore_id' value='{chore.id}'>"
-                    f"<button type='submit'>I did this (+{usd(chore.award_cents)})</button></form>"
+                    "<button type='submit'>Mark complete</button></form>"
                 )
-            elif status == "pending":
-                action = "<span class='pill'>Pending</span>"
+            elif is_selected_today and status == "pending":
+                action_html = "<span class='pill status-pending'>Awaiting review</span>"
+            elif is_selected_today and status == "paid":
+                action_html = "<span class='pill status-paid'>Completed</span>"
             else:
-                action = "<span class='pill'>Paid</span>"
-            window = ""
+                action_html = f"<span class='pill status-{status_class}'>{status_text}</span>"
+            schedule_bits: List[str] = []
             if chore.start_date or chore.end_date:
                 start_display = html_escape(str(chore.start_date)) if chore.start_date else "…"
                 end_display = html_escape(str(chore.end_date)) if chore.end_date else "…"
-                window = (
-                    f"<div class='muted' style='margin-top:4px;'>Active: {start_display} → {end_display}</div>"
+                schedule_bits.append(f"Active {start_display} → {end_display}")
+            weekday_set = chore_weekdays(chore)
+            if weekday_set:
+                schedule_bits.append(f"Days: {format_weekdays(weekday_set)}")
+            specific_dates = chore_specific_dates(chore)
+            if specific_dates:
+                schedule_bits.append(
+                    "Dates: " + ", ".join(sorted(d.isoformat() for d in specific_dates))
                 )
-            chore_name = html_escape(chore.name)
-            chore_type = html_escape(chore.type)
-            chore_cards += (
-                f"<div class='card'><div><b>{chore_name}</b> <span class='muted'>({chore_type})</span></div>"
-                f"{window}<div style='margin-top:6px;'>{action}</div></div>"
+            schedule_line = (
+                f"<div class='muted chore-item__schedule'>{' • '.join(schedule_bits)}</div>"
+                if schedule_bits
+                else ""
             )
-        if not chore_cards:
-            chore_cards = "<div class='muted'>(no chores yet)</div>"
+            completed_line = ""
+            if inst and inst.completed_at:
+                completed_line = (
+                    f"<div class='muted chore-item__schedule'>Marked "
+                    f"{inst.completed_at.strftime('%b %d %H:%M')}</div>"
+                )
+            chore_tiles.append(
+                "<div class='chore-item'>"
+                + "<div class='chore-item__info'>"
+                + f"<div class='chore-item__title'><b>{html_escape(chore.name)}</b>"
+                + f"<span class='pill chore-item__type'>{html_escape(chore.type.title())}</span></div>"
+                + f"<div class='muted chore-item__meta'>Reward {usd(chore.award_cents)}</div>"
+                + schedule_line
+                + completed_line
+                + "</div>"
+                + f"<div class='chore-item__action'>{action_html}</div>"
+                + "</div>"
+            )
+        chore_list_html = (
+            "".join(chore_tiles) or "<div class='muted chore-empty'>No chores scheduled for this day.</div>"
+        )
+        cal = calendar.Calendar(firstweekday=0)
+        weekday_labels = list(calendar.day_abbr)
+        header_cells = "".join(f"<th>{label}</th>" for label in weekday_labels)
+        month_weeks = cal.monthdatescalendar(selected_chore_day.year, selected_chore_day.month)
+        calendar_rows = []
+        for week in month_weeks:
+            cells = []
+            for day in week:
+                cell_classes = ["calendar-cell"]
+                if day.month != selected_chore_day.month:
+                    cell_classes.append("calendar-cell--faded")
+                if day == today:
+                    cell_classes.append("calendar-cell--today")
+                if day == selected_chore_day:
+                    cell_classes.append("calendar-cell--selected")
+                day_url = f"/kid?section=chores&chore_day={day.isoformat()}"
+                cells.append(
+                    f"<td class='{' '.join(cell_classes)}'><a href='{day_url}'>{day.day}</a></td>"
+                )
+            calendar_rows.append(f"<tr>{''.join(cells)}</tr>")
+        calendar_table = (
+            "<table class='calendar-table'>"
+            + f"<thead><tr>{header_cells}</tr></thead>"
+            + f"<tbody>{''.join(calendar_rows)}</tbody>"
+            + "</table>"
+        )
+        month_start = selected_chore_day.replace(day=1)
+        month_title = month_start.strftime("%B %Y")
+        prev_month_start = (month_start - timedelta(days=1)).replace(day=1)
+        next_month_start = (month_start + timedelta(days=32)).replace(day=1)
+        prev_url = f"/kid?section=chores&chore_day={prev_month_start.isoformat()}"
+        next_url = f"/kid?section=chores&chore_day={next_month_start.isoformat()}"
+        calendar_nav = (
+            "<div class='calendar-nav'>"
+            + f"<a class='calendar-nav__btn' href='{prev_url}'>&larr; {prev_month_start.strftime('%b')}</a>"
+            + f"<div class='calendar-nav__title'>{month_title}</div>"
+            + f"<a class='calendar-nav__btn' href='{next_url}'>{next_month_start.strftime('%b')} &rarr;</a>"
+            + "</div>"
+        )
+        if not is_selected_today:
+            calendar_nav += (
+                f"<a class='calendar-nav__today' href='/kid?section=chores'>Jump to today</a>"
+            )
+        chores_intro = (
+            "<div class='muted chore-intro'>Mark chores as complete to send them for approval.</div>"
+            if is_selected_today
+            else "<div class='muted chore-intro'>Past and future days are read-only.</div>"
+        )
+        chores_content = f"""
+          <div class='card chore-dashboard'>
+            <div class='chore-header'>
+              <div>
+                <h3>Chore Overview</h3>
+                <div class='muted'>Click any calendar date to review that day's chores.</div>
+              </div>
+              <div class='chore-header__date'>
+                <span class='chore-header__label'>{day_label}</span>
+                <div class='chore-header__value'>{day_full}</div>
+              </div>
+            </div>
+            <div class='chore-columns'>
+              <div class='chore-column chore-column--tasks'>
+                {chores_intro}
+                {chore_list_html}
+              </div>
+              <div class='chore-column chore-column--calendar'>
+                <div class='chore-column__headline'>Month view</div>
+                {calendar_nav}
+                {calendar_table}
+              </div>
+            </div>
+          </div>
+        """
         global_sections = ""
         for info in global_infos:
             chore = info["chore"]
@@ -2468,8 +2673,8 @@ def kid_home(request: Request, section: str = Query("overview")) -> HTMLResponse
         """
         money_card = f"""
           <div class='card'>
-            <h3>Money Moves</h3>
-            <div class='muted'>Request money or share with siblings.</div>
+            <h3>Send/Request</h3>
+            <div class='muted'>Share allowance or ask for help from siblings.</div>
             <div style='font-weight:600; margin-top:8px;'>Request Money</div>
             {request_form}
             <div style='font-weight:600; margin-top:14px;'>Send Money</div>
@@ -2477,8 +2682,10 @@ def kid_home(request: Request, section: str = Query("overview")) -> HTMLResponse
             {pending_requests_section}
           </div>
         """
-        available_chore_count = sum(1 for _, inst in chores if not inst or inst.status == "available")
-        pending_chore_count = sum(1 for _, inst in chores if inst and inst.status == "pending")
+        available_chore_count = sum(
+            1 for _, inst in chores_today if not inst or inst.status == "available"
+        )
+        pending_chore_count = sum(1 for _, inst in chores_today if inst and inst.status == "pending")
         open_global_count = sum(
             1 for info in global_infos if info["total_claims"] < info["chore"].max_claimants
         )
@@ -2494,58 +2701,185 @@ def kid_home(request: Request, section: str = Query("overview")) -> HTMLResponse
         snapshot_ok = bool(investing_snapshot.get("ok"))
         holdings_count = investing_snapshot.get("holdings_count", 0) if snapshot_ok else 0
         cd_count = investing_snapshot.get("cd_count", 0) if snapshot_ok else 0
-        total_invested = usd(investing_snapshot.get("total_c", 0) if snapshot_ok else 0)
+        total_invested_c = investing_snapshot.get("total_c", 0) if snapshot_ok else 0
+        total_invested = usd(total_invested_c)
+        kid_name_html = html_escape(child.name)
+        kid_id_html = html_escape(child.kid_id)
+        level_points = child.total_points % 100
+        progress_pct = int(round((level_points / 100) * 100)) if child.total_points else 0
+        progress_pct = max(0, min(100, progress_pct))
+        points_to_next = 100 - level_points if level_points else 100
+        hero_html = f"""
+          <div class='card hero-card'>
+            <div class='hero-card__intro'>
+              <div class='hero-card__greeting'>Welcome, {kid_name_html}!</div>
+              <div class='hero-card__meta'>Kid ID: <span class='pill hero-card__pill'>{kid_id_html}</span></div>
+              <div class='hero-card__meta'>Level {child.level} • {child.streak_days}-day streak</div>
+              <div class='hero-card__badges'>Badges: {_badges_html(child.badges)}</div>
+              <div class='hero-card__progress'>
+                <div class='hero-card__progress-label'>Progress to next level <span class='muted'>({points_to_next} pts to go)</span></div>
+                <div class='progress-bar'><div class='progress-bar__fill' style='width:{progress_pct}%;'></div></div>
+              </div>
+            </div>
+            <div class='hero-card__balance'>
+              <div class='muted'>Account balance</div>
+              <div class='hero-card__amount'>{usd(child.balance_cents)}</div>
+              <div class='muted hero-card__allowance'>Weekly allowance {usd(child.allowance_cents)}</div>
+            </div>
+          </div>
+        """
         quick_cards: List[str] = [
             (
-                "<div class='card'><div class='muted'>Balance</div>"
-                f"<div class='stat-value'>{usd(child.balance_cents)}</div>"
-                f"<div class='muted' style='margin-top:4px;'>Allowance {usd(child.allowance_cents)} / week</div>"
-                "</div>"
+                "<div class='stat-card'>"
+                "<div class='stat-card__label'>Today's chores</div>"
+                f"<div class='stat-card__value'>{available_chore_count} ready</div>"
+                f"<div class='stat-card__meta'>Pending approval {pending_chore_count}</div>"
+                "<a href='/kid?section=chores' class='stat-card__action'>Open chores</a></div>"
             ),
             (
-                "<div class='card'><div class='muted'>Chores</div>"
-                f"<div class='stat-value'>{available_chore_count} ready</div>"
-                f"<div class='muted' style='margin-top:4px;'>Pending approval {pending_chore_count}</div>"
-                "<a href='/kid?section=chores' class='button-link secondary' style='margin-top:10px;'>Open chores</a></div>"
+                "<div class='stat-card'>"
+                "<div class='stat-card__label'>Free-for-all</div>"
+                f"<div class='stat-card__value'>{open_global_count} open</div>"
+                f"<div class='stat-card__meta'>Pending submissions {pending_global_count}</div>"
+                "<a href='/kid?section=freeforall' class='stat-card__action'>See challenges</a></div>"
             ),
             (
-                "<div class='card'><div class='muted'>Free-for-all</div>"
-                f"<div class='stat-value'>{open_global_count} open</div>"
-                f"<div class='muted' style='margin-top:4px;'>Pending submissions {pending_global_count}</div>"
-                "<a href='/kid?section=freeforall' class='button-link secondary' style='margin-top:10px;'>See chores</a></div>"
+                "<div class='stat-card'>"
+                "<div class='stat-card__label'>Goals</div>"
+                f"<div class='stat-card__value'>{len(goals)} active</div>"
+                f"<div class='stat-card__meta'>Reached {achieved_goals}</div>"
+                "<a href='/kid?section=goals' class='stat-card__action'>Manage goals</a></div>"
             ),
             (
-                "<div class='card'><div class='muted'>Goals</div>"
-                f"<div class='stat-value'>{len(goals)} active</div>"
-                f"<div class='muted' style='margin-top:4px;'>Reached {achieved_goals}</div>"
-                "<a href='/kid?section=goals' class='button-link secondary' style='margin-top:10px;'>View goals</a></div>"
-            ),
-            (
-                "<div class='card'><div class='muted'>Money moves</div>"
-                f"<div class='stat-value'>{incoming_count} requests</div>"
-                f"<div class='muted' style='margin-top:4px;'>You sent {pending_outgoing_count} pending</div>"
-                "<a href='/kid?section=money' class='button-link secondary' style='margin-top:10px;'>Go to money</a></div>"
+                "<div class='stat-card'>"
+                "<div class='stat-card__label'>Send/Request</div>"
+                f"<div class='stat-card__value'>{incoming_count} waiting</div>"
+                f"<div class='stat-card__meta'>Outgoing pending {pending_outgoing_count}</div>"
+                "<a href='/kid?section=money' class='stat-card__action'>Open hub</a></div>"
             ),
         ]
         if snapshot_ok:
             quick_cards.append(
-                "<div class='card'><div class='muted'>Investing</div>"
-                f"<div class='stat-value'>{total_invested}</div>"
-                f"<div class='muted' style='margin-top:4px;'>Markets {holdings_count} • CDs {cd_count}</div>"
-                "<a href='/kid?section=investing' class='button-link secondary' style='margin-top:10px;'>View investing</a></div>"
+                "<div class='stat-card'>"
+                "<div class='stat-card__label'>Investing</div>"
+                f"<div class='stat-card__value'>{total_invested}</div>"
+                f"<div class='stat-card__meta'>Markets {holdings_count} • CDs {cd_count}</div>"
+                "<a href='/kid?section=investing' class='stat-card__action'>View details</a></div>"
             )
         else:
             quick_cards.append(
-                "<div class='card'><div class='muted'>Investing</div><div class='stat-value'>—</div>"
-                "<div class='muted' style='margin-top:4px;'>Data unavailable.</div>"
-                "<a href='/kid?section=investing' class='button-link secondary' style='margin-top:10px;'>View investing</a></div>"
+                "<div class='stat-card'>"
+                "<div class='stat-card__label'>Investing</div>"
+                "<div class='stat-card__value'>—</div>"
+                "<div class='stat-card__meta'>Link a market to begin</div>"
+                "<a href='/kid?section=investing' class='stat-card__action'>Set up</a></div>"
             )
-        overview_quick_html = (
-            "<div class='grid admin-top' style='margin-top:12px;'>" + "".join(quick_cards) + "</div>"
-        )
+        overview_quick_html = "<div class='overview-stats-grid'>" + "".join(quick_cards) + "</div>"
+        lookback_start = moment - timedelta(days=30)
+        recent_events = [
+            event for event in events if event.timestamp >= lookback_start and event.change_cents
+        ]
+        earned_c = sum(event.change_cents for event in recent_events if event.change_cents > 0)
+        spent_c = sum(-event.change_cents for event in recent_events if event.change_cents < 0)
+        net_cents = earned_c - spent_c
+        avg_daily_c = 0
+        if recent_events:
+            avg_daily_c = int(
+                (Decimal(net_cents) / Decimal(30)).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+            )
+        biggest_event = max(recent_events, key=lambda ev: abs(ev.change_cents), default=None)
+        if biggest_event:
+            biggest_reason = html_escape(biggest_event.reason or "Activity")
+            biggest_amount = usd(biggest_event.change_cents)
+            biggest_when = biggest_event.timestamp.strftime("%b %d")
+            biggest_line = f"Top move: {biggest_amount} for {biggest_reason} on {biggest_when}."
+        else:
+            biggest_line = "No recent money movement."
+        net_class = "text-good" if net_cents >= 0 else "text-bad"
+        money_insights_html = f"""
+          <div class='card analytics-card'>
+            <h3>Money insights</h3>
+            <div class='muted'>Last 30 days</div>
+            <div class='insight-grid'>
+              <div>
+                <div class='insight-label'>Earned</div>
+                <div class='insight-value text-good'>{usd(earned_c)}</div>
+              </div>
+              <div>
+                <div class='insight-label'>Spent</div>
+                <div class='insight-value text-bad'>{usd(spent_c)}</div>
+              </div>
+              <div>
+                <div class='insight-label'>Net change</div>
+                <div class='insight-value {net_class}'>{usd(net_cents)}</div>
+                <div class='insight-meta'>Avg {usd(avg_daily_c)}/day</div>
+              </div>
+            </div>
+            <div class='muted insight-note'>{biggest_line}</div>
+          </div>
+        """
+        if snapshot_ok:
+            total_market_c = investing_snapshot.get("total_market_c", 0)
+            market_pct = (
+                int(round((total_market_c / total_invested_c) * 100))
+                if total_invested_c
+                else 0
+            )
+            market_pct = max(0, min(100, market_pct))
+            cd_pct = max(0, 100 - market_pct)
+            primary = investing_snapshot.get("primary") or {}
+            primary_symbol = html_escape(str(primary.get("symbol", "SP500")))
+            primary_value = usd(primary.get("value_c", 0))
+            rate_summary = html_escape(investing_snapshot.get("rate_summary", ""))
+            ready_count = investing_snapshot.get("ready_count", 0)
+            distribution_bar = (
+                "<div class='distribution-bar'>"
+                + f"<div class='distribution-bar__segment distribution-bar__segment--market' style='width:{market_pct}%;'></div>"
+                + f"<div class='distribution-bar__segment distribution-bar__segment--cd' style='width:{cd_pct}%;'></div>"
+                + "</div>"
+            )
+            rate_line = (
+                f"<div class='muted insight-note'>CD rates {rate_summary}</div>"
+                if rate_summary
+                else ""
+            )
+            investing_overview_html = f"""
+          <div class='card analytics-card investing-summary'>
+            <h3>Investing progress</h3>
+            <div class='muted'>Distribution of your investing balance.</div>
+            {distribution_bar}
+            <div class='distribution-legend'><span>Markets {market_pct}%</span><span>CDs {cd_pct}%</span></div>
+            <div class='insight-grid insight-grid--tight'>
+              <div>
+                <div class='insight-label'>Total invested</div>
+                <div class='insight-value'>{total_invested}</div>
+              </div>
+              <div>
+                <div class='insight-label'>Holdings</div>
+                <div class='insight-value'>{holdings_count}</div>
+                <div class='insight-meta'>{primary_symbol} {primary_value}</div>
+              </div>
+              <div>
+                <div class='insight-label'>CDs</div>
+                <div class='insight-value'>{cd_count}</div>
+                <div class='insight-meta'>{ready_count} ready to cash out</div>
+              </div>
+            </div>
+            {rate_line}
+            <a href='/kid?section=investing' class='button-link secondary insight-link'>Open investing tools</a>
+          </div>
+        """
+        else:
+            investing_overview_html = """
+          <div class='card analytics-card investing-summary'>
+            <h3>Investing progress</h3>
+            <div class='muted'>Link a market to start building your portfolio.</div>
+            <a href='/kid?section=investing' class='button-link secondary insight-link'>Set up investing</a>
+          </div>
+        """
         available_preview = [
             (chore, inst)
-            for chore, inst in chores
+            for chore, inst in chores_today
             if not inst or inst.status == "available"
         ][:3]
         highlight_items: List[str] = [
@@ -2558,11 +2892,11 @@ def kid_home(request: Request, section: str = Query("overview")) -> HTMLResponse
         ]
         if incoming_count:
             highlight_items.append(
-                f"<li><b>{incoming_count}</b> money request{'s' if incoming_count != 1 else ''} waiting for you.</li>"
+                f"<li><b>{incoming_count}</b> request{'s' if incoming_count != 1 else ''} waiting in Send/Request.</li>"
             )
         if pending_outgoing_count:
             highlight_items.append(
-                f"<li>You have <b>{pending_outgoing_count}</b> sent request{'s' if pending_outgoing_count != 1 else ''} pending.</li>"
+                f"<li>You have <b>{pending_outgoing_count}</b> outgoing request{'s' if pending_outgoing_count != 1 else ''} pending.</li>"
             )
         if pending_global_count:
             highlight_items.append(
@@ -2600,30 +2934,13 @@ def kid_home(request: Request, section: str = Query("overview")) -> HTMLResponse
             <div class='actions' style='margin-top:12px;'>
               <a href='/kid?section=chores' class='button-link secondary'>My chores</a>
               <a href='/kid?section=freeforall' class='button-link secondary'>Free-for-all</a>
-              <a href='/kid?section=money' class='button-link secondary'>Money moves</a>
+              <a href='/kid?section=money' class='button-link secondary'>Send/Request</a>
               <a href='/kid?section=goals' class='button-link secondary'>Goals</a>
               <a href='/kid?section=activity' class='button-link secondary'>Recent activity</a>
             </div>
           </div>
         """
-        kid_name_html = html_escape(child.name)
-        kid_id_html = html_escape(child.kid_id)
-        kiosk_card = f"""
-          <div class='card kiosk'>
-            <div>
-              <div class='name'>{kid_name_html} <span class='muted'>({kid_id_html})</span></div>
-              <div class='muted'>Level {child.level} • Streak {child.streak_days} day{'s' if child.streak_days != 1 else ''} • Badges: {_badges_html(child.badges)}</div>
-            </div>
-            <div class='balance'>{usd(child.balance_cents)}</div>
-          </div>
-        """
-        overview_content = kiosk_card + overview_quick_html + highlights_card
-        chores_content = f"""
-          <div class='card'>
-            <h3>My Chores</h3>
-            {chore_cards}
-          </div>
-        """
+        overview_content = hero_html + overview_quick_html + money_insights_html + investing_overview_html + highlights_card
         goals_content = f"""
           <div class='card'>
             <h3>My Goals</h3>
@@ -2647,7 +2964,7 @@ def kid_home(request: Request, section: str = Query("overview")) -> HTMLResponse
             ("chores", "My Chores", chores_content),
             ("freeforall", "Free-for-all", global_card),
             ("goals", "Goals", goals_content),
-            ("money", "Money Moves", money_content),
+            ("money", "Send/Request", money_content),
             ("investing", "Investing", investing_card),
             ("activity", "Activity", activity_content),
         ]
@@ -2824,9 +3141,11 @@ def kid_checkoff(request: Request, chore_id: int = Form(...)):
     with Session(engine) as session:
         chore = session.get(Chore, chore_id)
         if not chore or chore.kid_id != kid_id or not chore.active:
-            return RedirectResponse("/kid", status_code=302)
+            set_kid_notice(request, "That chore isn't available right now.", "error")
+            return RedirectResponse("/kid?section=chores", status_code=302)
         if not is_chore_in_window(chore, today):
-            return RedirectResponse("/kid", status_code=302)
+            set_kid_notice(request, "That chore can't be completed today.", "error")
+            return RedirectResponse("/kid?section=chores", status_code=302)
         chore_type = normalize_chore_type(chore.type)
         pk = "SPECIAL" if chore_type == "special" else period_key_for(chore_type, moment)
         query = select(ChoreInstance).where(ChoreInstance.chore_id == chore.id)
@@ -2843,7 +3162,12 @@ def kid_checkoff(request: Request, chore_id: int = Form(...)):
             inst.completed_at = datetime.utcnow()
             session.add(inst)
             session.commit()
-    return RedirectResponse("/kid", status_code=302)
+            set_kid_notice(request, f"Sent '{chore.name}' for approval!", "success")
+        elif inst.status == "pending":
+            set_kid_notice(request, "That chore is already waiting for approval.", "error")
+        else:
+            set_kid_notice(request, "That chore has already been paid out.", "error")
+    return RedirectResponse("/kid?section=chores", status_code=302)
 
 
 @app.post("/kid/global_chore/apply")
@@ -2863,16 +3187,16 @@ def kid_global_chore_apply(request: Request, chore_id: int = Form(...)):
             or not is_chore_in_window(chore, today)
         ):
             set_kid_notice(request, "That Free-for-all chore is not available right now.", "error")
-            return RedirectResponse("/kid", status_code=302)
+            return RedirectResponse("/kid?section=freeforall", status_code=302)
         period_key = global_chore_period_key(moment, chore)
         existing_claim = get_global_claim(session, chore.id, kid_id, period_key)
         if existing_claim:
             set_kid_notice(request, "You already submitted this Free-for-all chore for this period.", "error")
-            return RedirectResponse("/kid", status_code=302)
+            return RedirectResponse("/kid?section=freeforall", status_code=302)
         total_claims = count_global_claims(session, chore.id, period_key, include_pending=True)
         if total_claims >= chore.max_claimants:
             set_kid_notice(request, "All spots are taken for that chore.", "error")
-            return RedirectResponse("/kid", status_code=302)
+            return RedirectResponse("/kid?section=freeforall", status_code=302)
         claim = GlobalChoreClaim(
             chore_id=chore.id,
             kid_id=kid_id,
@@ -2882,7 +3206,7 @@ def kid_global_chore_apply(request: Request, chore_id: int = Form(...)):
         session.add(claim)
         session.commit()
     set_kid_notice(request, "Submitted your Free-for-all claim!", "success")
-    return RedirectResponse("/kid", status_code=302)
+    return RedirectResponse("/kid?section=freeforall", status_code=302)
 
 
 @app.post("/kid/request_money")
@@ -2903,13 +3227,13 @@ def kid_request_money(
         note = note[:157] + "…"
     if not target:
         set_kid_notice(request, "Choose who to ask for money.", "error")
-        return RedirectResponse("/kid", status_code=302)
+        return RedirectResponse("/kid?section=money", status_code=302)
     if target == kid_id:
         set_kid_notice(request, "Choose someone else to ask for money.", "error")
-        return RedirectResponse("/kid", status_code=302)
+        return RedirectResponse("/kid?section=money", status_code=302)
     if amount_c <= 0:
         set_kid_notice(request, "Enter an amount greater than zero to request money.", "error")
-        return RedirectResponse("/kid", status_code=302)
+        return RedirectResponse("/kid?section=money", status_code=302)
     target_name = target
     with Session(engine) as session:
         child = session.exec(select(Child).where(Child.kid_id == kid_id)).first()
@@ -2919,7 +3243,7 @@ def kid_request_money(
         target_child = session.exec(select(Child).where(Child.kid_id == target)).first()
         if not target_child:
             set_kid_notice(request, "Could not find that kid.", "error")
-            return RedirectResponse("/kid", status_code=302)
+            return RedirectResponse("/kid?section=money", status_code=302)
         target_name = target_child.name
         detail_suffix = f" — {note}" if note else ""
         money_request = MoneyRequest(
@@ -2950,7 +3274,7 @@ def kid_request_money(
         session.add(target_child)
         session.commit()
     set_kid_notice(request, f"Asked {target_name} for {usd(amount_c)}.", "success")
-    return RedirectResponse("/kid", status_code=302)
+    return RedirectResponse("/kid?section=money", status_code=302)
 
 
 @app.post("/kid/request/respond")
@@ -2966,20 +3290,20 @@ def kid_request_respond(
     decision_value = (decision or "").strip().lower()
     if decision_value not in {"accept", "decline"}:
         set_kid_notice(request, "Choose to accept or decline the request.", "error")
-        return RedirectResponse("/kid", status_code=302)
+        return RedirectResponse("/kid?section=money", status_code=302)
     with Session(engine) as session:
         money_request = session.get(MoneyRequest, request_id)
         if not money_request or money_request.to_kid_id != kid_id:
             set_kid_notice(request, "That request is no longer waiting on you.", "error")
-            return RedirectResponse("/kid", status_code=302)
+            return RedirectResponse("/kid?section=money", status_code=302)
         if money_request.status != "pending":
             set_kid_notice(request, "That request has already been handled.", "error")
-            return RedirectResponse("/kid", status_code=302)
+            return RedirectResponse("/kid?section=money", status_code=302)
         responder = session.exec(select(Child).where(Child.kid_id == kid_id)).first()
         requester = session.exec(select(Child).where(Child.kid_id == money_request.from_kid_id)).first()
         if not responder or not requester:
             set_kid_notice(request, "Could not process that request right now.", "error")
-            return RedirectResponse("/kid", status_code=302)
+            return RedirectResponse("/kid?section=money", status_code=302)
         detail_suffix = f" — {money_request.reason}" if money_request.reason else ""
         amount_text = usd(money_request.amount_cents)
         now = datetime.utcnow()
@@ -3007,10 +3331,10 @@ def kid_request_respond(
             )
             session.commit()
             set_kid_notice(request, f"Declined {requester.name}'s request.", "success")
-            return RedirectResponse("/kid", status_code=302)
+            return RedirectResponse("/kid?section=money", status_code=302)
         if responder.balance_cents < money_request.amount_cents:
             set_kid_notice(request, "Not enough funds to accept this request right now.", "error")
-            return RedirectResponse("/kid", status_code=302)
+            return RedirectResponse("/kid?section=money", status_code=302)
         responder.balance_cents -= money_request.amount_cents
         requester.balance_cents += money_request.amount_cents
         responder.updated_at = now
@@ -3036,7 +3360,7 @@ def kid_request_respond(
         )
         session.commit()
         set_kid_notice(request, f"Sent {amount_text} to {requester.name}.", "success")
-    return RedirectResponse("/kid", status_code=302)
+    return RedirectResponse("/kid?section=money", status_code=302)
 
 
 @app.post("/kid/send_money")
@@ -3057,10 +3381,10 @@ def kid_send_money(
         note = note[:157] + "…"
     if not target:
         set_kid_notice(request, "Choose who to send money to.", "error")
-        return RedirectResponse("/kid", status_code=302)
+        return RedirectResponse("/kid?section=money", status_code=302)
     if amount_c <= 0:
         set_kid_notice(request, "Enter an amount greater than zero to send money.", "error")
-        return RedirectResponse("/kid", status_code=302)
+        return RedirectResponse("/kid?section=money", status_code=302)
     recipient_name = ""
     with Session(engine) as session:
         sender = session.exec(select(Child).where(Child.kid_id == from_kid)).first()
@@ -3070,13 +3394,13 @@ def kid_send_money(
         recipient = session.exec(select(Child).where(Child.kid_id == target)).first()
         if not recipient:
             set_kid_notice(request, "Could not find that kid.", "error")
-            return RedirectResponse("/kid", status_code=302)
+            return RedirectResponse("/kid?section=money", status_code=302)
         if recipient.kid_id == sender.kid_id:
             set_kid_notice(request, "Choose someone else to send money to.", "error")
-            return RedirectResponse("/kid", status_code=302)
+            return RedirectResponse("/kid?section=money", status_code=302)
         if sender.balance_cents < amount_c:
             set_kid_notice(request, "Not enough funds to send that amount.", "error")
-            return RedirectResponse("/kid", status_code=302)
+            return RedirectResponse("/kid?section=money", status_code=302)
         description = note or "Shared money"
         sender.balance_cents -= amount_c
         sender.updated_at = datetime.utcnow()
@@ -3101,7 +3425,7 @@ def kid_send_money(
         session.commit()
         recipient_name = recipient.name
     set_kid_notice(request, f"Sent {usd(amount_c)} to {recipient_name}!", "success")
-    return RedirectResponse("/kid", status_code=302)
+    return RedirectResponse("/kid?section=money", status_code=302)
 
 
 @app.post("/kid/logout")
@@ -3117,10 +3441,12 @@ def kid_goal_create(request: Request, name: str = Form(...), target: str = Form(
     kid_id = kid_authed(request)
     assert kid_id
     target_c = to_cents_from_dollars_str(target, 0)
+    goal_name = name.strip()
     with Session(engine) as session:
-        session.add(Goal(kid_id=kid_id, name=name.strip(), target_cents=target_c))
+        session.add(Goal(kid_id=kid_id, name=goal_name, target_cents=target_c))
         session.commit()
-    return RedirectResponse("/kid", status_code=302)
+    set_kid_notice(request, f"Created goal '{goal_name}'!", "success")
+    return RedirectResponse("/kid?section=goals", status_code=302)
 
 
 @app.post("/kid/goal_deposit")
@@ -3131,14 +3457,17 @@ def kid_goal_deposit(request: Request, goal_id: int = Form(...), amount: str = F
     assert kid_id
     amount_c = to_cents_from_dollars_str(amount, 0)
     if amount_c <= 0:
-        return RedirectResponse("/kid", status_code=302)
+        set_kid_notice(request, "Enter an amount greater than zero.", "error")
+        return RedirectResponse("/kid?section=goals", status_code=302)
     with Session(engine) as session:
         goal = session.get(Goal, goal_id)
         child = session.exec(select(Child).where(Child.kid_id == kid_id)).first()
         if not goal or not child or goal.kid_id != kid_id:
-            return RedirectResponse("/kid", status_code=302)
+            set_kid_notice(request, "Could not find that goal.", "error")
+            return RedirectResponse("/kid?section=goals", status_code=302)
         if amount_c > child.balance_cents:
-            return RedirectResponse("/kid", status_code=302)
+            set_kid_notice(request, "Not enough funds to save that amount.", "error")
+            return RedirectResponse("/kid?section=goals", status_code=302)
         child.balance_cents -= amount_c
         goal.saved_cents += amount_c
         child.updated_at = datetime.utcnow()
@@ -3149,7 +3478,8 @@ def kid_goal_deposit(request: Request, goal_id: int = Form(...), amount: str = F
         session.add(goal)
         session.add(Event(child_id=kid_id, change_cents=-amount_c, reason=f"goal_deposit:{goal.name}"))
         session.commit()
-    return RedirectResponse("/kid", status_code=302)
+    set_kid_notice(request, f"Saved {usd(amount_c)} to {goal.name}.", "success")
+    return RedirectResponse("/kid?section=goals", status_code=302)
 
 
 @app.post("/kid/goal_delete")
@@ -3162,7 +3492,9 @@ def kid_goal_delete(request: Request, goal_id: int = Form(...)):
         goal = session.get(Goal, goal_id)
         child = session.exec(select(Child).where(Child.kid_id == kid_id)).first()
         if not goal or not child or goal.kid_id != kid_id:
-            return RedirectResponse("/kid", status_code=302)
+            set_kid_notice(request, "Could not find that goal.", "error")
+            return RedirectResponse("/kid?section=goals", status_code=302)
+        goal_name = goal.name
         if goal.saved_cents > 0:
             child.balance_cents += goal.saved_cents
             session.add(Event(child_id=kid_id, change_cents=goal.saved_cents, reason=f"goal_refund_delete:{goal.name}"))
@@ -3170,7 +3502,8 @@ def kid_goal_delete(request: Request, goal_id: int = Form(...)):
         child.updated_at = datetime.utcnow()
         session.add(child)
         session.commit()
-    return RedirectResponse("/kid", status_code=302)
+    set_kid_notice(request, f"Deleted goal '{goal_name}' and returned the savings.", "success")
+    return RedirectResponse("/kid?section=goals", status_code=302)
 
 
 @app.get("/kid/invest", response_class=HTMLResponse)
