@@ -44,28 +44,43 @@ class CertificateOfDeposit:
     def matures_on(self) -> datetime:
         return self.opened_on + self.term
 
-    def value(self, *, at: Optional[datetime] = None) -> Decimal:
-        """Return the accrued value as of ``at`` using simple interest."""
+    def _term_days(self) -> float:
+        return max(1.0, self.term.total_seconds() / 86400.0)
 
+    def _elapsed_days(self, at: Optional[datetime] = None) -> float:
         moment = at or datetime.utcnow()
-        total_seconds = self.term.total_seconds()
-        if total_seconds <= 0:
-            return self.payout_amount()
         elapsed_seconds = (moment - self.opened_on).total_seconds()
-        elapsed_seconds = max(0.0, min(elapsed_seconds, total_seconds))
-        progress = 0.0 if total_seconds == 0 else elapsed_seconds / total_seconds
+        if elapsed_seconds <= 0:
+            return 0.0
+        return max(0.0, min(elapsed_seconds / 86400.0, self._term_days()))
+
+    def _value_for_elapsed_days(self, days: float) -> Decimal:
+        total_days = self._term_days()
+        clamped_days = max(0.0, min(days, total_days))
         rate_float = float(self.rate)
-        if progress <= 0.0 or rate_float <= 0.0:
+        if clamped_days <= 0.0 or rate_float <= 0.0:
             return self.principal
-        factor = math.exp(progress * math.log1p(rate_float))
-        value = (self.principal * Decimal(str(factor))).quantize(Decimal("0.01"))
+        try:
+            fraction = clamped_days / total_days
+        except ZeroDivisionError:  # pragma: no cover - defensive
+            return self.principal
+        try:
+            growth = math.exp(math.log1p(rate_float) * fraction)
+        except ValueError:
+            growth = 1.0
+        value = (self.principal * Decimal(str(growth))).quantize(Decimal("0.01"))
         return value
+
+    def value(self, *, at: Optional[datetime] = None) -> Decimal:
+        """Return the accrued value as of ``at`` using daily compound interest."""
+
+        elapsed_days = self._elapsed_days(at)
+        return self._value_for_elapsed_days(elapsed_days)
 
     def payout_amount(self) -> Decimal:
         """Return the amount released upon maturity."""
 
-        interest = (self.principal * self.rate).quantize(Decimal("0.01"))
-        return self.principal + interest
+        return self._value_for_elapsed_days(self._term_days())
 
 
 @dataclass(slots=True)
@@ -224,11 +239,10 @@ class InvestmentPortfolio:
             penalty = Decimal("0.00")
         else:
             gross = certificate.value(at=moment)
-            total_days = certificate.term.days or 1
-            daily_interest = (certificate.principal * certificate.rate) / Decimal(total_days)
-            penalty = (
-                daily_interest * Decimal(min(certificate.penalty_days, total_days))
-            ).quantize(Decimal("0.01"))
+            elapsed_days = certificate._elapsed_days(moment)
+            penalty_window = max(0.0, min(float(certificate.penalty_days), elapsed_days))
+            prior_value = certificate._value_for_elapsed_days(elapsed_days - penalty_window)
+            penalty = (gross - prior_value).quantize(Decimal("0.01"))
             accrued_interest = max(Decimal("0.00"), gross - certificate.principal)
             penalty = min(penalty, accrued_interest)
         net = (gross - penalty).quantize(Decimal("0.01"))
