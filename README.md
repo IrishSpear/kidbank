@@ -80,10 +80,13 @@ stock-investing simulator described in the feature list.
 2. (Optional) create a `.env` file with custom PINs and session secret:
 
    ```env
-   MOM_PIN=1234
-   DAD_PIN=9876
+   MOM_PIN=1022
+   DAD_PIN=2097
    SESSION_SECRET=replace-me
    ```
+
+   PINs can also be updated later from the Admin → Parent PINs card; any
+   changes are stored in SQLite and override these defaults immediately.
 
 3. Launch the app:
 
