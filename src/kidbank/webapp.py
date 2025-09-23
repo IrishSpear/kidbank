@@ -22,7 +22,8 @@ import os
 import sqlite3
 from decimal import Decimal, ROUND_HALF_UP
 from datetime import date, datetime, timedelta
-from typing import Iterable, List, Literal, Optional, Tuple
+from collections import defaultdict
+from typing import DefaultDict, Dict, Iterable, List, Literal, Optional, Sequence, Set, Tuple
 from urllib.error import HTTPError, URLError
 from urllib.request import Request as URLRequest, urlopen
 
@@ -105,6 +106,8 @@ class Chore(SQLModel, table=True):
     active: bool = True
     start_date: Optional[date] = None
     end_date: Optional[date] = None
+    weekdays: Optional[str] = None  # comma-separated weekdays 0-6
+    specific_dates: Optional[str] = None  # comma-separated YYYY-MM-DD
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
 
@@ -141,6 +144,41 @@ class Certificate(SQLModel, table=True):
     term_months: int
     opened_at: datetime = Field(default_factory=datetime.utcnow)
     matured_at: Optional[datetime] = None
+    status: str = "active"  # active|matured|early
+    penalty_days: int = 0
+
+
+class GlobalChore(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    name: str
+    reward_cents: int
+    max_claims: int
+    description: Optional[str] = None
+    active: bool = True
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+class GlobalChoreClaim(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    chore_id: int
+    kid_id: str
+    comment: Optional[str] = None
+    status: str = "pending"  # pending|approved|denied|cancelled
+    amount_override_cents: Optional[int] = None
+    awarded_amount_cents: Optional[int] = None
+    submitted_at: datetime = Field(default_factory=datetime.utcnow)
+    resolved_at: Optional[datetime] = None
+
+
+class MoneyRequest(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    requester_kid_id: str
+    target_kid_id: str
+    amount_cents: int
+    comment: Optional[str] = None
+    status: str = "pending"  # pending|approved|denied|cancelled
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    resolved_at: Optional[datetime] = None
 
 
 class Investment(SQLModel, table=True):
@@ -201,6 +239,14 @@ def run_migrations() -> None:
             raw.execute("ALTER TABLE choreinstance ADD COLUMN created_at TEXT;")
         if not _column_exists(raw, "goal", "achieved_at"):
             raw.execute("ALTER TABLE goal ADD COLUMN achieved_at TEXT;")
+        if not _column_exists(raw, "chore", "weekdays"):
+            raw.execute("ALTER TABLE chore ADD COLUMN weekdays TEXT;")
+        if not _column_exists(raw, "chore", "specific_dates"):
+            raw.execute("ALTER TABLE chore ADD COLUMN specific_dates TEXT;")
+        if not _column_exists(raw, "certificate", "status"):
+            raw.execute("ALTER TABLE certificate ADD COLUMN status TEXT DEFAULT 'active';")
+        if not _column_exists(raw, "certificate", "penalty_days"):
+            raw.execute("ALTER TABLE certificate ADD COLUMN penalty_days INTEGER DEFAULT 0;")
         raw.execute(
             """
             CREATE TABLE IF NOT EXISTS investment (
@@ -221,6 +267,48 @@ def run_migrations() -> None:
                 term_months INTEGER,
                 opened_at TEXT,
                 matured_at TEXT
+            );
+            """
+        )
+        raw.execute(
+            """
+            CREATE TABLE IF NOT EXISTS globalchore (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                reward_cents INTEGER NOT NULL,
+                max_claims INTEGER NOT NULL,
+                description TEXT,
+                active INTEGER DEFAULT 1,
+                created_at TEXT
+            );
+            """
+        )
+        raw.execute(
+            """
+            CREATE TABLE IF NOT EXISTS globalchoreclaim (
+                id INTEGER PRIMARY KEY,
+                chore_id INTEGER NOT NULL,
+                kid_id TEXT NOT NULL,
+                comment TEXT,
+                status TEXT DEFAULT 'pending',
+                amount_override_cents INTEGER,
+                awarded_amount_cents INTEGER,
+                submitted_at TEXT,
+                resolved_at TEXT
+            );
+            """
+        )
+        raw.execute(
+            """
+            CREATE TABLE IF NOT EXISTS moneyrequest (
+                id INTEGER PRIMARY KEY,
+                requester_kid_id TEXT NOT NULL,
+                target_kid_id TEXT NOT NULL,
+                amount_cents INTEGER NOT NULL,
+                comment TEXT,
+                status TEXT DEFAULT 'pending',
+                created_at TEXT,
+                resolved_at TEXT
             );
             """
         )
@@ -251,8 +339,12 @@ run_migrations()
 # ---------------------------------------------------------------------------
 # Money helpers
 # ---------------------------------------------------------------------------
-CD_RATE_KEY = "cd_rate_bps"
+CD_RATE_KEY = "cd_rate_bps_default"
+LEGACY_CD_RATE_KEY = "cd_rate_bps"
+CD_RATE_TERM_PREFIX = "cd_rate_bps_"
+CD_PENALTY_PREFIX = "cd_penalty_days_"
 DEFAULT_CD_RATE_BPS = 250
+CD_TERMS: Tuple[int, ...] = (3, 6, 12)
 
 
 def usd(cents: int) -> str:
@@ -503,10 +595,89 @@ def period_key_for(chore_type: str, moment: datetime) -> str:
     return "SPECIAL"
 
 
+def chore_weekdays(chore: Chore) -> Set[int]:
+    if not chore.weekdays:
+        return set()
+    values: Set[int] = set()
+    for part in chore.weekdays.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            values.add(int(part))
+        except ValueError:
+            continue
+    return values
+
+
+def chore_specific_dates(chore: Chore) -> Set[date]:
+    if not chore.specific_dates:
+        return set()
+    dates: Set[date] = set()
+    for part in chore.specific_dates.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            dates.add(date.fromisoformat(part))
+        except ValueError:
+            continue
+    return dates
+
+
+def serialize_weekday_values(values: Sequence[int]) -> Optional[str]:
+    cleaned: List[int] = []
+    seen: Set[int] = set()
+    for raw in values:
+        try:
+            idx = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if 0 <= idx <= 6 and idx not in seen:
+            seen.add(idx)
+            cleaned.append(idx)
+    cleaned.sort()
+    return ",".join(str(idx) for idx in cleaned) if cleaned else None
+
+
+def serialize_specific_date_values(raw: str) -> Optional[str]:
+    if not raw:
+        return None
+    valid: Set[str] = set()
+    for token in raw.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            date.fromisoformat(token)
+        except ValueError:
+            continue
+        valid.add(token)
+    if not valid:
+        return None
+    return ",".join(sorted(valid))
+
+
+def split_evenly_cents(total: int, count: int) -> List[int]:
+    if count <= 0:
+        return []
+    base, remainder = divmod(max(0, total), count)
+    shares = [base for _ in range(count)]
+    for idx in range(remainder):
+        shares[idx] += 1
+    return shares
+
+
 def is_chore_in_window(chore: Chore, today: date) -> bool:
     if chore.start_date and today < chore.start_date:
         return False
     if chore.end_date and today > chore.end_date:
+        return False
+    specific = chore_specific_dates(chore)
+    if specific and today not in specific:
+        return False
+    weekdays = chore_weekdays(chore)
+    if weekdays and today.weekday() not in weekdays:
         return False
     return chore.active
 
@@ -579,15 +750,67 @@ class MetaDAO:
             session.add(MetaKV(k=key, v=value))
 
 
-def get_cd_rate_bps(session: Session) -> int:
-    raw = MetaDAO.get(session, CD_RATE_KEY)
+def _rate_key_for_term(term_months: int) -> str:
+    return f"{CD_RATE_TERM_PREFIX}{term_months}"
+
+
+def _penalty_key_for_term(term_months: int) -> str:
+    return f"{CD_PENALTY_PREFIX}{term_months}"
+
+
+def get_cd_rate_bps(session: Session, term_months: Optional[int] = None) -> int:
+    if term_months is None:
+        raw = MetaDAO.get(session, CD_RATE_KEY)
+        if raw is None:
+            legacy = MetaDAO.get(session, LEGACY_CD_RATE_KEY)
+            if legacy is None:
+                return DEFAULT_CD_RATE_BPS
+            try:
+                legacy_rate = int(legacy)
+            except ValueError:
+                return DEFAULT_CD_RATE_BPS
+            return max(0, legacy_rate)
+        try:
+            rate = int(raw)
+        except ValueError:
+            return DEFAULT_CD_RATE_BPS
+        return max(0, rate)
+    raw = MetaDAO.get(session, _rate_key_for_term(term_months))
     if raw is None:
-        return DEFAULT_CD_RATE_BPS
+        return get_cd_rate_bps(session, None)
     try:
         rate = int(raw)
     except ValueError:
-        return DEFAULT_CD_RATE_BPS
+        return get_cd_rate_bps(session, None)
     return max(0, rate)
+
+
+def set_cd_rate_bps(session: Session, term_months: Optional[int], rate_bps: int) -> None:
+    key = CD_RATE_KEY if term_months is None else _rate_key_for_term(term_months)
+    MetaDAO.set(session, key, str(max(0, rate_bps)))
+
+
+def get_cd_penalty_days(session: Session, term_months: int) -> int:
+    raw = MetaDAO.get(session, _penalty_key_for_term(term_months))
+    if raw is None:
+        return 0
+    try:
+        days = int(raw)
+    except ValueError:
+        return 0
+    return max(0, days)
+
+
+def set_cd_penalty_days(session: Session, term_months: int, days: int) -> None:
+    MetaDAO.set(session, _penalty_key_for_term(term_months), str(max(0, days)))
+
+
+def all_cd_rates(session: Session) -> Dict[int, int]:
+    return {term: get_cd_rate_bps(session, term) for term in CD_TERMS}
+
+
+def all_cd_penalties(session: Session) -> Dict[int, int]:
+    return {term: get_cd_penalty_days(session, term) for term in CD_TERMS}
 
 
 def certificate_term_days(certificate: Certificate) -> int:
@@ -1001,7 +1224,8 @@ def kid_home(request: Request) -> HTMLResponse:
             if not child:
                 request.session.pop("kid_authed", None)
                 return RedirectResponse("/", status_code=302)
-            chores = list_chore_instances_for_kid(kid_id)
+        chores = list_chore_instances_for_kid(kid_id)
+        with Session(engine) as session:
             events = session.exec(
                 select(Event)
                 .where(Event.child_id == kid_id)
@@ -1013,6 +1237,23 @@ def kid_home(request: Request) -> HTMLResponse:
                 .where(Goal.kid_id == kid_id)
                 .order_by(desc(Goal.created_at))
             ).all()
+            kids = session.exec(select(Child).order_by(Child.name)).all()
+            global_chores = session.exec(
+                select(GlobalChore).order_by(desc(GlobalChore.created_at))
+            ).all()
+            chore_claims = session.exec(
+                select(GlobalChoreClaim).order_by(desc(GlobalChoreClaim.submitted_at))
+            ).all()
+            requests_by_me = session.exec(
+                select(MoneyRequest)
+                .where(MoneyRequest.requester_kid_id == kid_id)
+                .order_by(desc(MoneyRequest.created_at))
+            ).all()
+            requests_for_me = session.exec(
+                select(MoneyRequest)
+                .where(MoneyRequest.target_kid_id == kid_id)
+                .order_by(desc(MoneyRequest.created_at))
+            ).all()
         event_rows = "".join(
             f"<tr><td data-label='When'>{event.timestamp.strftime('%Y-%m-%d %H:%M')}</td>"
             f"<td data-label='Δ Amount' class='right'>{'+' if event.change_cents>=0 else ''}{usd(event.change_cents)}</td>"
@@ -1020,6 +1261,7 @@ def kid_home(request: Request) -> HTMLResponse:
             for event in events
         ) or "<tr><td>(no events)</td></tr>"
         chore_cards = ""
+        weekday_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
         for chore, inst in chores:
             status = inst.status if inst else "available"
             if status == "available":
@@ -1032,15 +1274,95 @@ def kid_home(request: Request) -> HTMLResponse:
                 action = "<span class='pill'>Pending</span>"
             else:
                 action = "<span class='pill'>Paid</span>"
-            window = ""
+            schedule_lines: List[str] = []
             if chore.start_date or chore.end_date:
-                window = f"<div class='muted' style='margin-top:4px;'>Active: {chore.start_date or '…'} → {chore.end_date or '…'}</div>"
+                schedule_lines.append(
+                    f"Active: {chore.start_date or '…'} → {chore.end_date or '…'}"
+                )
+            days = chore_weekdays(chore)
+            if days:
+                schedule_lines.append(
+                    "Days: "
+                    + ", ".join(weekday_names[day] for day in sorted(days) if 0 <= day < 7)
+                )
+            specific = chore_specific_dates(chore)
+            if specific:
+                schedule_lines.append(
+                    "Dates: "
+                    + ", ".join(sorted(day.isoformat() for day in specific))
+                )
+            window = (
+                "<div class='muted' style='margin-top:4px;'>"
+                + " • ".join(schedule_lines)
+                + "</div>"
+            ) if schedule_lines else ""
             chore_cards += (
                 f"<div class='card'><div><b>{chore.name}</b> <span class='muted'>({chore.type})</span></div>"
                 f"{window}<div style='margin-top:6px;'>{action}</div></div>"
             )
+        claims_by_chore: DefaultDict[int, List[GlobalChoreClaim]] = defaultdict(list)
+        for claim in chore_claims:
+            claims_by_chore[claim.chore_id].append(claim)
+        latest_my_claim: Dict[int, GlobalChoreClaim] = {}
+        for claim in chore_claims:
+            if claim.kid_id != kid_id:
+                continue
+            existing = latest_my_claim.get(claim.chore_id)
+            if not existing or claim.submitted_at > existing.submitted_at:
+                latest_my_claim[claim.chore_id] = claim
+        free_for_all_html = ""
+        for global_chore in global_chores:
+            relevant_claims = claims_by_chore.get(global_chore.id, [])
+            approved = [c for c in relevant_claims if c.status == "approved"]
+            remaining = max(0, global_chore.max_claims - len(approved))
+            my_claim = latest_my_claim.get(global_chore.id)
+            if not global_chore.active and not my_claim:
+                continue
+            if my_claim:
+                if my_claim.status == "pending":
+                    status_note = "<span class='pill'>Pending approval</span>"
+                elif my_claim.status == "approved":
+                    amount = my_claim.awarded_amount_cents or global_chore.reward_cents
+                    status_note = (
+                        "<span class='pill'>Approved</span> "
+                        f"<span class='muted'>Award: {usd(amount)}</span>"
+                    )
+                elif my_claim.status == "denied":
+                    status_note = "<span class='pill danger'>Denied</span>"
+                else:
+                    status_note = "<span class='pill'>Cancelled</span>"
+            else:
+                status_note = "<span class='muted'>You haven't claimed this yet.</span>"
+            claim_form = ""
+            if global_chore.active and (not my_claim or my_claim.status in {"denied", "cancelled"}):
+                claim_form = (
+                    f"<form method='post' action='/kid/chores/global_claim' class='inline' style='margin-top:6px;'>"
+                    f"<input type='hidden' name='chore_id' value='{global_chore.id}'>"
+                    "<input name='comment' placeholder='What did you do?' style='max-width:220px;'>"
+                    "<button type='submit'>Claim Spot</button></form>"
+                )
+            elif my_claim and my_claim.status == "pending":
+                claim_form = (
+                    f"<form method='post' action='/kid/chores/global_claim/cancel' class='inline' style='margin-top:6px;'>"
+                    f"<input type='hidden' name='claim_id' value='{my_claim.id}'>"
+                    "<button type='submit' class='danger'>Cancel Request</button></form>"
+                )
+            active_note = "" if global_chore.active else "<div class='muted'>This task is closed.</div>"
+            free_for_all_html += (
+                "<div class='card'>"
+                f"<div><b>{global_chore.name}</b> <span class='muted'>(Free-for-all)</span></div>"
+                f"<div class='muted'>Reward: {usd(global_chore.reward_cents)} shared by up to {global_chore.max_claims} kids</div>"
+                f"<div class='muted'>Remaining spots: {remaining}</div>"
+                f"<div style='margin-top:4px;'>{status_note}</div>"
+                f"{active_note}"
+                f"<div style='margin-top:6px;'>{global_chore.description or ''}</div>"
+                f"{claim_form}"
+                "</div>"
+            )
         if not chore_cards:
             chore_cards = "<div class='muted'>(no chores yet)</div>"
+        if free_for_all_html:
+            chore_cards += "<h4 style='margin-top:12px;'>Free-for-all</h4>" + free_for_all_html
         goal_rows = "".join(
             f"<tr><td data-label='Goal'><b>{goal.name}</b>"
             + (" <span class='pill' title='Goal reached'>Reached</span>" if goal.saved_cents >= goal.target_cents else "")
@@ -1058,7 +1380,82 @@ def kid_home(request: Request) -> HTMLResponse:
             "<button type='submit' class='danger'>Delete</button></form></td></tr>"
             for goal in goals
         ) or "<tr><td>(no goals)</td></tr>"
+        kids_map = {kid.kid_id: kid for kid in kids}
+        others = [kid for kid in kids if kid.kid_id != kid_id]
+        if others:
+            options = "".join(
+                f"<option value='{kid.kid_id}'>{kid.name} ({kid.kid_id})</option>" for kid in others
+            )
+            send_form = (
+                "<form method='post' action='/kid/transfer/send' class='inline'>"
+                "<label>Send to</label>"
+                f"<select name='to_kid' required>{options}</select>"
+                "<input name='amount' type='text' data-money placeholder='amount $' style='max-width:120px; margin-left:6px;' required>"
+                "<input name='comment' placeholder='reason (optional)' style='margin-left:6px; max-width:160px;'>"
+                "<button type='submit' style='margin-left:6px;'>Send</button>"
+                "</form>"
+            )
+            request_form = (
+                "<form method='post' action='/kid/transfer/request' class='inline' style='margin-top:8px;'>"
+                "<label>Request from</label>"
+                f"<select name='from_kid' required>{options}</select>"
+                "<input name='amount' type='text' data-money placeholder='amount $' style='max-width:120px; margin-left:6px;' required>"
+                "<input name='comment' placeholder='reason (optional)' style='margin-left:6px; max-width:160px;'>"
+                "<button type='submit' style='margin-left:6px;'>Request</button>"
+                "</form>"
+            )
+        else:
+            send_form = "<div class='muted'>No other kids available for transfers.</div>"
+            request_form = ""
+
+        def _request_badge(req: MoneyRequest) -> str:
+            if req.status == "approved":
+                return "<span class='pill'>Approved</span>"
+            if req.status == "denied":
+                return "<span class='pill danger'>Denied</span>"
+            if req.status == "cancelled":
+                return "<span class='pill'>Cancelled</span>"
+            return "<span class='pill'>Pending</span>"
+
+        my_requests_html = "".join(
+            (
+                "<div style='margin-bottom:6px;'>"
+                f"{_request_badge(req)} <b>{usd(req.amount_cents)}</b> from {kids_map.get(req.target_kid_id, req.target_kid_id).name if req.target_kid_id in kids_map else req.target_kid_id}"
+                f"<div class='muted'>{req.comment or ''} • {req.created_at.strftime('%Y-%m-%d %H:%M')}</div>"
+                + (
+                    f"<form method='post' action='/kid/transfer/request/cancel' class='inline' style='margin-top:4px;'>"
+                    f"<input type='hidden' name='request_id' value='{req.id}'>"
+                    "<button type='submit' class='danger'>Cancel</button></form>"
+                    if req.status == "pending"
+                    else ""
+                )
+                + "</div>"
+            )
+            for req in requests_by_me
+        ) or "<div class='muted'>No requests yet.</div>"
+
+        incoming_requests_html = "".join(
+            (
+                "<div style='margin-bottom:6px;'>"
+                f"{_request_badge(req)} <b>{usd(req.amount_cents)}</b> to {child.name} from {kids_map.get(req.requester_kid_id, req.requester_kid_id).name if req.requester_kid_id in kids_map else req.requester_kid_id}"
+                f"<div class='muted'>{req.comment or ''} • {req.created_at.strftime('%Y-%m-%d %H:%M')}</div>"
+                "</div>"
+            )
+            for req in requests_for_me
+        ) or "<div class='muted'>No one has requested money from you.</div>"
+
         investing_card = _safe_investing_card(kid_id)
+        money_card = f"""
+        <div class='card'>
+          <h3>Money with Siblings</h3>
+          {send_form}
+          {request_form}
+          <h4 style='margin-top:12px;'>My Requests</h4>
+          {my_requests_html}
+          <h4 style='margin-top:12px;'>Requests for Me</h4>
+          {incoming_requests_html}
+        </div>
+        """
         inner = f"""
         <div class='card kiosk'>
           <div>
@@ -1073,6 +1470,7 @@ def kid_home(request: Request) -> HTMLResponse:
             {chore_cards}
           </div>
           {investing_card}
+          {money_card}
           <div class='card'>
             <h3>My Goals</h3>
             <form method='post' action='/kid/goal_create' class='inline'>
@@ -1108,7 +1506,6 @@ def _safe_investing_card(kid_id: str) -> str:
         cd_total_c = 0
         cd_count = 0
         ready_count = 0
-        rate_bps = DEFAULT_CD_RATE_BPS
         moment = datetime.utcnow()
         with Session(engine) as session:
             holding = session.exec(
@@ -1121,7 +1518,8 @@ def _safe_investing_card(kid_id: str) -> str:
                 .where(Certificate.matured_at == None)  # noqa: E711
                 .order_by(desc(Certificate.opened_at))
             ).all()
-            rate_bps = get_cd_rate_bps(session)
+            rate_map = all_cd_rates(session)
+            penalty_map = all_cd_penalties(session)
         if certificates:
             for certificate in certificates:
                 cd_total_c += certificate_value_cents(certificate, at=moment)
@@ -1130,7 +1528,13 @@ def _safe_investing_card(kid_id: str) -> str:
             cd_count = len(certificates)
         value_c = int(round(shares * price_c))
         total_c = value_c + cd_total_c
-        rate_pct = rate_bps / 100
+        rate_bits = []
+        for term in CD_TERMS:
+            rate = rate_map.get(term, DEFAULT_CD_RATE_BPS) / 100
+            penalty_days = penalty_map.get(term, 0)
+            penalty_note = f" • {penalty_days}d penalty" if penalty_days else ""
+            rate_bits.append(f"{term}m {rate:.2f}%{penalty_note}")
+        rate_summary = " • ".join(rate_bits)
         if cd_count:
             ready_text = f" • {ready_count} ready" if ready_count else ""
             cd_line = (
@@ -1144,7 +1548,7 @@ def _safe_investing_card(kid_id: str) -> str:
             <div class='muted'>Stocks &amp; certificates of deposit</div>
             <div style='margin-top:6px;'>Stocks: <b>{usd(value_c)}</b> ({shares:.4f} sh @ {usd(price_c)})</div>
             <div style='margin-top:4px;'>{cd_line}</div>
-            <div class='muted' style='margin-top:4px;'>Total invested: <b>{usd(total_c)}</b> • CD rate {rate_pct:.2f}% APR</div>
+            <div class='muted' style='margin-top:4px;'>Total invested: <b>{usd(total_c)}</b> • CD rates {rate_summary}</div>
             <a href='/kid/invest'><button style='margin-top:8px;'>Open Investing Dashboard</button></a>
           </div>
         """
@@ -1186,6 +1590,144 @@ def kid_checkoff(request: Request, chore_id: int = Form(...)):
             inst.completed_at = datetime.utcnow()
             session.add(inst)
             session.commit()
+    return RedirectResponse("/kid", status_code=302)
+
+
+@app.post("/kid/chores/global_claim")
+def kid_global_claim(request: Request, chore_id: int = Form(...), comment: str = Form("")):
+    if (redirect := require_kid(request)) is not None:
+        return redirect
+    kid_id = kid_authed(request)
+    assert kid_id
+    with Session(engine) as session:
+        chore = session.get(GlobalChore, chore_id)
+        if not chore or not chore.active:
+            return RedirectResponse("/kid", status_code=302)
+        existing = session.exec(
+            select(GlobalChoreClaim)
+            .where(GlobalChoreClaim.chore_id == chore_id)
+            .where(GlobalChoreClaim.kid_id == kid_id)
+            .order_by(desc(GlobalChoreClaim.submitted_at))
+        ).first()
+        if existing and existing.status in {"pending", "approved"}:
+            return RedirectResponse("/kid", status_code=302)
+        submission = GlobalChoreClaim(
+            chore_id=chore_id,
+            kid_id=kid_id,
+            comment=(comment.strip() or None),
+        )
+        session.add(submission)
+        session.commit()
+    return RedirectResponse("/kid", status_code=302)
+
+
+@app.post("/kid/chores/global_claim/cancel")
+def kid_global_claim_cancel(request: Request, claim_id: int = Form(...)):
+    if (redirect := require_kid(request)) is not None:
+        return redirect
+    kid_id = kid_authed(request)
+    assert kid_id
+    with Session(engine) as session:
+        claim = session.get(GlobalChoreClaim, claim_id)
+        if not claim or claim.kid_id != kid_id or claim.status != "pending":
+            return RedirectResponse("/kid", status_code=302)
+        claim.status = "cancelled"
+        claim.resolved_at = datetime.utcnow()
+        session.add(claim)
+        session.commit()
+    return RedirectResponse("/kid", status_code=302)
+
+
+@app.post("/kid/transfer/send")
+def kid_transfer_send(
+    request: Request,
+    to_kid: str = Form(...),
+    amount: str = Form(...),
+    comment: str = Form(""),
+):
+    if (redirect := require_kid(request)) is not None:
+        return redirect
+    kid_id = kid_authed(request)
+    assert kid_id
+    amount_c = to_cents_from_dollars_str(amount, 0)
+    if amount_c <= 0 or to_kid == kid_id:
+        return RedirectResponse("/kid", status_code=302)
+    note = comment.strip()
+    with Session(engine) as session:
+        sender = session.exec(select(Child).where(Child.kid_id == kid_id)).first()
+        recipient = session.exec(select(Child).where(Child.kid_id == to_kid)).first()
+        if not sender or not recipient or sender.balance_cents < amount_c:
+            return RedirectResponse("/kid", status_code=302)
+        sender.balance_cents -= amount_c
+        recipient.balance_cents += amount_c
+        moment = datetime.utcnow()
+        sender.updated_at = moment
+        recipient.updated_at = moment
+        session.add(sender)
+        session.add(recipient)
+        session.add(
+            Event(
+                child_id=kid_id,
+                change_cents=-amount_c,
+                reason=f"kid_transfer_send:{to_kid}{':' + note if note else ''}",
+            )
+        )
+        session.add(
+            Event(
+                child_id=to_kid,
+                change_cents=amount_c,
+                reason=f"kid_transfer_receive:{kid_id}{':' + note if note else ''}",
+            )
+        )
+        session.commit()
+    return RedirectResponse("/kid", status_code=302)
+
+
+@app.post("/kid/transfer/request")
+def kid_transfer_request(
+    request: Request,
+    from_kid: str = Form(...),
+    amount: str = Form(...),
+    comment: str = Form(""),
+):
+    if (redirect := require_kid(request)) is not None:
+        return redirect
+    kid_id = kid_authed(request)
+    assert kid_id
+    amount_c = to_cents_from_dollars_str(amount, 0)
+    if amount_c <= 0 or from_kid == kid_id:
+        return RedirectResponse("/kid", status_code=302)
+    note = comment.strip()
+    with Session(engine) as session:
+        requester = session.exec(select(Child).where(Child.kid_id == kid_id)).first()
+        target = session.exec(select(Child).where(Child.kid_id == from_kid)).first()
+        if not requester or not target:
+            return RedirectResponse("/kid", status_code=302)
+        pending = MoneyRequest(
+            requester_kid_id=kid_id,
+            target_kid_id=from_kid,
+            amount_cents=amount_c,
+            comment=note or None,
+        )
+        session.add(pending)
+        session.commit()
+    return RedirectResponse("/kid", status_code=302)
+
+
+@app.post("/kid/transfer/request/cancel")
+def kid_transfer_request_cancel(request: Request, request_id: int = Form(...)):
+    if (redirect := require_kid(request)) is not None:
+        return redirect
+    kid_id = kid_authed(request)
+    assert kid_id
+    with Session(engine) as session:
+        req = session.get(MoneyRequest, request_id)
+        if not req or req.requester_kid_id != kid_id or req.status != "pending":
+            return RedirectResponse("/kid", status_code=302)
+        req.status = "cancelled"
+        req.resolved_at = datetime.utcnow()
+        session.add(req)
+        session.commit()
     return RedirectResponse("/kid", status_code=302)
 
 
@@ -1276,7 +1818,8 @@ def kid_invest_home(request: Request) -> HTMLResponse:
                 .where(Certificate.kid_id == kid_id)
                 .order_by(desc(Certificate.opened_at))
             ).all()
-            rate_bps = get_cd_rate_bps(session)
+            rate_map = all_cd_rates(session)
+            penalty_map = all_cd_penalties(session)
 
         def fmt(value: int) -> str:
             return f"{'+' if value >= 0 else ''}{usd(value)}"
@@ -1292,7 +1835,11 @@ def kid_invest_home(request: Request) -> HTMLResponse:
             progress_pct = certificate_progress_percent(certificate, at=moment)
             rate_display = certificate.rate_bps / 100
             if certificate.matured_at:
-                status = f"Cashed out on {certificate.matured_at.strftime('%Y-%m-%d')}"
+                status = (
+                    "Closed early on {:%Y-%m-%d}".format(certificate.matured_at)
+                    if certificate.status == "early"
+                    else f"Cashed out on {certificate.matured_at.strftime('%Y-%m-%d')}"
+                )
                 progress_pct = 100.0
             elif moment >= maturity:
                 status = "Matured — ready to cash out"
@@ -1305,21 +1852,38 @@ def kid_invest_home(request: Request) -> HTMLResponse:
                 if next_maturity is None or maturity < next_maturity:
                     next_maturity = maturity
             progress_text = format_percent(progress_pct)
+            penalty_text = f"{certificate.penalty_days} days" if certificate.penalty_days else "—"
+            if certificate.matured_at or certificate.status != "active":
+                action_html = "<span class='muted'>—</span>"
+            else:
+                action_html = (
+                    f"<form method='post' action='/kid/invest/cd/withdraw' class='inline'>"
+                    f"<input type='hidden' name='certificate_id' value='{certificate.id}'>"
+                    "<button type='submit' class='danger' style='margin-top:4px;'"
+                    " onclick=\"return confirm('Withdraw early and pay the penalty?');\"">Withdraw Early</button></form>"
+                )
             cert_rows += (
                 f"<tr>"
                 f"<td data-label='Principal'>{usd(certificate.principal_cents)}</td>"
                 f"<td data-label='Rate'>{rate_display:.2f}%</td>"
                 f"<td data-label='Term'>{certificate.term_months} mo</td>"
+                f"<td data-label='Penalty'>{penalty_text}</td>"
                 f"<td data-label='Value Today' class='right'>{usd(value_c)}</td>"
                 f"<td data-label='Progress' class='right'>{progress_text}</td>"
                 f"<td data-label='Status'>{status}</td>"
+                f"<td data-label='Actions'>{action_html}</td>"
                 "</tr>"
             )
         if not cert_rows:
-            cert_rows = "<tr><td colspan='6' class='muted'>(no certificates yet)</td></tr>"
-        rate_pct_display = (rate_bps / 100) if 'rate_bps' in locals() else (DEFAULT_CD_RATE_BPS / 100)
+            cert_rows = "<tr><td colspan='8' class='muted'>(no certificates yet)</td></tr>"
+        rate_summary = []
+        for term in CD_TERMS:
+            rate_display = rate_map.get(term, DEFAULT_CD_RATE_BPS) / 100
+            penalty_days = penalty_map.get(term, 0)
+            penalty_note = f" • {penalty_days}d penalty" if penalty_days else ""
+            rate_summary.append(f"{term}m {rate_display:.2f}%{penalty_note}")
         summary_bits = [
-            f"<div><b>Current rate:</b> {rate_pct_display:.2f}% APR</div>",
+            f"<div><b>Rates:</b> {' • '.join(rate_summary)}</div>",
             f"<div>Total active value: <b>{usd(cd_total_c)}</b></div>",
         ]
         if next_maturity:
@@ -1336,6 +1900,18 @@ def kid_invest_home(request: Request) -> HTMLResponse:
                 "<button type='submit'>Cash out matured</button>"
                 "</form>"
             )
+        term_options = "".join(
+            (
+                f"<option value='{term}' {'selected' if term == 12 else ''}>{term} months — {rate_map.get(term, DEFAULT_CD_RATE_BPS) / 100:.2f}% APR"
+                + (
+                    f" (penalty {penalty_map.get(term, 0)} days)"
+                    if penalty_map.get(term, 0)
+                    else ""
+                )
+                + "</option>"
+            )
+            for term in CD_TERMS
+        )
 
         inner = f"""
         <div class='card'>
@@ -1380,14 +1956,12 @@ def kid_invest_home(request: Request) -> HTMLResponse:
             <input name='amount' type='text' data-money placeholder='amount $' required>
             <label style='margin-left:6px;'>Term</label>
             <select name='term_months'>
-              <option value='3'>3 months</option>
-              <option value='6'>6 months</option>
-              <option value='12' selected>12 months</option>
+              {term_options}
             </select>
             <button type='submit' style='margin-left:6px;'>Lock Savings</button>
           </form>
           <p class='muted' style='margin-top:6px;'>Funds move from your balance into the certificate.</p>
-          <table style='margin-top:10px;'><tr><th>Principal</th><th>Rate</th><th>Term</th><th>Value Today</th><th>Progress</th><th>Status</th></tr>{cert_rows}</table>
+          <table style='margin-top:10px;'><tr><th>Principal</th><th>Rate</th><th>Term</th><th>Penalty</th><th>Value Today</th><th>Progress</th><th>Status</th><th>Actions</th></tr>{cert_rows}</table>
         </div>
         <p class='muted' style='margin-top:10px;'><a href='/kid'>← Back to My Account</a></p>
         """
@@ -1524,13 +2098,15 @@ def kid_invest_cd_open(
         child = session.exec(select(Child).where(Child.kid_id == kid_id)).first()
         if not child or amount_c > child.balance_cents:
             return RedirectResponse("/kid/invest", status_code=302)
-        rate_bps = get_cd_rate_bps(session)
+        rate_bps = get_cd_rate_bps(session, term)
+        penalty_days = get_cd_penalty_days(session, term)
         certificate = Certificate(
             kid_id=kid_id,
             principal_cents=amount_c,
             rate_bps=rate_bps,
             term_months=term,
             opened_at=datetime.utcnow(),
+            penalty_days=penalty_days,
         )
         child.balance_cents -= amount_c
         child.updated_at = datetime.utcnow()
@@ -1572,6 +2148,7 @@ def kid_invest_cd_mature(request: Request):
                 payout_total += payout
                 matured_count += 1
                 certificate.matured_at = moment
+                certificate.status = "matured"
                 session.add(certificate)
         if payout_total > 0 and matured_count > 0:
             child.balance_cents += payout_total
@@ -1587,6 +2164,60 @@ def kid_invest_cd_mature(request: Request):
             session.commit()
         else:
             session.rollback()
+    return RedirectResponse("/kid/invest", status_code=302)
+
+
+@app.post("/kid/invest/cd/withdraw")
+def kid_invest_cd_withdraw(request: Request, certificate_id: int = Form(...)):
+    if (redirect := require_kid(request)) is not None:
+        return redirect
+    kid_id = kid_authed(request)
+    assert kid_id
+    moment = datetime.utcnow()
+    with Session(engine) as session:
+        child = session.exec(select(Child).where(Child.kid_id == kid_id)).first()
+        certificate = session.get(Certificate, certificate_id)
+        if (
+            not child
+            or not certificate
+            or certificate.kid_id != kid_id
+            or certificate.matured_at is not None
+        ):
+            return RedirectResponse("/kid/invest", status_code=302)
+        value_c = certificate_value_cents(certificate, at=moment)
+        total_days = certificate_term_days(certificate) or 1
+        penalty_days = max(0, min(certificate.penalty_days, total_days))
+        principal = Decimal(certificate.principal_cents)
+        rate = Decimal(certificate.rate_bps) / Decimal(10000)
+        daily_interest = (principal * rate) / Decimal(total_days)
+        penalty = (daily_interest * Decimal(penalty_days)).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+        accrued_interest = Decimal(max(0, value_c - certificate.principal_cents))
+        penalty = min(penalty, accrued_interest)
+        penalty_c = int(penalty)
+        child.balance_cents += value_c
+        if penalty_c > 0:
+            child.balance_cents -= penalty_c
+        child.updated_at = datetime.utcnow()
+        certificate.matured_at = moment
+        certificate.status = "early"
+        session.add(child)
+        session.add(certificate)
+        session.add(
+            Event(
+                child_id=kid_id,
+                change_cents=value_c,
+                reason=f"invest_cd_withdraw:{certificate.term_months}m",
+            )
+        )
+        if penalty_c > 0:
+            session.add(
+                Event(
+                    child_id=kid_id,
+                    change_cents=-penalty_c,
+                    reason=f"invest_cd_penalty:{penalty_days}d",
+                )
+            )
+        session.commit()
     return RedirectResponse("/kid/invest", status_code=302)
 
 
@@ -1667,9 +2298,18 @@ def admin_home(request: Request):
             .where(Goal.saved_cents >= Goal.target_cents)
             .order_by(desc(Goal.created_at))
         ).all()
-        cd_rate_bps = get_cd_rate_bps(session)
+        default_cd_rate_bps = get_cd_rate_bps(session)
+        rate_map = all_cd_rates(session)
+        penalty_map = all_cd_penalties(session)
         active_certs = session.exec(
             select(Certificate).where(Certificate.matured_at == None)  # noqa: E711
+        ).all()
+        global_chores = session.exec(select(GlobalChore).order_by(desc(GlobalChore.created_at))).all()
+        global_claims = session.exec(
+            select(GlobalChoreClaim).order_by(desc(GlobalChoreClaim.submitted_at))
+        ).all()
+        money_requests = session.exec(
+            select(MoneyRequest).order_by(desc(MoneyRequest.created_at))
         ).all()
     kids_rows = "".join(
         f"<tr>"
@@ -1696,6 +2336,7 @@ def admin_home(request: Request):
         f"</td></tr>"
         for child in kids
     ) or "<tr><td>(no kids yet)</td></tr>"
+    kid_lookup = {child.kid_id: child for child in kids}
     prize_rows = "".join(
         f"<tr><td data-label='Prize'><b>{prize.name}</b><div class='muted'>{prize.notes or ''}</div></td>"
         f"<td data-label='Cost' class='right'>{usd(prize.cost_cents)}</td>"
@@ -1747,7 +2388,7 @@ def admin_home(request: Request):
     active_cd_total = sum(certificate_value_cents(cert, at=moment_admin) for cert in active_certs)
     active_cd_count = len(active_certs)
     ready_cd = sum(1 for cert in active_certs if moment_admin >= certificate_maturity_date(cert))
-    cd_rate_pct = cd_rate_bps / 100
+    cd_rate_pct = default_cd_rate_bps / 100
     ready_note = (
         f"<div class='muted' style='margin-top:4px;'>{ready_cd} certificate{'s' if ready_cd != 1 else ''} ready to cash out.</div>"
         if ready_cd
@@ -1760,19 +2401,141 @@ def admin_home(request: Request):
       <p class='muted' style='margin-top:6px;'>When a goal is fully funded, approve the purchase (Grant) or return funds.</p>
     </div>
     """
+    rate_rows = "".join(
+        (
+            f"<tr>"
+            f"<td>{term} mo</td>"
+            f"<td>{rate_map.get(term, default_cd_rate_bps) / 100:.2f}%</td>"
+            f"<td>{penalty_map.get(term, 0)} days</td>"
+            f"<td><form method='post' action='/admin/certificates/rate' class='inline'>"
+            f"<input type='hidden' name='term' value='{term}'>"
+            f"<input name='rate' type='number' step='0.01' min='0' value='{rate_map.get(term, default_cd_rate_bps) / 100:.2f}' style='max-width:110px;'>"
+            f"<button type='submit'>Save</button></form></td>"
+            f"<td><form method='post' action='/admin/certificates/penalty' class='inline'>"
+            f"<input type='hidden' name='term' value='{term}'>"
+            f"<input name='days' type='number' min='0' value='{penalty_map.get(term, 0)}' style='max-width:90px;'>"
+            f"<button type='submit'>Save</button></form></td>"
+            "</tr>"
+        )
+        for term in CD_TERMS
+    ) or "<tr><td colspan='5' class='muted'>(no term presets)</td></tr>"
     investing_card = f"""
     <div class='card'>
       <h3>Investing Controls</h3>
-      <div><b>Current CD rate:</b> {cd_rate_pct:.2f}% APR</div>
       <div>Active certificates: <b>{active_cd_count}</b> worth <b>{usd(active_cd_total)}</b></div>
       {ready_note}
       <form method='post' action='/admin/certificates/rate' style='margin-top:10px;'>
-        <label>Set CD rate (% APR)</label>
+        <label>Default CD rate (% APR)</label>
         <input name='rate' type='number' step='0.01' min='0' value='{cd_rate_pct:.2f}' required>
-        <button type='submit' style='margin-top:8px;'>Save Rate</button>
+        <button type='submit' style='margin-top:6px;'>Save Default</button>
       </form>
+      <table style='margin-top:10px;'><tr><th>Term</th><th>Rate</th><th>Penalty</th><th>Update Rate</th><th>Update Penalty</th></tr>{rate_rows}</table>
+      <p class='muted' style='margin-top:6px;'>Updates apply to new certificates for the selected term.</p>
     </div>
     """
+    claims_by_chore_admin: DefaultDict[int, List[GlobalChoreClaim]] = defaultdict(list)
+    for claim in global_claims:
+        claims_by_chore_admin[claim.chore_id].append(claim)
+    global_chore_rows = "".join(
+        (
+            f"<tr>"
+            f"<td><b>{chore.name}</b><div class='muted'>{chore.description or ''}</div></td>"
+            f"<td>{usd(chore.reward_cents)}</td>"
+            f"<td>{chore.max_claims}</td>"
+            f"<td>{sum(1 for claim in claims_by_chore_admin.get(chore.id, []) if claim.status == 'approved')}</td>"
+            f"<td>{max(0, chore.max_claims - sum(1 for claim in claims_by_chore_admin.get(chore.id, []) if claim.status == 'approved'))}</td>"
+            f"<td><span class='pill'>{'Active' if chore.active else 'Inactive'}</span></td>"
+            f"<td class='right'>"
+            f"<form class='inline' method='post' action='/admin/global_chores/toggle'>"
+            f"<input type='hidden' name='chore_id' value='{chore.id}'>"
+            f"<input type='hidden' name='active' value={'0' if chore.active else '1'}>"
+            f"<button type='submit'{" class='danger'" if chore.active else ''}>{'Deactivate' if chore.active else 'Activate'}</button></form> "
+            f"<form class='inline' method='post' action='/admin/global_chores/delete' onsubmit=\"return confirm('Delete this global chore?');\" style='margin-left:6px;'>"
+            f"<input type='hidden' name='chore_id' value='{chore.id}'><button type='submit' class='danger'>Delete</button></form>"
+            f"</td>"
+            "</tr>"
+        )
+        for chore in global_chores
+    ) or "<tr><td colspan='7' class='muted'>(no global chores yet)</td></tr>"
+    global_chores_card = f"""
+    <div class='card'>
+      <h3>Global Chores</h3>
+      <form method='post' action='/admin/global_chores/create' class='inline'>
+        <input name='name' placeholder='Task name' required>
+        <input name='reward' type='text' data-money placeholder='reward $' style='max-width:120px;' required>
+        <input name='max_claims' type='number' min='1' value='1' style='max-width:90px;' required>
+        <input name='description' placeholder='description (optional)' style='max-width:220px;'>
+        <button type='submit' style='margin-top:6px;'>Add Global Chore</button>
+      </form>
+      <table style='margin-top:8px;'><tr><th>Name</th><th>Reward</th><th>Max Claims</th><th>Approved</th><th>Remaining</th><th>Status</th><th>Actions</th></tr>{global_chore_rows}</table>
+    </div>
+    """
+    approval_sections = ""
+    for chore in global_chores:
+        pending_claims = [claim for claim in claims_by_chore_admin.get(chore.id, []) if claim.status == "pending"]
+        if not pending_claims:
+            continue
+        approved_count = sum(1 for claim in claims_by_chore_admin.get(chore.id, []) if claim.status == "approved")
+        remaining_slots = max(0, chore.max_claims - approved_count)
+        rows = "".join(
+            (
+                f"<tr>"
+                f"<td><input type='checkbox' name='claim_id' value='{claim.id}'></td>"
+                f"<td>{kid_lookup.get(claim.kid_id).name if claim.kid_id in kid_lookup else claim.kid_id}</td>"
+                f"<td>{claim.comment or ''}</td>"
+                f"<td>{claim.submitted_at.strftime('%Y-%m-%d %H:%M')}</td>"
+                f"<td><input name='amount_{claim.id}' type='text' data-money placeholder='override $' style='max-width:110px;'></td>"
+                f"<td class='right'><button type='submit' class='danger' formaction='/admin/global_chores/deny' name='claim_id' value='{claim.id}' style='margin-left:4px;'>Deny</button></td>"
+                "</tr>"
+            )
+            for claim in pending_claims
+        )
+        approval_sections += f"""
+        <div class='subcard' style='margin-bottom:12px;'>
+          <h4>{chore.name} — {usd(chore.reward_cents)} total • {remaining_slots} slot{'s' if remaining_slots != 1 else ''} open</h4>
+          <form method='post' action='/admin/global_chores/approve'>
+            <input type='hidden' name='chore_id' value='{chore.id}'>
+            <table><tr><th>Select</th><th>Kid</th><th>Comment</th><th>Submitted</th><th>Override</th><th>Action</th></tr>{rows}</table>
+            <button type='submit' style='margin-top:6px;'>Approve Selected</button>
+          </form>
+        </div>
+        """
+    global_claims_card = (
+        f"<div class='card'><h3>Free-for-all Approvals</h3>{approval_sections}</div>"
+        if approval_sections
+        else "<div class='card'><h3>Free-for-all Approvals</h3><p class='muted'>No pending submissions.</p></div>"
+    )
+    pending_requests = [req for req in money_requests if req.status == "pending"]
+    money_requests_rows = "".join(
+        (
+            f"<tr>"
+            f"<td>{kid_lookup.get(req.requester_kid_id).name if req.requester_kid_id in kid_lookup else req.requester_kid_id} → {kid_lookup.get(req.target_kid_id).name if req.target_kid_id in kid_lookup else req.target_kid_id}</td>"
+            f"<td>{usd(req.amount_cents)}</td>"
+            f"<td>{req.comment or ''}</td>"
+            f"<td>{req.created_at.strftime('%Y-%m-%d %H:%M')}</td>"
+            f"<td class='right'>"
+            f"<form class='inline' method='post' action='/admin/money_request/approve'>"
+            f"<input type='hidden' name='request_id' value='{req.id}'>"
+            f"<button type='submit'>Approve</button></form> "
+            f"<form class='inline' method='post' action='/admin/money_request/deny' style='margin-left:6px;'>"
+            f"<input type='hidden' name='request_id' value='{req.id}'>"
+            f"<button type='submit' class='danger'>Deny</button></form>"
+            f"</td>"
+            "</tr>"
+        )
+        for req in pending_requests
+    ) or "<tr><td colspan='5' class='muted'>No pending requests.</td></tr>"
+    money_requests_card = f"""
+    <div class='card'>
+      <h3>Kid Money Requests</h3>
+      <table><tr><th>Request</th><th>Amount</th><th>Comment</th><th>Submitted</th><th>Actions</th></tr>{money_requests_rows}</table>
+    </div>
+    """
+    weekday_labels = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+    weekday_picker_html = "".join(
+        f"<label><input type='checkbox' name='weekdays' value='{idx}'> {weekday_labels[idx]}</label>"
+        for idx in range(7)
+    )
     rules_card = f"""
     <div class='card'>
       <h3>Allowance Rules</h3>
@@ -1852,6 +2615,9 @@ def admin_home(request: Request):
     <div class='grid'>
       {goals_card}
       {investing_card}
+      {global_chores_card}
+      {global_claims_card}
+      {money_requests_card}
       <div class='card'>
         <h3>Chores</h3>
         <form method='post' action='/admin/chores/create'>
@@ -1866,6 +2632,10 @@ def admin_home(request: Request):
             <div><label>Start Date (optional)</label><input name='start_date' type='date'></div>
             <div><label>End Date (optional)</label><input name='end_date' type='date'></div>
           </div>
+          <div class='muted' style='margin-top:6px;'>Weekdays (optional)</div>
+          <div style='display:flex; flex-wrap:wrap; gap:6px; margin-top:4px;'>{weekday_picker_html}</div>
+          <label style='margin-top:6px;'>Specific Dates (YYYY-MM-DD, comma separated)</label>
+          <input name='specific_dates' placeholder='2024-05-01,2024-05-15'>
           <label style='margin-top:6px;'>Notes</label><input name='notes' placeholder='Any details'>
           <button type='submit' style='margin-top:10px;'>Add Chore</button>
         </form>
@@ -1965,6 +2735,7 @@ def admin_manage_chores(request: Request, kid_id: str = Query(...)):
         if not child:
             return HTMLResponse(frame("Chores", "<div class='card'>Kid not found.</div>"))
         chores = session.exec(select(Chore).where(Chore.kid_id == kid_id).order_by(desc(Chore.created_at))).all()
+    weekday_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
     rows = "".join(
         f"<tr>"
         f"<td data-label='Name'><form class='inline' method='post' action='/admin/chores/update'>"
@@ -1979,6 +2750,15 @@ def admin_manage_chores(request: Request, kid_id: str = Query(...)):
         f"<td data-label='Window'>"
         f"<input name='start_date' type='date' value='{chore.start_date or ''}' style='max-width:160px'>"
         f"<input name='end_date' type='date' value='{chore.end_date or ''}' style='max-width:160px; margin-left:6px;'>"
+        f"<div class='muted' style='margin-top:4px;'>Days</div>"
+        f"<div style='display:flex; flex-wrap:wrap; gap:4px; margin-top:2px;'>"
+        + "".join(
+            f"<label><input type='checkbox' name='weekdays' value='{idx}' {'checked' if idx in chore_weekdays(chore) else ''}>"
+            f"{weekday_names[idx]}</label>"
+            for idx in range(7)
+        )
+        + "</div>"
+        f"<input name='specific_dates' value='{chore.specific_dates or ''}' placeholder='YYYY-MM-DD,YYYY-MM-DD' style='margin-top:4px;'>"
         f"</td>"
         f"<td data-label='Notes'><input name='notes' value='{chore.notes or ''}'></td>"
         f"<td data-label='Status'><span class='pill'>{'Active' if chore.active else 'Inactive'}</span></td>"
@@ -2013,10 +2793,23 @@ def admin_manage_chores(request: Request, kid_id: str = Query(...)):
 
 
 @app.post("/admin/chores/create")
-def admin_chore_create(request: Request, kid_id: str = Form(...), name: str = Form(...), type: str = Form(...), award: str = Form(...), start_date: Optional[str] = Form(None), end_date: Optional[str] = Form(None), notes: str = Form("")):
+def admin_chore_create(
+    request: Request,
+    kid_id: str = Form(...),
+    name: str = Form(...),
+    type: str = Form(...),
+    award: str = Form(...),
+    start_date: Optional[str] = Form(None),
+    end_date: Optional[str] = Form(None),
+    notes: str = Form(""),
+    weekdays: List[int] = Form([]),
+    specific_dates: str = Form(""),
+):
     if (redirect := require_admin(request)) is not None:
         return redirect
     award_c = to_cents_from_dollars_str(award, 0)
+    weekday_csv = serialize_weekday_values(weekdays)
+    specific_csv = serialize_specific_date_values(specific_dates)
     with Session(engine) as session:
         chore = Chore(
             kid_id=kid_id,
@@ -2026,6 +2819,8 @@ def admin_chore_create(request: Request, kid_id: str = Form(...), name: str = Fo
             notes=notes.strip() or None,
             start_date=date.fromisoformat(start_date) if start_date else None,
             end_date=date.fromisoformat(end_date) if end_date else None,
+            weekdays=weekday_csv,
+            specific_dates=specific_csv,
         )
         session.add(chore)
         session.commit()
@@ -2033,10 +2828,23 @@ def admin_chore_create(request: Request, kid_id: str = Form(...), name: str = Fo
 
 
 @app.post("/admin/chores/update")
-def admin_chore_update(request: Request, chore_id: int = Form(...), name: str = Form(...), type: str = Form(...), award: str = Form(...), start_date: Optional[str] = Form(None), end_date: Optional[str] = Form(None), notes: str = Form("")):
+def admin_chore_update(
+    request: Request,
+    chore_id: int = Form(...),
+    name: str = Form(...),
+    type: str = Form(...),
+    award: str = Form(...),
+    start_date: Optional[str] = Form(None),
+    end_date: Optional[str] = Form(None),
+    notes: str = Form(""),
+    weekdays: List[int] = Form([]),
+    specific_dates: str = Form(""),
+):
     if (redirect := require_admin(request)) is not None:
         return redirect
     award_c = to_cents_from_dollars_str(award, 0)
+    weekday_csv = serialize_weekday_values(weekdays)
+    specific_csv = serialize_specific_date_values(specific_dates)
     with Session(engine) as session:
         chore = session.get(Chore, chore_id)
         if not chore:
@@ -2047,6 +2855,8 @@ def admin_chore_update(request: Request, chore_id: int = Form(...), name: str = 
         chore.notes = notes.strip() or None
         chore.start_date = date.fromisoformat(start_date) if start_date else None
         chore.end_date = date.fromisoformat(end_date) if end_date else None
+        chore.weekdays = weekday_csv
+        chore.specific_dates = specific_csv
         session.add(chore)
         session.commit()
     return RedirectResponse(f"/admin/chores?kid_id={chore.kid_id}", status_code=302)
@@ -2642,8 +3452,235 @@ def admin_rules(request: Request, bonus_all: Optional[str] = Form(None), bonus: 
     return RedirectResponse("/admin", status_code=302)
 
 
+@app.post("/admin/global_chores/create")
+def admin_global_chores_create(
+    request: Request,
+    name: str = Form(...),
+    reward: str = Form(...),
+    max_claims: str = Form(...),
+    description: str = Form(""),
+):
+    if (redirect := require_admin(request)) is not None:
+        return redirect
+    reward_c = to_cents_from_dollars_str(reward, 0)
+    try:
+        max_claims_value = int(max_claims)
+    except (TypeError, ValueError):
+        max_claims_value = 1
+    max_claims_value = max(1, max_claims_value)
+    with Session(engine) as session:
+        chore = GlobalChore(
+            name=name.strip(),
+            reward_cents=reward_c,
+            max_claims=max_claims_value,
+            description=description.strip() or None,
+        )
+        session.add(chore)
+        session.commit()
+    return RedirectResponse("/admin", status_code=302)
+
+
+@app.post("/admin/global_chores/toggle")
+def admin_global_chores_toggle(request: Request, chore_id: int = Form(...), active: str = Form(...)):
+    if (redirect := require_admin(request)) is not None:
+        return redirect
+    with Session(engine) as session:
+        chore = session.get(GlobalChore, chore_id)
+        if not chore:
+            return RedirectResponse("/admin", status_code=302)
+        chore.active = active not in {"0", "false", "False"}
+        session.add(chore)
+        session.commit()
+    return RedirectResponse("/admin", status_code=302)
+
+
+@app.post("/admin/global_chores/delete")
+def admin_global_chores_delete(request: Request, chore_id: int = Form(...)):
+    if (redirect := require_admin(request)) is not None:
+        return redirect
+    with Session(engine) as session:
+        chore = session.get(GlobalChore, chore_id)
+        if not chore:
+            return RedirectResponse("/admin", status_code=302)
+        claims = session.exec(
+            select(GlobalChoreClaim).where(GlobalChoreClaim.chore_id == chore_id)
+        ).all()
+        for claim in claims:
+            session.delete(claim)
+        session.delete(chore)
+        session.commit()
+    return RedirectResponse("/admin", status_code=302)
+
+
+@app.post("/admin/global_chores/deny")
+def admin_global_chores_deny(request: Request, claim_id: int = Form(...)):
+    if (redirect := require_admin(request)) is not None:
+        return redirect
+    with Session(engine) as session:
+        claim = session.get(GlobalChoreClaim, claim_id)
+        if not claim or claim.status != "pending":
+            return RedirectResponse("/admin", status_code=302)
+        claim.status = "denied"
+        claim.resolved_at = datetime.utcnow()
+        session.add(claim)
+        session.commit()
+    return RedirectResponse("/admin", status_code=302)
+
+
+@app.post("/admin/global_chores/approve")
+async def admin_global_chores_approve(request: Request):
+    if (redirect := require_admin(request)) is not None:
+        return redirect
+    form = await request.form()
+    try:
+        chore_id = int(form.get("chore_id"))
+    except (TypeError, ValueError):
+        return RedirectResponse("/admin", status_code=302)
+    raw_claim_ids = form.getlist("claim_id") if hasattr(form, "getlist") else []
+    claim_ids: List[int] = []
+    for raw in raw_claim_ids:
+        try:
+            claim_ids.append(int(raw))
+        except (TypeError, ValueError):
+            continue
+    if not claim_ids:
+        return RedirectResponse("/admin", status_code=302)
+    with Session(engine) as session:
+        chore = session.get(GlobalChore, chore_id)
+        if not chore:
+            return RedirectResponse("/admin", status_code=302)
+        approved_existing = session.exec(
+            select(GlobalChoreClaim)
+            .where(GlobalChoreClaim.chore_id == chore_id)
+            .where(GlobalChoreClaim.status == "approved")
+        ).all()
+        approved_count = len(approved_existing)
+        remaining_slots = max(0, chore.max_claims - approved_count)
+        if remaining_slots <= 0:
+            return RedirectResponse("/admin", status_code=302)
+        selected: List[GlobalChoreClaim] = []
+        for cid in claim_ids:
+            claim = session.get(GlobalChoreClaim, cid)
+            if not claim or claim.chore_id != chore_id or claim.status != "pending":
+                continue
+            selected.append(claim)
+            if len(selected) >= remaining_slots:
+                break
+        if not selected:
+            return RedirectResponse("/admin", status_code=302)
+        overrides: Dict[int, int] = {}
+        for claim in selected:
+            raw_amount = form.get(f"amount_{claim.id}")
+            if raw_amount:
+                amount_c = to_cents_from_dollars_str(str(raw_amount), 0)
+                if amount_c > 0:
+                    overrides[claim.id] = amount_c
+        awarded_so_far = sum(cl.awarded_amount_cents or 0 for cl in approved_existing)
+        remaining_pool = max(0, chore.reward_cents - awarded_so_far)
+        remaining_after_override = max(0, remaining_pool - sum(overrides.values()))
+        non_override = [claim for claim in selected if claim.id not in overrides]
+        auto_shares = split_evenly_cents(remaining_after_override, len(non_override))
+        auto_share_map = {
+            claim.id: share for claim, share in zip(non_override, auto_shares)
+        }
+        moment = datetime.utcnow()
+        approved_now = 0
+        for claim in selected:
+            child = session.exec(select(Child).where(Child.kid_id == claim.kid_id)).first()
+            if not child:
+                continue
+            override_amount = overrides.get(claim.id)
+            amount_c = override_amount if override_amount is not None else auto_share_map.get(claim.id, 0)
+            child.balance_cents += amount_c
+            child.updated_at = moment
+            session.add(child)
+            claim.status = "approved"
+            claim.resolved_at = moment
+            claim.amount_override_cents = override_amount
+            claim.awarded_amount_cents = amount_c
+            session.add(claim)
+            approved_now += 1
+            if amount_c > 0:
+                session.add(
+                    Event(
+                        child_id=child.kid_id,
+                        change_cents=amount_c,
+                        reason=f"global_chore:{chore.name}",
+                    )
+                )
+        total_approved = approved_count + approved_now
+        if total_approved >= chore.max_claims:
+            chore.active = False
+        session.add(chore)
+        session.commit()
+    return RedirectResponse("/admin", status_code=302)
+
+
+@app.post("/admin/money_request/approve")
+def admin_money_request_approve(request: Request, request_id: int = Form(...)):
+    if (redirect := require_admin(request)) is not None:
+        return redirect
+    with Session(engine) as session:
+        req = session.get(MoneyRequest, request_id)
+        if not req or req.status != "pending":
+            return RedirectResponse("/admin", status_code=302)
+        requester = session.exec(select(Child).where(Child.kid_id == req.requester_kid_id)).first()
+        target = session.exec(select(Child).where(Child.kid_id == req.target_kid_id)).first()
+        if not requester or not target:
+            return RedirectResponse("/admin", status_code=302)
+        amount_c = max(0, req.amount_cents)
+        moment = datetime.utcnow()
+        if amount_c <= 0 or target.balance_cents < amount_c:
+            req.status = "denied"
+            req.resolved_at = moment
+            session.add(req)
+            session.commit()
+            return RedirectResponse("/admin", status_code=302)
+        requester.balance_cents += amount_c
+        target.balance_cents -= amount_c
+        requester.updated_at = moment
+        target.updated_at = moment
+        req.status = "approved"
+        req.resolved_at = moment
+        note = f":{req.comment}" if req.comment else ""
+        session.add(requester)
+        session.add(target)
+        session.add(req)
+        session.add(
+            Event(
+                child_id=requester.kid_id,
+                change_cents=amount_c,
+                reason=f"money_request_receive:{target.kid_id}{note}",
+            )
+        )
+        session.add(
+            Event(
+                child_id=target.kid_id,
+                change_cents=-amount_c,
+                reason=f"money_request_pay:{requester.kid_id}{note}",
+            )
+        )
+        session.commit()
+    return RedirectResponse("/admin", status_code=302)
+
+
+@app.post("/admin/money_request/deny")
+def admin_money_request_deny(request: Request, request_id: int = Form(...)):
+    if (redirect := require_admin(request)) is not None:
+        return redirect
+    with Session(engine) as session:
+        req = session.get(MoneyRequest, request_id)
+        if not req or req.status != "pending":
+            return RedirectResponse("/admin", status_code=302)
+        req.status = "denied"
+        req.resolved_at = datetime.utcnow()
+        session.add(req)
+        session.commit()
+    return RedirectResponse("/admin", status_code=302)
+
+
 @app.post("/admin/certificates/rate")
-def admin_set_certificate_rate(request: Request, rate: str = Form(...)):
+def admin_set_certificate_rate(request: Request, rate: str = Form(...), term: Optional[int] = Form(None)):
     if (redirect := require_admin(request)) is not None:
         return redirect
     raw = (rate or "").strip()
@@ -2654,7 +3691,23 @@ def admin_set_certificate_rate(request: Request, rate: str = Form(...)):
         return HTMLResponse(frame("Admin", body), status_code=400)
     rate_bps = max(0, int(round(rate_value * 100)))
     with Session(engine) as session:
-        MetaDAO.set(session, CD_RATE_KEY, str(rate_bps))
+        set_cd_rate_bps(session, term, rate_bps)
+        session.commit()
+    return RedirectResponse("/admin", status_code=302)
+
+
+@app.post("/admin/certificates/penalty")
+def admin_set_certificate_penalty(request: Request, term: str = Form(...), days: str = Form(...)):
+    if (redirect := require_admin(request)) is not None:
+        return redirect
+    try:
+        term_value = int(term)
+        days_value = int(days)
+    except (TypeError, ValueError):
+        body = "<div class='card'><p style='color:#ff6b6b;'>Enter numeric term and penalty days.</p><p><a href='/admin'>Back</a></p></div>"
+        return HTMLResponse(frame("Admin", body), status_code=400)
+    with Session(engine) as session:
+        set_cd_penalty_days(session, term_value, max(0, days_value))
         session.commit()
     return RedirectResponse("/admin", status_code=302)
 
