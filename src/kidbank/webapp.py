@@ -20,6 +20,7 @@ import io
 import json
 import os
 import sqlite3
+from dataclasses import dataclass
 from decimal import Decimal, ROUND_HALF_UP
 from datetime import date, datetime, timedelta
 from html import escape as html_escape
@@ -151,6 +152,7 @@ class Certificate(SQLModel, table=True):
     principal_cents: int
     rate_bps: int
     term_months: int
+    term_days: int = Field(default=0)
     opened_at: datetime = Field(default_factory=datetime.utcnow)
     matured_at: Optional[datetime] = None
 
@@ -213,6 +215,18 @@ def run_migrations() -> None:
             raw.execute("ALTER TABLE choreinstance ADD COLUMN created_at TEXT;")
         if not _column_exists(raw, "goal", "achieved_at"):
             raw.execute("ALTER TABLE goal ADD COLUMN achieved_at TEXT;")
+        if not _column_exists(raw, "certificate", "term_days"):
+            raw.execute("ALTER TABLE certificate ADD COLUMN term_days INTEGER DEFAULT 0;")
+            raw.execute(
+                """
+                UPDATE certificate
+                SET term_days = CASE
+                    WHEN term_months > 0 THEN term_months * 30
+                    ELSE 0
+                END
+                WHERE term_days = 0;
+                """
+            )
         raw.execute(
             """
             CREATE TABLE IF NOT EXISTS investment (
@@ -265,6 +279,28 @@ run_migrations()
 # ---------------------------------------------------------------------------
 CD_RATE_KEY = "cd_rate_bps"
 DEFAULT_CD_RATE_BPS = 250
+
+
+@dataclass(frozen=True)
+class CdTermOption:
+    key: str
+    label: str
+    days: int
+    months: Optional[int] = None
+
+
+CD_TERM_OPTIONS: Tuple[CdTermOption, ...] = (
+    CdTermOption("1w", "1 week", 7, None),
+    CdTermOption("3m", "3 months", 90, 3),
+    CdTermOption("6m", "6 months", 180, 6),
+    CdTermOption("12m", "12 months", 360, 12),
+)
+DEFAULT_CD_TERM_KEY = "12m"
+CD_TERMS_BY_KEY = {option.key: option for option in CD_TERM_OPTIONS}
+CD_TERMS_BY_DAYS = {option.days: option for option in CD_TERM_OPTIONS}
+CD_TERMS_BY_MONTHS = {
+    option.months: option for option in CD_TERM_OPTIONS if option.months is not None
+}
 
 
 def usd(cents: int) -> str:
@@ -602,19 +638,68 @@ class MetaDAO:
             session.add(MetaKV(k=key, v=value))
 
 
-def get_cd_rate_bps(session: Session) -> int:
-    raw = MetaDAO.get(session, CD_RATE_KEY)
+def _parse_rate(raw: Optional[str]) -> Optional[int]:
     if raw is None:
-        return DEFAULT_CD_RATE_BPS
+        return None
     try:
-        rate = int(raw)
+        return max(0, int(raw))
     except ValueError:
-        return DEFAULT_CD_RATE_BPS
-    return max(0, rate)
+        return None
+
+
+def get_cd_rate_bps(session: Session, term_key: Optional[str] = None) -> int:
+    if term_key:
+        specific_key = f"{CD_RATE_KEY}:{term_key}"
+        specific = _parse_rate(MetaDAO.get(session, specific_key))
+        if specific is not None:
+            return specific
+    legacy = _parse_rate(MetaDAO.get(session, CD_RATE_KEY))
+    if legacy is not None:
+        return legacy
+    return DEFAULT_CD_RATE_BPS
+
+
+def get_cd_rates_bps(session: Session) -> Dict[str, int]:
+    rates: Dict[str, int] = {}
+    for option in CD_TERM_OPTIONS:
+        rates[option.key] = get_cd_rate_bps(session, option.key)
+    return rates
+
+
+def format_cd_rates(rates_bps: Dict[str, int]) -> str:
+    parts = []
+    for option in CD_TERM_OPTIONS:
+        rate_bps = rates_bps.get(option.key, DEFAULT_CD_RATE_BPS)
+        parts.append(f"{option.label} {rate_bps / 100:.2f}%")
+    return ", ".join(parts)
+
+
+def resolve_cd_term(term_key: str) -> CdTermOption:
+    return CD_TERMS_BY_KEY.get(term_key, CD_TERMS_BY_KEY[DEFAULT_CD_TERM_KEY])
 
 
 def certificate_term_days(certificate: Certificate) -> int:
+    if getattr(certificate, "term_days", 0):
+        return max(0, certificate.term_days)
     return max(0, certificate.term_months) * 30
+
+
+def certificate_term_label(certificate: Certificate) -> str:
+    days = certificate_term_days(certificate)
+    if days:
+        option = CD_TERMS_BY_DAYS.get(days)
+        if option:
+            return option.label
+        if days % 7 == 0:
+            weeks = days // 7
+            return f"{weeks} week{'s' if weeks != 1 else ''}"
+        return f"{days} days"
+    if certificate.term_months > 0:
+        option = CD_TERMS_BY_MONTHS.get(certificate.term_months)
+        if option:
+            return option.label
+        return f"{certificate.term_months} mo"
+    return "—"
 
 
 def certificate_maturity_date(certificate: Certificate) -> datetime:
@@ -1263,7 +1348,8 @@ def _safe_investing_card(kid_id: str) -> str:
         cd_total_c = 0
         cd_count = 0
         ready_count = 0
-        rate_bps = DEFAULT_CD_RATE_BPS
+        rates_bps = {option.key: DEFAULT_CD_RATE_BPS for option in CD_TERM_OPTIONS}
+        rate_bps_default = DEFAULT_CD_RATE_BPS
         moment = datetime.utcnow()
         with Session(engine) as session:
             holding = session.exec(
@@ -1276,7 +1362,8 @@ def _safe_investing_card(kid_id: str) -> str:
                 .where(Certificate.matured_at == None)  # noqa: E711
                 .order_by(desc(Certificate.opened_at))
             ).all()
-            rate_bps = get_cd_rate_bps(session)
+            rates_bps = get_cd_rates_bps(session)
+            rate_bps_default = rates_bps.get(DEFAULT_CD_TERM_KEY, DEFAULT_CD_RATE_BPS)
         if certificates:
             for certificate in certificates:
                 cd_total_c += certificate_value_cents(certificate, at=moment)
@@ -1285,7 +1372,7 @@ def _safe_investing_card(kid_id: str) -> str:
             cd_count = len(certificates)
         value_c = int(round(shares * price_c))
         total_c = value_c + cd_total_c
-        rate_pct = rate_bps / 100
+        rates_summary = format_cd_rates(rates_bps)
         if cd_count:
             ready_text = f" • {ready_count} ready" if ready_count else ""
             cd_line = (
@@ -1299,7 +1386,7 @@ def _safe_investing_card(kid_id: str) -> str:
             <div class='muted'>Stocks &amp; certificates of deposit</div>
             <div style='margin-top:6px;'>Stocks: <b>{usd(value_c)}</b> ({shares:.4f} sh @ {usd(price_c)})</div>
             <div style='margin-top:4px;'>{cd_line}</div>
-            <div class='muted' style='margin-top:4px;'>Total invested: <b>{usd(total_c)}</b> • CD rate {rate_pct:.2f}% APR</div>
+            <div class='muted' style='margin-top:4px;'>Total invested: <b>{usd(total_c)}</b> • CD rates {rates_summary} APR</div>
             <a href='/kid/invest'><button style='margin-top:8px;'>Open Investing Dashboard</button></a>
           </div>
         """
@@ -1642,6 +1729,7 @@ def kid_invest_home(request: Request) -> HTMLResponse:
         metrics = compute_holdings_metrics(kid_id)
         history = get_price_history()
         svg = sparkline_svg_from_history(history)
+        rates_bps = {option.key: DEFAULT_CD_RATE_BPS for option in CD_TERM_OPTIONS}
         with Session(engine) as session:
             child = session.exec(select(Child).where(Child.kid_id == kid_id)).first()
             balance_c = child.balance_cents if child else 0
@@ -1650,7 +1738,7 @@ def kid_invest_home(request: Request) -> HTMLResponse:
                 .where(Certificate.kid_id == kid_id)
                 .order_by(desc(Certificate.opened_at))
             ).all()
-            rate_bps = get_cd_rate_bps(session)
+            rates_bps = get_cd_rates_bps(session)
 
         def fmt(value: int) -> str:
             return f"{'+' if value >= 0 else ''}{usd(value)}"
@@ -1683,7 +1771,7 @@ def kid_invest_home(request: Request) -> HTMLResponse:
                 f"<tr>"
                 f"<td data-label='Principal'>{usd(certificate.principal_cents)}</td>"
                 f"<td data-label='Rate'>{rate_display:.2f}%</td>"
-                f"<td data-label='Term'>{certificate.term_months} mo</td>"
+                f"<td data-label='Term'>{certificate_term_label(certificate)}</td>"
                 f"<td data-label='Value Today' class='right'>{usd(value_c)}</td>"
                 f"<td data-label='Progress' class='right'>{progress_text}</td>"
                 f"<td data-label='Status'>{status}</td>"
@@ -1691,9 +1779,9 @@ def kid_invest_home(request: Request) -> HTMLResponse:
             )
         if not cert_rows:
             cert_rows = "<tr><td colspan='6' class='muted'>(no certificates yet)</td></tr>"
-        rate_pct_display = (rate_bps / 100) if 'rate_bps' in locals() else (DEFAULT_CD_RATE_BPS / 100)
+        rates_display = format_cd_rates(rates_bps)
         summary_bits = [
-            f"<div><b>Current rate:</b> {rate_pct_display:.2f}% APR</div>",
+            f"<div><b>Current rates:</b> {rates_display} APR</div>",
             f"<div>Total active value: <b>{usd(cd_total_c)}</b></div>",
         ]
         if next_maturity:
@@ -1753,10 +1841,11 @@ def kid_invest_home(request: Request) -> HTMLResponse:
           <form method='post' action='/kid/invest/cd/open' class='inline'>
             <input name='amount' type='text' data-money placeholder='amount $' required>
             <label style='margin-left:6px;'>Term</label>
-            <select name='term_months'>
-              <option value='3'>3 months</option>
-              <option value='6'>6 months</option>
-              <option value='12' selected>12 months</option>
+            <select name='term'>
+              <option value='1w'>1 week</option>
+              <option value='3m'>3 months</option>
+              <option value='6m'>6 months</option>
+              <option value='12m' selected>12 months</option>
             </select>
             <button type='submit' style='margin-left:6px;'>Lock Savings</button>
           </form>
@@ -1884,26 +1973,28 @@ def kid_invest_sell(request: Request, amount: str = Form(...)):
 def kid_invest_cd_open(
     request: Request,
     amount: str = Form(...),
-    term_months: int = Form(...),
+    term: str = Form(...),
 ):
     if (redirect := require_kid(request)) is not None:
         return redirect
     kid_id = kid_authed(request)
     assert kid_id
     amount_c = to_cents_from_dollars_str(amount, 0)
-    term = max(1, int(term_months))
+    term_key = (term or "").strip()
+    term_option = resolve_cd_term(term_key)
     if amount_c <= 0:
         return RedirectResponse("/kid/invest", status_code=302)
     with Session(engine) as session:
         child = session.exec(select(Child).where(Child.kid_id == kid_id)).first()
         if not child or amount_c > child.balance_cents:
             return RedirectResponse("/kid/invest", status_code=302)
-        rate_bps = get_cd_rate_bps(session)
+        rate_bps = get_cd_rate_bps(session, term_option.key)
         certificate = Certificate(
             kid_id=kid_id,
             principal_cents=amount_c,
             rate_bps=rate_bps,
-            term_months=term,
+            term_months=term_option.months or 0,
+            term_days=term_option.days,
             opened_at=datetime.utcnow(),
         )
         child.balance_cents -= amount_c
@@ -1915,7 +2006,7 @@ def kid_invest_cd_open(
             Event(
                 child_id=kid_id,
                 change_cents=-amount_c,
-                reason=f"invest_cd_open:{term}m @ {rate_pct:.2f}%",
+                reason=f"invest_cd_open:{term_option.key} @ {rate_pct:.2f}%",
             )
         )
         session.commit()
@@ -2020,6 +2111,7 @@ def admin_home(request: Request):
         return redirect
     run_weekly_allowance_if_needed()
     role = admin_role(request)
+    rates_bps = {option.key: DEFAULT_CD_RATE_BPS for option in CD_TERM_OPTIONS}
     with Session(engine) as session:
         kids = session.exec(select(Child).order_by(Child.name)).all()
         prizes = session.exec(select(Prize).order_by(desc(Prize.created_at))).all()
@@ -2041,7 +2133,7 @@ def admin_home(request: Request):
             .where(Goal.saved_cents >= Goal.target_cents)
             .order_by(desc(Goal.created_at))
         ).all()
-        cd_rate_bps = get_cd_rate_bps(session)
+        rates_bps = get_cd_rates_bps(session)
         active_certs = session.exec(
             select(Certificate).where(Certificate.matured_at == None)  # noqa: E711
         ).all()
@@ -2121,7 +2213,17 @@ def admin_home(request: Request):
     active_cd_total = sum(certificate_value_cents(cert, at=moment_admin) for cert in active_certs)
     active_cd_count = len(active_certs)
     ready_cd = sum(1 for cert in active_certs if moment_admin >= certificate_maturity_date(cert))
-    cd_rate_pct = cd_rate_bps / 100
+    rates_summary = format_cd_rates(rates_bps)
+    rate_form_fields = "".join(
+        (
+            "<div>"
+            f"<label style='display:block;'>{option.label}</label>"
+            f"<input name='rate_{option.key}' type='number' step='0.01' min='0' "
+            f"value='{rates_bps.get(option.key, DEFAULT_CD_RATE_BPS) / 100:.2f}' required>"
+            "</div>"
+        )
+        for option in CD_TERM_OPTIONS
+    )
     ready_note = (
         f"<div class='muted' style='margin-top:4px;'>{ready_cd} certificate{'s' if ready_cd != 1 else ''} ready to cash out.</div>"
         if ready_cd
@@ -2137,13 +2239,15 @@ def admin_home(request: Request):
     investing_card = f"""
     <div class='card'>
       <h3>Investing Controls</h3>
-      <div><b>Current CD rate:</b> {cd_rate_pct:.2f}% APR</div>
+      <div><b>Current CD rates:</b> {rates_summary} APR</div>
       <div>Active certificates: <b>{active_cd_count}</b> worth <b>{usd(active_cd_total)}</b></div>
       {ready_note}
       <form method='post' action='/admin/certificates/rate' style='margin-top:10px;'>
-        <label>Set CD rate (% APR)</label>
-        <input name='rate' type='number' step='0.01' min='0' value='{cd_rate_pct:.2f}' required>
-        <button type='submit' style='margin-top:8px;'>Save Rate</button>
+        <label>Set CD rates (% APR)</label>
+        <div class='grid' style='grid-template-columns:repeat(2,minmax(0,1fr)); gap:8px; margin-top:6px;'>
+          {rate_form_fields}
+        </div>
+        <button type='submit' style='margin-top:8px;'>Save Rates</button>
       </form>
     </div>
     """
@@ -2526,6 +2630,7 @@ def admin_goals(request: Request, kid_id: str = Query(...)):
 def admin_statement(request: Request, kid_id: str = Query(...)):
     if (redirect := require_admin(request)) is not None:
         return redirect
+    rates_bps = {option.key: DEFAULT_CD_RATE_BPS for option in CD_TERM_OPTIONS}
     with Session(engine) as session:
         child = session.exec(select(Child).where(Child.kid_id == kid_id)).first()
         if not child:
@@ -2542,7 +2647,7 @@ def admin_statement(request: Request, kid_id: str = Query(...)):
             .where(Certificate.kid_id == kid_id)
             .order_by(desc(Certificate.opened_at))
         ).all()
-        cd_rate_bps = get_cd_rate_bps(session)
+        rates_bps = get_cd_rates_bps(session)
     metrics = compute_holdings_metrics(kid_id)
     moment = datetime.utcnow()
     goal_rows = "".join(
@@ -2593,7 +2698,7 @@ def admin_statement(request: Request, kid_id: str = Query(...)):
             f"<tr>"
             f"<td data-label='Principal'>{usd(certificate.principal_cents)}</td>"
             f"<td data-label='Rate'>{rate_display:.2f}%</td>"
-            f"<td data-label='Term'>{certificate.term_months} mo</td>"
+            f"<td data-label='Term'>{certificate_term_label(certificate)}</td>"
             f"<td data-label='Value' class='right'>{usd(value_c)}</td>"
             f"<td data-label='Progress' class='right'>{format_percent(progress_pct)}</td>"
             f"<td data-label='Status'>{status}</td>"
@@ -2601,7 +2706,7 @@ def admin_statement(request: Request, kid_id: str = Query(...)):
         )
     if not cert_rows:
         cert_rows = "<tr><td colspan='6' class='muted'>(no certificates)</td></tr>"
-    cd_rate_pct = cd_rate_bps / 100
+    rates_summary = format_cd_rates(rates_bps)
     ready_note = (
         f"<div class='muted' style='margin-top:4px;'>{ready_cd} certificate{'s' if ready_cd != 1 else ''} ready to cash out.</div>"
         if ready_cd
@@ -2621,7 +2726,7 @@ def admin_statement(request: Request, kid_id: str = Query(...)):
     <div class='card'>
       <h3>Investing Overview</h3>
       <div><b>Stocks:</b> {usd(metrics['market_value_c'])} ({metrics['shares']:.4f} sh @ {usd(metrics['price_c'])})</div>
-      <div>Certificates: <b>{usd(active_cd_total)}</b> across {active_cd_count} active • Rate {cd_rate_pct:.2f}% APR</div>
+      <div>Certificates: <b>{usd(active_cd_total)}</b> across {active_cd_count} active • Rates {rates_summary} APR</div>
       {ready_note}
       <table style='margin-top:10px;'><tr><th>Principal</th><th>Rate</th><th>Term</th><th>Value</th><th>Progress</th><th>Status</th></tr>{cert_rows}</table>
     </div>
@@ -3017,18 +3122,40 @@ def admin_rules(request: Request, bonus_all: Optional[str] = Form(None), bonus: 
 
 
 @app.post("/admin/certificates/rate")
-def admin_set_certificate_rate(request: Request, rate: str = Form(...)):
+def admin_set_certificate_rate(
+    request: Request,
+    rate_1w: str = Form(...),
+    rate_3m: str = Form(...),
+    rate_6m: str = Form(...),
+    rate_12m: str = Form(...),
+):
     if (redirect := require_admin(request)) is not None:
         return redirect
-    raw = (rate or "").strip()
-    try:
-        rate_value = float(raw)
-    except ValueError:
-        body = "<div class='card'><p style='color:#ff6b6b;'>Enter a numeric rate in percent.</p><p><a href='/admin'>Back</a></p></div>"
-        return HTMLResponse(frame("Admin", body), status_code=400)
-    rate_bps = max(0, int(round(rate_value * 100)))
+    raw_rates = {
+        "1w": rate_1w,
+        "3m": rate_3m,
+        "6m": rate_6m,
+        "12m": rate_12m,
+    }
+    parsed_rates: Dict[str, int] = {}
+    for term_key, raw_value in raw_rates.items():
+        cleaned = (raw_value or "").strip()
+        try:
+            rate_value = float(cleaned)
+        except (TypeError, ValueError):
+            term_label = resolve_cd_term(term_key).label
+            body = (
+                "<div class='card'><p style='color:#ff6b6b;'>Enter a numeric rate in percent for "
+                f"{term_label}.</p><p><a href='/admin'>Back</a></p></div>"
+            )
+            return HTMLResponse(frame("Admin", body), status_code=400)
+        parsed_rates[term_key] = max(0, int(round(rate_value * 100)))
     with Session(engine) as session:
-        MetaDAO.set(session, CD_RATE_KEY, str(rate_bps))
+        for term_key, rate_bps in parsed_rates.items():
+            MetaDAO.set(session, f"{CD_RATE_KEY}:{term_key}", str(rate_bps))
+        default_rate = parsed_rates.get(DEFAULT_CD_TERM_KEY)
+        if default_rate is not None:
+            MetaDAO.set(session, CD_RATE_KEY, str(default_rate))
         session.commit()
     return RedirectResponse("/admin", status_code=302)
 
