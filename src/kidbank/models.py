@@ -144,6 +144,14 @@ class PayoutStatus(str, Enum):
     CANCELLED = "cancelled"
 
 
+class TransferRequestStatus(str, Enum):
+    """Lifecycle for kid-to-kid transfer requests."""
+
+    PENDING = "pending"
+    APPROVED = "approved"
+    DECLINED = "declined"
+
+
 @dataclass(slots=True)
 class PayoutRequest:
     """Represents a payout awaiting parent approval."""
@@ -174,6 +182,36 @@ class PayoutRequest:
 
     def cancel(self, *, when: datetime | None = None) -> None:
         self.status = PayoutStatus.CANCELLED
+        self.resolved_at = when or datetime.utcnow()
+
+
+@dataclass(slots=True)
+class TransferRequest:
+    """Represents a request from one child to another for funds."""
+
+    request_id: str
+    sender: str
+    recipient: str
+    amount: Decimal
+    comment: str = ""
+    status: TransferRequestStatus = TransferRequestStatus.PENDING
+    created_at: datetime = field(default_factory=datetime.utcnow)
+    resolved_at: Optional[datetime] = None
+    resolved_by: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        value = to_decimal(self.amount)
+        require_positive(value)
+        object.__setattr__(self, "amount", value)
+
+    def approve(self, actor: str, *, when: datetime | None = None) -> None:
+        self.status = TransferRequestStatus.APPROVED
+        self.resolved_by = actor
+        self.resolved_at = when or datetime.utcnow()
+
+    def decline(self, actor: str, *, when: datetime | None = None) -> None:
+        self.status = TransferRequestStatus.DECLINED
+        self.resolved_by = actor
         self.resolved_at = when or datetime.utcnow()
 
 

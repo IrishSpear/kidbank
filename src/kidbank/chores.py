@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, time, timedelta
+from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 from enum import IntEnum
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Mapping, Optional, Sequence
 
 
 class Weekday(IntEnum):
@@ -47,17 +47,32 @@ class TimeWindow:
 class ChoreSchedule:
     """Schedule describing when a chore should be available."""
 
-    weekdays: frozenset[Weekday]
+    weekdays: frozenset[Weekday] = field(default_factory=frozenset)
     window: TimeWindow | None = None
+    specific_dates: frozenset[date] | None = None
+
+    def __post_init__(self) -> None:
+        if self.specific_dates is not None:
+            object.__setattr__(self, "specific_dates", frozenset(self.specific_dates))
+        if self.weekdays is None:
+            object.__setattr__(self, "weekdays", frozenset())
 
     def is_due(self, moment: datetime) -> bool:
-        return Weekday.from_datetime(moment) in self.weekdays and (
-            self.window is None or self.window.includes(moment)
-        )
+        if self.specific_dates is not None:
+            due_today = moment.date() in self.specific_dates
+        elif self.weekdays:
+            due_today = Weekday.from_datetime(moment) in self.weekdays
+        else:
+            due_today = True
+        return due_today and (self.window is None or self.window.includes(moment))
 
     @classmethod
     def daily(cls) -> "ChoreSchedule":
         return cls(weekdays=frozenset(Weekday), window=None)
+
+    @classmethod
+    def on_dates(cls, dates: Sequence[date], *, window: TimeWindow | None = None) -> "ChoreSchedule":
+        return cls(weekdays=frozenset(), window=window, specific_dates=frozenset(dates))
 
 
 @dataclass(slots=True)
@@ -183,6 +198,99 @@ class ChorePack:
 
     def includes(self, chore_name: str) -> bool:
         return chore_name in self.chore_names
+
+
+@dataclass(slots=True)
+class GlobalChoreSubmission:
+    """A pending submission for a shared chore."""
+
+    child_name: str
+    comment: str = ""
+    submitted_at: datetime = field(default_factory=datetime.utcnow)
+    proof: Optional[str] = None
+
+
+@dataclass(slots=True)
+class GlobalChore:
+    """Represents a chore that can be shared across multiple children."""
+
+    name: str
+    reward: Decimal
+    max_claims: int
+    description: str = ""
+    active: bool = True
+    submissions: Dict[str, GlobalChoreSubmission] = field(default_factory=dict)
+    approved: Dict[str, Decimal] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        reward = Decimal(self.reward).quantize(Decimal("0.01"))
+        if reward <= Decimal("0.00"):
+            raise ValueError("Reward must be positive for a global chore.")
+        if self.max_claims <= 0:
+            raise ValueError("max_claims must be positive.")
+        object.__setattr__(self, "reward", reward)
+
+    def remaining_claims(self) -> int:
+        return max(0, self.max_claims - len(self.approved))
+
+    def submit(self, child_name: str, *, comment: str = "", proof: Optional[str] = None) -> GlobalChoreSubmission:
+        if not self.active:
+            raise ValueError("Global chore is no longer active.")
+        submission = GlobalChoreSubmission(
+            child_name=child_name,
+            comment=comment.strip(),
+            proof=proof,
+        )
+        self.submissions[child_name] = submission
+        return submission
+
+    def _split_evenly(self, count: int) -> List[Decimal]:
+        if count <= 0:
+            raise ValueError("Cannot split reward among zero participants.")
+        total_cents = int((self.reward * 100).quantize(Decimal("1")))
+        base = total_cents // count
+        remainder = total_cents % count
+        amounts: List[Decimal] = []
+        for index in range(count):
+            cents = base + (1 if index < remainder else 0)
+            amounts.append(Decimal(cents) / Decimal(100))
+        return amounts
+
+    def approve(
+        self,
+        participants: Sequence[str],
+        *,
+        amount_override: Mapping[str, Decimal] | None = None,
+    ) -> Dict[str, Decimal]:
+        if not participants:
+            raise ValueError("At least one participant must be selected for approval.")
+        if len(participants) > self.max_claims:
+            raise ValueError("Cannot approve more participants than allowed.")
+        for child in participants:
+            if child not in self.submissions:
+                raise KeyError(f"No submission on file for '{child}'.")
+        if amount_override:
+            payout: Dict[str, Decimal] = {}
+            total = Decimal("0.00")
+            for child in participants:
+                if child not in amount_override:
+                    raise KeyError(f"Missing override amount for '{child}'.")
+                value = Decimal(amount_override[child]).quantize(Decimal("0.01"))
+                if value < Decimal("0.00"):
+                    raise ValueError("Override amounts cannot be negative.")
+                payout[child] = value
+                total += value
+            if total != self.reward:
+                raise ValueError("Override amounts must total the reward value.")
+        else:
+            split = self._split_evenly(len(participants))
+            payout = {child: amount for child, amount in zip(participants, split)}
+
+        for child, amount in payout.items():
+            self.approved[child] = amount
+            self.submissions.pop(child, None)
+        self.active = False
+        return payout
 
 
 class ChoreBoard:
@@ -321,4 +429,6 @@ __all__ = [
     "ChoreSchedule",
     "TimeWindow",
     "Weekday",
+    "GlobalChore",
+    "GlobalChoreSubmission",
 ]
