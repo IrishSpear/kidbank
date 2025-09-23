@@ -226,6 +226,7 @@ class InvestmentPortfolio:
             accrued_interest = max(Decimal("0.00"), gross - certificate.principal)
             penalty = min(penalty, accrued_interest)
         net = (gross - penalty).quantize(Decimal("0.01"))
+        self.positions["cash"] = (self.positions["cash"] + net).quantize(Decimal("0.01"))
         gross = gross.quantize(Decimal("0.01"))
         penalty = penalty.quantize(Decimal("0.01"))
         return gross, penalty, net

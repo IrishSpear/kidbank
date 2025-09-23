@@ -115,6 +115,8 @@ def test_certificate_term_rates_and_penalties() -> None:
 
     opened_on = datetime.utcnow() - timedelta(days=60)
     certificate = bank.open_certificate("Ava", 100, term_months=6, opened_on=opened_on)
+    portfolio = bank.portfolio("Ava")
+    cash_before = portfolio.available_cash()
     assert certificate.rate == Decimal("0.0300")
 
     # Update rates for future certificates but existing one should remain unchanged
@@ -128,6 +130,7 @@ def test_certificate_term_rates_and_penalties() -> None:
     assert gross == Decimal("101.50")
     assert penalty == Decimal("0.50")
     assert net == Decimal("101.00")
+    assert portfolio.available_cash() == cash_before + net
     account = bank.get_account("Ava")
     deposit_tx, penalty_tx = account.transactions[-2:]
     assert deposit_tx.category is EventCategory.INVEST
