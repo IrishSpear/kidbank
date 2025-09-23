@@ -85,6 +85,9 @@ stock-investing simulator described in the feature list.
    SESSION_SECRET=replace-me
    ```
 
+   PINs can also be updated later from the Admin → Parent PINs card; any
+   changes are stored in SQLite and override these defaults immediately.
+
 3. Launch the app:
 
    ```bash

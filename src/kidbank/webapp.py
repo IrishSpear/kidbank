@@ -42,6 +42,7 @@ MOM_PIN = os.environ.get("MOM_PIN", "1022")
 DAD_PIN = os.environ.get("DAD_PIN", "2097")
 SESSION_SECRET = os.environ.get("SESSION_SECRET", "change-this-session-secret")
 SQLITE_FILE_NAME = os.environ.get("KIDBANK_SQLITE", "kidbank.db")
+PARENT_ROLES: Tuple[str, ...] = ("mom", "dad")
 
 
 def now_local() -> datetime:
@@ -600,6 +601,49 @@ class MetaDAO:
             session.add(row)
         else:
             session.add(MetaKV(k=key, v=value))
+
+
+def _parent_pin_default(role: str) -> str:
+    if role == "mom":
+        return MOM_PIN
+    if role == "dad":
+        return DAD_PIN
+    raise ValueError(f"Unknown parent role: {role}")
+
+
+def _parent_pin_meta_key(role: str) -> str:
+    return f"parent_pin_{role}"
+
+
+def get_parent_pins(session: Session | None = None) -> Dict[str, str]:
+    def load(active_session: Session) -> Dict[str, str]:
+        pins: Dict[str, str] = {}
+        for role in PARENT_ROLES:
+            override = MetaDAO.get(active_session, _parent_pin_meta_key(role))
+            pins[role] = override or _parent_pin_default(role)
+        return pins
+
+    if session is not None:
+        return load(session)
+    with Session(engine) as new_session:
+        return load(new_session)
+
+
+def resolve_admin_role(pin: str, *, session: Session | None = None) -> Optional[str]:
+    pins = get_parent_pins(session)
+    for role, value in pins.items():
+        if pin == value:
+            return role
+    return None
+
+
+def set_parent_pin(role: str, new_pin: str) -> None:
+    normalized_role = role.lower()
+    if normalized_role not in PARENT_ROLES:
+        raise ValueError(f"Unknown parent role: {role}")
+    with Session(engine) as session:
+        MetaDAO.set(session, _parent_pin_meta_key(normalized_role), new_pin)
+        session.commit()
 
 
 def get_cd_rate_bps(session: Session) -> int:
@@ -1986,11 +2030,8 @@ def admin_login_page(request: Request):
 
 @app.post("/admin/login")
 def admin_login(request: Request, pin: str = Form(...)):
-    role = None
-    if pin == MOM_PIN:
-        role = "mom"
-    elif pin == DAD_PIN:
-        role = "dad"
+    with Session(engine) as session:
+        role = resolve_admin_role(pin, session=session)
     if not role:
         body = "<div class='card'><p style='color:#ff6b6b;'>Incorrect PIN.</p><p><a href='/admin/login'>Try again</a></p></div>"
         return HTMLResponse(frame("Parent Login", body))
@@ -2220,6 +2261,20 @@ def admin_home(request: Request):
           <label style='margin-top:6px;'>Notes</label><input name='notes' placeholder='One serving'>
           <button type='submit' style='margin-top:10px;'>Add Prize</button>
         </form>
+      </div>
+      <div class='card'>
+        <h3>Parent PINs</h3>
+        <form method='post' action='/admin/set_parent_pin'>
+          <label>Parent</label>
+          <select name='role'>
+            <option value='mom'>Mom</option>
+            <option value='dad'>Dad</option>
+          </select>
+          <label style='margin-top:6px;'>New PIN</label><input name='new_pin' type='password' placeholder='****' autocomplete='new-password' required>
+          <label style='margin-top:6px;'>Confirm PIN</label><input name='confirm_pin' type='password' placeholder='****' autocomplete='new-password' required>
+          <button type='submit' style='margin-top:10px;'>Update PIN</button>
+        </form>
+        <p class='muted' style='margin-top:6px;'>Updates override the default environment values immediately.</p>
       </div>
       {rules_card}
     </div>
@@ -2778,10 +2833,10 @@ def create_kid(request: Request, kid_id: str = Form(...), name: str = Form(...),
 def delete_kid(request: Request, kid_id: str = Form(...), pin: str = Form(...)):
     if (redirect := require_admin(request)) is not None:
         return redirect
-    if pin not in {MOM_PIN, DAD_PIN}:
-        body = "<div class='card'><p style='color:#ff6b6b;'>Incorrect parent PIN.</p><p><a href='/admin'>Back</a></p></div>"
-        return HTMLResponse(frame("Admin", body))
     with Session(engine) as session:
+        if resolve_admin_role(pin, session=session) is None:
+            body = "<div class='card'><p style='color:#ff6b6b;'>Incorrect parent PIN.</p><p><a href='/admin'>Back</a></p></div>"
+            return HTMLResponse(frame("Admin", body))
         child = session.exec(select(Child).where(Child.kid_id == kid_id)).first()
         if not child:
             return RedirectResponse("/admin", status_code=302)
@@ -2806,6 +2861,31 @@ def delete_kid(request: Request, kid_id: str = Form(...), pin: str = Form(...)):
             session.delete(certificate)
         session.delete(child)
         session.commit()
+    return RedirectResponse("/admin", status_code=302)
+
+
+@app.post("/admin/set_parent_pin")
+def admin_set_parent_pin(
+    request: Request,
+    role: str = Form(...),
+    new_pin: str = Form(...),
+    confirm_pin: str = Form(...),
+):
+    if (redirect := require_admin(request)) is not None:
+        return redirect
+    normalized_role = (role or "").lower()
+    if normalized_role not in PARENT_ROLES:
+        body = "<div class='card'><p style='color:#ff6b6b;'>Choose mom or dad when updating the parent PIN.</p><p><a href='/admin'>Back</a></p></div>"
+        return HTMLResponse(frame("Admin", body))
+    pin_value = (new_pin or "").strip()
+    confirmation = (confirm_pin or "").strip()
+    if not pin_value:
+        body = "<div class='card'><p style='color:#ff6b6b;'>Enter a new PIN before saving.</p><p><a href='/admin'>Back</a></p></div>"
+        return HTMLResponse(frame("Admin", body))
+    if pin_value != confirmation:
+        body = "<div class='card'><p style='color:#ff6b6b;'>Confirmation PIN does not match.</p><p><a href='/admin'>Back</a></p></div>"
+        return HTMLResponse(frame("Admin", body))
+    set_parent_pin(normalized_role, pin_value)
     return RedirectResponse("/admin", status_code=302)
 
 
