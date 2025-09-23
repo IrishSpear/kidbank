@@ -199,6 +199,13 @@ class MarketInstrument(SQLModel, table=True):
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
 
+class KidMarketInstrument(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    kid_id: str
+    symbol: str
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+
 class GlobalChoreClaim(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     chore_id: int
@@ -343,6 +350,30 @@ def run_migrations() -> None:
         )
         raw.execute(
             """
+            CREATE TABLE IF NOT EXISTS kidmarketinstrument (
+                id INTEGER PRIMARY KEY,
+                kid_id TEXT,
+                symbol TEXT,
+                created_at TEXT
+            );
+            """
+        )
+        raw.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_kidmarketinstrument_kid_symbol
+            ON kidmarketinstrument(kid_id, symbol);
+            """
+        )
+        raw.execute(
+            """
+            INSERT OR IGNORE INTO kidmarketinstrument (kid_id, symbol, created_at)
+            SELECT DISTINCT kid_id, UPPER(fund), CURRENT_TIMESTAMP
+            FROM investment
+            WHERE IFNULL(kid_id, '') != '' AND IFNULL(fund, '') != '';
+            """
+        )
+        raw.execute(
+            """
             CREATE TABLE IF NOT EXISTS globalchoreclaim (
                 id INTEGER PRIMARY KEY,
                 chore_id INTEGER,
@@ -438,6 +469,85 @@ def format_percent(pct: Optional[float]) -> str:
     if pct < 100:
         return f"{pct:.0f}%"
     return "100%"
+
+
+def filter_events(
+    events: Sequence[Event],
+    *,
+    search: str = "",
+    direction: str = "all",
+    kid_lookup: Optional[Dict[str, Child]] = None,
+    kid_filter: str = "",
+) -> List[Event]:
+    normalized_direction = (direction or "all").lower()
+    if normalized_direction not in {"all", "credit", "debit", "zero"}:
+        normalized_direction = "all"
+    normalized_kid = (kid_filter or "").strip().lower()
+    raw_search = (search or "").strip().lower()
+    tokens = [token for token in re.split(r"\s+", raw_search) if token] if raw_search else []
+    amount_filters: List[Tuple[str, int]] = []
+    text_tokens: List[str] = []
+    amount_pattern = re.compile(r"^(>=|<=|>|<|=)?\$?(-?\d+(?:\.\d{1,2})?)$")
+    for token in tokens:
+        match = amount_pattern.match(token)
+        if match:
+            op = match.group(1) or "="
+            try:
+                cents_value = int(round(float(match.group(2)) * 100))
+            except (TypeError, ValueError):
+                text_tokens.append(token)
+                continue
+            amount_filters.append((op, cents_value))
+        else:
+            text_tokens.append(token)
+    filtered: List[Event] = []
+    for event in events:
+        if normalized_kid and (event.child_id or "").lower() != normalized_kid:
+            continue
+        if normalized_direction == "credit" and event.change_cents <= 0:
+            continue
+        if normalized_direction == "debit" and event.change_cents >= 0:
+            continue
+        if normalized_direction == "zero" and event.change_cents != 0:
+            continue
+        if amount_filters:
+            amount_match = True
+            for op, cents in amount_filters:
+                value = event.change_cents
+                if op == ">" and not value > cents:
+                    amount_match = False
+                    break
+                if op == "<" and not value < cents:
+                    amount_match = False
+                    break
+                if op == ">=" and not value >= cents:
+                    amount_match = False
+                    break
+                if op == "<=" and not value <= cents:
+                    amount_match = False
+                    break
+                if op == "=" and value != cents:
+                    amount_match = False
+                    break
+            if not amount_match:
+                continue
+        if text_tokens:
+            haystack = [
+                (event.reason or "").lower(),
+                (event.reason or "").replace("_", " ").lower(),
+                usd(event.change_cents).lower(),
+                f"{event.change_cents/100:.2f}",
+                event.timestamp.strftime("%Y-%m-%d %H:%M").lower(),
+                event.timestamp.strftime("%Y-%m-%d").lower(),
+            ]
+            if event.child_id:
+                haystack.append(event.child_id.lower())
+                if kid_lookup and event.child_id in kid_lookup:
+                    haystack.append(kid_lookup[event.child_id].name.lower())
+            if not all(any(token in text for text in haystack) for token in text_tokens):
+                continue
+        filtered.append(event)
+    return filtered
 
 
 # ---------------------------------------------------------------------------
@@ -632,6 +742,14 @@ def base_styles() -> str:
       .chart-toggle{margin-top:8px; display:flex; gap:6px; flex-wrap:wrap; align-items:center; color:var(--muted);}
       .chart-toggle a{padding:6px 10px; border-radius:999px; text-decoration:none; background:rgba(148,163,184,0.16); color:var(--text); font-size:13px;}
       .chart-toggle a.active{background:var(--accent); color:#fff;}
+      .investing-grid{grid-template-columns:repeat(auto-fit,minmax(260px,1fr)); gap:12px;}
+      .chart-popout{display:block; margin-top:12px; border-radius:14px; background:rgba(148,163,184,0.08); padding:12px; box-shadow:inset 0 0 0 1px rgba(148,163,184,0.12); transition:transform .18s ease, box-shadow .18s ease;}
+      .chart-popout:hover,.chart-popout:focus{transform:scale(1.01); box-shadow:inset 0 0 0 1px rgba(148,163,184,0.24);}
+      .chart-popout svg{width:100%; height:auto; display:block;}
+      .chart-hint{margin-top:6px; font-size:12px; color:var(--muted);}
+      .chart-modal__card{max-width:960px;}
+      .chart-modal__body{max-height:75vh; overflow:auto;}
+      .chart-modal__body svg{width:100%; height:auto;}
       .modal-overlay{position:fixed; inset:0; background:rgba(15,23,42,0.78); display:none; align-items:center; justify-content:center; padding:16px; z-index:1000;}
       .modal-overlay:target{display:flex;}
       .modal-card{background:var(--card); border-radius:12px; padding:20px; max-width:720px; width:100%; max-height:90vh; overflow:auto; box-shadow:0 28px 48px rgba(0,0,0,0.4);}
@@ -1573,6 +1691,65 @@ def list_market_instruments(session: Session | None = None) -> List[MarketInstru
         return _load(new_session)
 
 
+def list_kid_market_symbols(
+    kid_id: str, session: Session | None = None
+) -> List[str]:
+    normalized_default = _normalize_symbol(DEFAULT_MARKET_SYMBOL)
+
+    def _load(active: Session) -> List[str]:
+        rows = active.exec(
+            select(KidMarketInstrument)
+            .where(KidMarketInstrument.kid_id == kid_id)
+            .order_by(KidMarketInstrument.created_at)
+        ).all()
+        symbols: List[str] = []
+        for row in rows:
+            normalized = _normalize_symbol(row.symbol)
+            if normalized and normalized not in symbols:
+                symbols.append(normalized)
+        if normalized_default not in symbols:
+            return [normalized_default] + symbols
+        ordered = [normalized_default]
+        ordered.extend(sym for sym in symbols if sym != normalized_default)
+        return ordered
+
+    if session is not None:
+        return _load(session)
+    with Session(engine) as new_session:
+        return _load(new_session)
+
+
+def list_market_instruments_for_kid(
+    kid_id: str, session: Session | None = None
+) -> List[MarketInstrument]:
+    def _load(active: Session) -> List[MarketInstrument]:
+        symbols = list_kid_market_symbols(kid_id, session=active)
+        if not symbols:
+            symbols = [_normalize_symbol(DEFAULT_MARKET_SYMBOL)]
+        fetched = active.exec(
+            select(MarketInstrument).where(
+                MarketInstrument.symbol.in_(symbols)
+            )
+        ).all()
+        lookup = {
+            _normalize_symbol(inst.symbol): inst
+            for inst in fetched
+        }
+        instruments: List[MarketInstrument] = []
+        for symbol in symbols:
+            normalized = _normalize_symbol(symbol)
+            inst = lookup.get(normalized)
+            if not inst:
+                inst = MarketInstrument(symbol=normalized, name=normalized, kind=INSTRUMENT_KIND_STOCK)
+            instruments.append(inst)
+        return instruments
+
+    if session is not None:
+        return _load(session)
+    with Session(engine) as new_session:
+        return _load(new_session)
+
+
 def get_market_instrument(symbol: str, session: Session | None = None) -> Optional[MarketInstrument]:
     normalized = _normalize_symbol(symbol)
 
@@ -2206,6 +2383,8 @@ def kid_home(
     request: Request,
     section: str = Query("overview"),
     chore_day: Optional[str] = Query(None),
+    activity_search: str = Query(""),
+    activity_dir: str = Query("all"),
 ) -> HTMLResponse:
     if (redirect := require_kid(request)) is not None:
         return redirect
@@ -2223,6 +2402,10 @@ def kid_home(
     kid_global_claims: List[GlobalChoreClaim] = []
     global_chore_lookup: Dict[int, Chore] = {}
     chores_today: List[Tuple[Chore, Optional[ChoreInstance]]] = []
+    activity_query = (activity_search or "").strip()
+    activity_direction = (activity_dir or "all").strip().lower()
+    if activity_direction not in {"all", "credit", "debit", "zero"}:
+        activity_direction = "all"
     try:
         others: List[Child] = []
         incoming_requests: List[MoneyRequest] = []
@@ -2237,11 +2420,12 @@ def kid_home(
                 chores = chores_today
             else:
                 chores = list_chore_instances_for_kid(kid_id, target_day=selected_chore_day)
+            event_limit = 120 if activity_query else 40
             events = session.exec(
                 select(Event)
                 .where(Event.child_id == kid_id)
                 .order_by(desc(Event.timestamp))
-                .limit(20)
+                .limit(event_limit)
             ).all()
             goals = session.exec(
                 select(Goal)
@@ -2300,12 +2484,47 @@ def kid_home(
         kid_lookup: Dict[str, Child] = {child.kid_id: child}
         for other in others:
             kid_lookup[other.kid_id] = other
+        filtered_events = filter_events(
+            events,
+            search=activity_query,
+            direction=activity_direction,
+        )
         event_rows = "".join(
             f"<tr><td data-label='When'>{event.timestamp.strftime('%Y-%m-%d %H:%M')}</td>"
             f"<td data-label='Δ Amount' class='right'>{'+' if event.change_cents>=0 else ''}{usd(event.change_cents)}</td>"
             f"<td data-label='Reason'>{html_escape(event.reason)}</td></tr>"
-            for event in events
-        ) or "<tr><td>(no events)</td></tr>"
+            for event in filtered_events
+        ) or "<tr><td colspan='3' class='muted'>No activity matched your filters.</td></tr>"
+        filter_summary_html = ""
+        if filtered_events:
+            if activity_query or activity_direction != "all":
+                filter_summary_html = (
+                    f"<div class='muted' style='margin-bottom:8px;'>Showing {len(filtered_events)} of {len(events)} recent entries.</div>"
+                )
+            else:
+                filter_summary_html = (
+                    f"<div class='muted' style='margin-bottom:8px;'>Showing the latest {len(filtered_events)} entries.</div>"
+                )
+        else:
+            filter_summary_html = (
+                f"<div class='muted' style='margin-bottom:8px;'>No matches found across {len(events)} recent entries.</div>"
+            )
+        activity_search_value = html_escape(activity_query)
+        activity_dir_options = []
+        for value, label in [
+            ("all", "All activity"),
+            ("credit", "Credits"),
+            ("debit", "Debits"),
+            ("zero", "Zero change"),
+        ]:
+            selected_attr = " selected" if activity_direction == value else ""
+            activity_dir_options.append(f"<option value='{value}'{selected_attr}>{label}</option>")
+        activity_dir_select = "".join(activity_dir_options)
+        reset_filters_html = (
+            "<a href='/kid?section=activity' class='button-link secondary' style='margin-top:6px;'>Reset</a>"
+            if activity_query or activity_direction != "all"
+            else ""
+        )
         is_selected_today = selected_chore_day == today
         day_label = "Today" if is_selected_today else selected_chore_day.strftime("%A")
         day_full = selected_chore_day.strftime("%B %d, %Y")
@@ -2955,6 +3174,16 @@ def kid_home(
         activity_content = f"""
           <div class='card'>
             <h3>Recent Activity</h3>
+            <form method='get' action='/kid' class='stacked-form' style='margin-bottom:12px;'>
+              <input type='hidden' name='section' value='activity'>
+              <label>Search</label>
+              <input name='activity_search' placeholder='Search reason, amount, or date' value='{activity_search_value}'>
+              <label>Type</label>
+              <select name='activity_dir'>{activity_dir_select}</select>
+              <button type='submit'>Apply</button>
+              {reset_filters_html}
+            </form>
+            {filter_summary_html}
             <table><tr><th>When</th><th>Δ Amount</th><th>Reason</th></tr>{event_rows}</table>
           </div>
         """
@@ -3011,7 +3240,7 @@ def kid_home(
 def _kid_investing_snapshot(kid_id: str) -> Dict[str, Any]:
     snapshot: Dict[str, Any] = {"ok": False}
     try:
-        instruments = list_market_instruments()
+        instruments = list_market_instruments_for_kid(kid_id)
         holdings: List[Dict[str, Any]] = []
         cd_total_c = 0
         cd_count = 0
@@ -3020,7 +3249,7 @@ def _kid_investing_snapshot(kid_id: str) -> Dict[str, Any]:
         moment = datetime.utcnow()
         with Session(engine) as session:
             if not instruments:
-                instruments = list_market_instruments(session)
+                instruments = list_market_instruments_for_kid(kid_id, session=session)
             for instrument in instruments:
                 holding = session.exec(
                     select(Investment)
@@ -3459,6 +3688,7 @@ def kid_goal_deposit(request: Request, goal_id: int = Form(...), amount: str = F
     if amount_c <= 0:
         set_kid_notice(request, "Enter an amount greater than zero.", "error")
         return RedirectResponse("/kid?section=goals", status_code=302)
+    goal_name = ""
     with Session(engine) as session:
         goal = session.get(Goal, goal_id)
         child = session.exec(select(Child).where(Child.kid_id == kid_id)).first()
@@ -3468,6 +3698,7 @@ def kid_goal_deposit(request: Request, goal_id: int = Form(...), amount: str = F
         if amount_c > child.balance_cents:
             set_kid_notice(request, "Not enough funds to save that amount.", "error")
             return RedirectResponse("/kid?section=goals", status_code=302)
+        goal_name = goal.name
         child.balance_cents -= amount_c
         goal.saved_cents += amount_c
         child.updated_at = datetime.utcnow()
@@ -3478,7 +3709,7 @@ def kid_goal_deposit(request: Request, goal_id: int = Form(...), amount: str = F
         session.add(goal)
         session.add(Event(child_id=kid_id, change_cents=-amount_c, reason=f"goal_deposit:{goal.name}"))
         session.commit()
-    set_kid_notice(request, f"Saved {usd(amount_c)} to {goal.name}.", "success")
+    set_kid_notice(request, f"Saved {usd(amount_c)} to {goal_name or 'your goal'}.", "success")
     return RedirectResponse("/kid?section=goals", status_code=302)
 
 
@@ -3526,7 +3757,7 @@ def kid_invest_home(
             f"<div class='notice {notice_class}'>{html_escape(notice_msg)}</div>"
         )
     try:
-        instruments = list_market_instruments()
+        instruments = list_market_instruments_for_kid(kid_id)
         if not instruments:
             raise RuntimeError("No market instruments available.")
         instrument_map = {_normalize_symbol(inst.symbol): inst for inst in instruments}
@@ -3544,9 +3775,11 @@ def kid_invest_home(
         metrics = compute_holdings_metrics(kid_id, selected_symbol)
         history = fetch_price_history_range(selected_symbol, selected_range)
         if chart_mode == CHART_VIEW_DETAIL:
-            svg = detailed_history_chart_svg(history)
+            svg = detailed_history_chart_svg(history, width=640, height=260)
+            enlarged_svg = detailed_history_chart_svg(history, width=1024, height=420)
         else:
-            svg = sparkline_svg_from_history(history)
+            svg = sparkline_svg_from_history(history, width=360, height=120)
+            enlarged_svg = sparkline_svg_from_history(history, width=960, height=240)
         cd_rates_bps = {code: DEFAULT_CD_RATE_BPS for code, _, _ in CD_TERM_OPTIONS}
         with Session(engine) as session:
             child = session.exec(select(Child).where(Child.kid_id == kid_id)).first()
@@ -3751,6 +3984,20 @@ def kid_invest_home(
                 "<button type='submit' class='danger secondary'>Remove from dashboard</button>"
                 "</form>"
             )
+        has_chart_history = len(history) >= 2
+        chart_modal_id = f"chart-{_normalize_symbol(active_instrument.symbol).lower()}"
+        chart_display_html = (
+            f"<a href='#{chart_modal_id}' class='chart-popout' aria-label='Expand price chart'>{svg}</a>"
+        )
+        chart_hint_html = "<div class='chart-hint'>Tap or click the chart to expand.</div>" if has_chart_history else ""
+        chart_modal_html = f"""
+        <div id='{chart_modal_id}' class='modal-overlay chart-modal'>
+          <div class='modal-card chart-modal__card'>
+            <div class='modal-head'><h3>{instrument_label} — expanded chart</h3><a href='#' class='pill'>Close</a></div>
+            <div class='chart-modal__body'>{enlarged_svg}</div>
+          </div>
+        </div>
+        """
 
         inner = f"""
         {notice_html}{search_card_html}
@@ -3759,12 +4006,13 @@ def kid_invest_home(
           <h3>Investing — {instrument_label}</h3>
           <div class='muted'>{instrument_symbol} • {kind_label}</div>
           <div style='margin-bottom:12px;'><b>Available Balance:</b> {usd(balance_c)}</div>
-          <div class='grid' style='grid-template-columns:1fr 1fr; gap:12px;'>
-            <div class='card'>
+          <div class='grid investing-grid'>
+            <div class='card investing-chart-card'>
               <div><b>Current Price</b></div>
               <div style='font-size:28px; font-weight:800; margin-top:6px;'>{usd(metrics['price_c'])}</div>
               <div class='muted'>{unit_label}</div>
-              <div style='margin-top:8px;'>{svg}</div>
+              {chart_display_html}
+              {chart_hint_html}
               {range_selector_html}
               {chart_toggle_html}
             </div>
@@ -3817,6 +4065,7 @@ def kid_invest_home(
           <table style='margin-top:10px;'><tr><th>Principal</th><th>Rate</th><th>Term</th><th>Value Today</th><th>Progress</th><th>Status</th><th>Actions</th></tr>{cert_rows}</table>
         </div>
         <p class='muted' style='margin-top:10px;'><a href='/kid'>← Back to My Account</a></p>
+        {chart_modal_html}
         """
         return HTMLResponse(frame(f"Investing — {instrument_label}", inner))
     except Exception:
@@ -3839,6 +4088,8 @@ def kid_invest_track(
 ):
     if (redirect := require_kid(request)) is not None:
         return redirect
+    kid_id = kid_authed(request)
+    assert kid_id
     normalized_symbol = _normalize_symbol(symbol)
     if not normalized_symbol:
         set_kid_notice(request, "Enter a ticker symbol to track.", "error")
@@ -3854,7 +4105,20 @@ def kid_invest_track(
     if not instrument:
         set_kid_notice(request, "Could not add that symbol.", "error")
         return RedirectResponse("/kid/invest", status_code=302)
-    set_kid_notice(request, f"Tracking {instrument.symbol}.", "success")
+    existing_link = None
+    with Session(engine) as session:
+        existing_link = session.exec(
+            select(KidMarketInstrument)
+            .where(KidMarketInstrument.kid_id == kid_id)
+            .where(KidMarketInstrument.symbol == instrument.symbol)
+        ).first()
+        if not existing_link:
+            session.add(KidMarketInstrument(kid_id=kid_id, symbol=instrument.symbol))
+            session.commit()
+    message = f"Tracking {instrument.symbol}."
+    if existing_link:
+        message = f"Already tracking {instrument.symbol}."
+    set_kid_notice(request, message, "success")
     next_range = normalize_history_range(range_code)
     next_chart = normalize_chart_view(chart_view)
     return RedirectResponse(
@@ -4368,50 +4632,39 @@ def kid_invest_delete(
             f"/kid/invest?symbol={symbol}&range={next_range}&chart={chart_mode}",
             status_code=302,
         )
+    removed = False
+    already_removed = False
     with Session(engine) as session:
-        instrument = session.exec(
-            select(MarketInstrument).where(MarketInstrument.symbol == normalized_symbol)
+        holding = session.exec(
+            select(Investment).where(Investment.kid_id == kid_id, Investment.fund == normalized_symbol)
         ).first()
-        if not instrument:
-            set_kid_notice(request, "That market is no longer tracked.", "error")
+        if holding and holding.shares > 1e-6:
+            set_kid_notice(request, "Sell your shares before removing this market.", "error")
             return RedirectResponse(
                 f"/kid/invest?symbol={symbol}&range={next_range}&chart={chart_mode}",
                 status_code=302,
             )
-        holdings = session.exec(
-            select(Investment).where(Investment.fund == normalized_symbol)
-        ).all()
-        active_holders = [h for h in holdings if h.shares > 1e-6]
-        own_active = next((h for h in active_holders if h.kid_id == kid_id), None)
-        if own_active is not None:
-            set_kid_notice(request, "Sell your shares before removing this stock.", "error")
-            return RedirectResponse(
-                f"/kid/invest?symbol={symbol}&range={next_range}&chart={chart_mode}",
-                status_code=302,
-            )
-        other_active = [h for h in active_holders if h.kid_id != kid_id]
-        if other_active:
-            set_kid_notice(
-                request,
-                "Another kid is still invested in this stock, so it can't be removed yet.",
-                "error",
-            )
-            return RedirectResponse(
-                f"/kid/invest?symbol={symbol}&range={next_range}&chart={chart_mode}",
-                status_code=302,
-            )
-        for holding in holdings:
-            if holding.kid_id == kid_id:
-                session.delete(holding)
-        session.delete(instrument)
+        link = session.exec(
+            select(KidMarketInstrument)
+            .where(KidMarketInstrument.kid_id == kid_id)
+            .where(KidMarketInstrument.symbol == normalized_symbol)
+        ).first()
+        if not link:
+            already_removed = True
+        else:
+            session.delete(link)
+            removed = True
+        if holding:
+            session.delete(holding)
         session.commit()
-    remaining = list_market_instruments()
-    fallback_symbol = symbol
-    if not any(_normalize_symbol(inst.symbol) == normalized_symbol for inst in remaining):
-        fallback_symbol = (
-            remaining[0].symbol if remaining else DEFAULT_MARKET_SYMBOL
-        )
-    set_kid_notice(request, f"Removed {normalized_symbol} from your dashboard.", "success")
+    remaining_symbols = [
+        sym for sym in list_kid_market_symbols(kid_id) if sym != normalized_symbol
+    ]
+    fallback_symbol = remaining_symbols[0] if remaining_symbols else DEFAULT_MARKET_SYMBOL
+    if already_removed and not removed:
+        set_kid_notice(request, f"{normalized_symbol} was already removed.", "success")
+    else:
+        set_kid_notice(request, f"Removed {normalized_symbol} from your dashboard.", "success")
     return RedirectResponse(
         f"/kid/invest?symbol={fallback_symbol}&range={next_range}&chart={chart_mode}",
         status_code=302,
@@ -4469,20 +4722,32 @@ def _kid_options(kids: Iterable[Child]) -> str:
 @app.get("/admin", response_class=HTMLResponse)
 def admin_home(
     request: Request,
-    section: str = Query("goals"),
+    section: str = Query("overview"),
     child: Optional[str] = Query(None),
+    events_search: str = Query(""),
+    events_dir: str = Query("all"),
+    events_kid: str = Query(""),
 ):
     if (redirect := require_admin(request)) is not None:
         return redirect
     run_weekly_allowance_if_needed()
     role = admin_role(request)
-    selected_section = (section or "goals").strip().lower()
+    selected_section = (section or "overview").strip().lower()
     selected_child = (child or "").strip()
     cd_rates_bps = {code: DEFAULT_CD_RATE_BPS for code, _, _ in CD_TERM_OPTIONS}
+    admin_events_query = (events_search or "").strip()
+    admin_events_dir = (events_dir or "all").strip().lower()
+    if admin_events_dir not in {"all", "credit", "debit", "zero"}:
+        admin_events_dir = "all"
+    admin_events_kid = (events_kid or "").strip()
+    moment_admin = _time_provider()
     with Session(engine) as session:
         kids = session.exec(select(Child).order_by(Child.name)).all()
         prizes = session.exec(select(Prize).order_by(desc(Prize.created_at))).all()
-        events = session.exec(select(Event).order_by(desc(Event.timestamp)).limit(30)).all()
+        events_limit = 160 if (admin_events_query or admin_events_kid or admin_events_dir != "all") else 60
+        events = session.exec(
+            select(Event).order_by(desc(Event.timestamp)).limit(events_limit)
+        ).all()
         pending = session.exec(
             select(ChoreInstance, Chore, Child)
             .where(ChoreInstance.status == "pending")
@@ -4513,17 +4778,123 @@ def admin_home(
         active_certs = session.exec(
             select(Certificate).where(Certificate.matured_at == None)  # noqa: E711
         ).all()
-        instruments = list_market_instruments(session)
         time_settings = get_time_settings(session)
         parent_admins = all_parent_admins(session)
         approved_global_claims = session.exec(
             select(GlobalChoreClaim)
             .where(GlobalChoreClaim.status == GLOBAL_CHORE_STATUS_APPROVED)
         ).all()
+        pending_money_requests = session.exec(
+            select(MoneyRequest).where(MoneyRequest.status == "pending")
+        ).all()
     approved_lookup: Dict[Tuple[int, str], List[GlobalChoreClaim]] = {}
     for approved in approved_global_claims:
         approved_lookup.setdefault((approved.chore_id, approved.period_key), []).append(approved)
     kids_by_id = {kid.kid_id: kid for kid in kids}
+    total_cash_c = sum(child.balance_cents for child in kids)
+    total_market_value_c = 0
+    total_cd_value_c = 0
+    total_unrealized_c = 0
+    total_realized_c = 0
+    total_cd_ready = 0
+    total_active_certificates = 0
+    portfolio_summaries: Dict[str, Dict[str, Any]] = {}
+    for kid in kids:
+        instruments_for_kid = list_market_instruments_for_kid(kid.kid_id)
+        holdings_details: List[Dict[str, Any]] = []
+        kid_market_total = 0
+        kid_invested_total = 0
+        kid_unrealized_total = 0
+        kid_realized_total = 0
+        active_holdings: List[Dict[str, Any]] = []
+        for inst in instruments_for_kid:
+            metrics = compute_holdings_metrics(kid.kid_id, inst.symbol)
+            holdings_details.append(
+                {
+                    "symbol": inst.symbol,
+                    "name": inst.name or inst.symbol,
+                    "kind": inst.kind,
+                    "metrics": metrics,
+                }
+            )
+            kid_market_total += metrics["market_value_c"]
+            kid_invested_total += metrics["invested_cost_c"]
+            kid_unrealized_total += metrics["unrealized_pl_c"]
+            kid_realized_total += metrics["realized_pl_c"]
+            if (
+                metrics["shares"] > 1e-6
+                or metrics["market_value_c"]
+                or metrics["invested_cost_c"]
+            ):
+                active_holdings.append(
+                    {
+                        "symbol": inst.symbol,
+                        "name": inst.name or inst.symbol,
+                        "kind": inst.kind,
+                        "metrics": metrics,
+                    }
+                )
+        certificate_details: List[Dict[str, Any]] = []
+        kid_cd_total = 0
+        kid_cd_ready = 0
+        for cert in active_certs:
+            if cert.kid_id != kid.kid_id:
+                continue
+            value_c = certificate_value_cents(cert, at=moment_admin)
+            kid_cd_total += value_c
+            maturity_at = certificate_maturity_date(cert)
+            matured = moment_admin >= maturity_at
+            if matured:
+                kid_cd_ready += 1
+            certificate_details.append(
+                {
+                    "principal_cents": cert.principal_cents,
+                    "rate_bps": cert.rate_bps,
+                    "term_label": certificate_term_label(cert),
+                    "value_cents": value_c,
+                    "matures_at": maturity_at,
+                    "matured": matured,
+                    "penalty_days": cert.penalty_days,
+                }
+            )
+        total_market_value_c += kid_market_total
+        total_cd_value_c += kid_cd_total
+        total_unrealized_c += kid_unrealized_total
+        total_realized_c += kid_realized_total
+        total_cd_ready += kid_cd_ready
+        total_active_certificates += len(certificate_details)
+        largest_position_c = max(
+            (holding["metrics"]["market_value_c"] for holding in active_holdings),
+            default=0,
+        )
+        largest_position_pct = (
+            (largest_position_c / kid_market_total) if kid_market_total else 0.0
+        )
+        total_assets_c = kid.balance_cents + kid_market_total + kid_cd_total
+        cash_ratio = (kid.balance_cents / total_assets_c) if total_assets_c else 0.0
+        market_ratio = (kid_market_total / total_assets_c) if total_assets_c else 0.0
+        cd_ratio = (kid_cd_total / total_assets_c) if total_assets_c else 0.0
+        total_pl_c = kid_unrealized_total + kid_realized_total
+        portfolio_summaries[kid.kid_id] = {
+            "kid": kid,
+            "cash_cents": kid.balance_cents,
+            "holdings": holdings_details,
+            "total_market_c": kid_market_total,
+            "total_invested_c": kid_invested_total,
+            "unrealized_pl_c": kid_unrealized_total,
+            "realized_pl_c": kid_realized_total,
+            "cd_value_c": kid_cd_total,
+            "cd_ready": kid_cd_ready,
+            "certificates": certificate_details,
+            "holding_count": len(active_holdings),
+            "largest_position_c": largest_position_c,
+            "largest_position_pct": largest_position_pct,
+            "total_assets_c": total_assets_c,
+            "cash_ratio": cash_ratio,
+            "market_ratio": market_ratio,
+            "cd_ratio": cd_ratio,
+            "total_pl_c": total_pl_c,
+        }
     kid_options_html = _kid_options(kids)
     parent_options_html = "".join(
         f"<option value='{admin['role']}'>{html_escape(admin['label'])}</option>"
@@ -4561,11 +4932,11 @@ def admin_home(
             f"<td data-label='Award' class='right'><b>{usd(chore.award_cents)}</b></td>"
             f"<td data-label='Completed'>{submitted}</td>"
             "<td data-label='Actions' class='right'>"
-            f"<form class='inline' method='post' action='/admin/chore_payout'><input type='hidden' name='instance_id' value='{inst.id}'>"
+            f"<form class='inline' method='post' action='/admin/chore_payout'><input type='hidden' name='instance_id' value='{inst.id}'><input type='hidden' name='redirect' value='/admin?section=payouts'>"
             "<input name='amount' type='text' data-money placeholder='override $ (optional)' style='max-width:150px'>"
             "<input name='reason' type='text' placeholder='reason (optional)' style='max-width:200px'>"
             "<button type='submit'>Payout</button></form> "
-            f"<form class='inline' method='post' action='/admin/chore_deny' style='margin-left:6px;' onsubmit='return confirm(\"Deny and push back to Available?\");'><input type='hidden' name='instance_id' value='{inst.id}'><button type='submit' class='danger'>Deny</button></form>"
+            f"<form class='inline' method='post' action='/admin/chore_deny' style='margin-left:6px;' onsubmit='return confirm(\"Deny and push back to Available?\");'><input type='hidden' name='instance_id' value='{inst.id}'><input type='hidden' name='redirect' value='/admin?section=payouts'><button type='submit' class='danger'>Deny</button></form>"
             "</td></tr>"
         )
     global_groups: Dict[Tuple[int, str], Dict[str, Any]] = {}
@@ -4597,6 +4968,7 @@ def admin_home(
                 f"<input type='hidden' name='chore_id' value='{chore_id_val}'>"
                 f"<input type='hidden' name='period_key' value='{html_escape(period_key)}'>"
                 f"<input type='hidden' name='claim_ids' value='{claim.id}'>"
+                "<input type='hidden' name='redirect' value='/admin?section=payouts'>"
                 f"<input name='amount_{claim.id}' type='text' data-money placeholder='override $ (optional)'>"
                 "<input name='reason' type='text' placeholder='reason (optional)'>"
                 "<div class='actions'>"
@@ -4628,6 +5000,7 @@ def admin_home(
             + "<form method='post' action='/admin/global_chore/claims' class='stacked-form'>"
             + f"<input type='hidden' name='chore_id' value='{chore_id_val}'>"
             + f"<input type='hidden' name='period_key' value='{html_escape(period_key)}'>"
+            + "<input type='hidden' name='redirect' value='/admin?section=payouts'>"
             + "<table><tr><th>Select</th><th>Kid</th><th>Submitted</th><th>Override ($)</th></tr>"
             + modal_rows
             + "</table>"
@@ -4658,6 +5031,205 @@ def admin_home(
         "<p class='muted' style='margin-top:6px;'>Audit trail: <a href='/admin/audit'>Pending vs Paid</a></p>"
         "</div>"
     )
+    total_assets_c = total_cash_c + total_market_value_c + total_cd_value_c
+    kids_count = len(kids)
+    pending_payout_count = len(pending)
+    global_pending_count = len(global_pending)
+    money_request_count = len(pending_money_requests)
+    goals_attention_count = len(needs)
+
+    def fmt_signed(value: int) -> str:
+        return f"{'+' if value >= 0 else ''}{usd(value)}"
+
+    avg_cash_c = total_cash_c // kids_count if kids_count else 0
+    avg_assets_c = total_assets_c // kids_count if kids_count else 0
+    top_summary = max(
+        portfolio_summaries.values(),
+        key=lambda entry: entry["total_assets_c"],
+        default=None,
+    )
+    quick_cards: List[str] = [
+        (
+            "<div class='stat-card'>"
+            "<div class='stat-card__label'>Total assets</div>"
+            f"<div class='stat-card__value'>{usd(total_assets_c)}</div>"
+            f"<div class='stat-card__meta'>Cash {usd(total_cash_c)} • Markets {usd(total_market_value_c)} • CDs {usd(total_cd_value_c)}</div>"
+            "</div>"
+        ),
+        (
+            "<div class='stat-card'>"
+            "<div class='stat-card__label'>Market exposure</div>"
+            f"<div class='stat-card__value'>{usd(total_market_value_c)}</div>"
+            f"<div class='stat-card__meta'>Unrealized {fmt_signed(total_unrealized_c)} • Realized {fmt_signed(total_realized_c)}</div>"
+            "</div>"
+        ),
+        (
+            "<div class='stat-card'>"
+            "<div class='stat-card__label'>Action items</div>"
+            f"<div class='stat-card__value'>{pending_payout_count + global_pending_count + money_request_count}</div>"
+            f"<div class='stat-card__meta'>Payouts {pending_payout_count + global_pending_count} • Requests {money_request_count} • Goals {goals_attention_count}</div>"
+            "</div>"
+        ),
+        (
+            "<div class='stat-card'>"
+            "<div class='stat-card__label'>Cash buffer</div>"
+            f"<div class='stat-card__value'>{usd(total_cash_c)}</div>"
+            f"<div class='stat-card__meta'>Avg per kid {usd(avg_cash_c)} • CDs ready {total_cd_ready}/{total_active_certificates}</div>"
+            "</div>"
+        ),
+    ]
+    if top_summary:
+        top_kid = top_summary["kid"]
+        quick_cards.append(
+            "<div class='stat-card'>"
+            "<div class='stat-card__label'>Top portfolio</div>"
+            f"<div class='stat-card__value'>{usd(top_summary['total_assets_c'])}</div>"
+            f"<div class='stat-card__meta'>{html_escape(top_kid.name)} ({top_kid.kid_id}) • Avg assets {usd(avg_assets_c)}</div>"
+            "</div>"
+        )
+    overview_quick_html = "<div class='overview-stats-grid'>" + "".join(quick_cards) + "</div>"
+
+    payout_preview_items: List[str] = []
+    for inst, chore, child in pending[:4]:
+        payout_preview_items.append(
+            "<li>"
+            + f"<b>{html_escape(child.name)}</b> • {usd(chore.award_cents)}"
+            + f" <span class='muted'>({html_escape(chore.name)})</span>"
+            + "</li>"
+        )
+    payout_section = (
+        "<h4 style='margin-top:12px;'>Chore payouts</h4>"
+        + (
+            "<ul style='margin:6px 0 0 18px;'>" + "".join(payout_preview_items) + "</ul>"
+            if payout_preview_items
+            else "<div class='muted'>All caught up.</div>"
+        )
+        + "<a href='/admin?section=payouts' class='button-link secondary' style='margin-top:6px;'>Open payouts</a>"
+    )
+    global_summary: Dict[int, Dict[str, Any]] = {}
+    for claim, claimant, chore in global_pending:
+        entry = global_summary.setdefault(chore.id, {"chore": chore, "count": 0})
+        entry["count"] += 1
+    global_preview_items: List[str] = []
+    for entry in list(global_summary.values())[:3]:
+        chore = entry["chore"]
+        count = entry["count"]
+        global_preview_items.append(
+            f"<li><b>{html_escape(chore.name)}</b> • {count} claim{'s' if count != 1 else ''}</li>"
+        )
+    global_section = (
+        "<h4 style='margin-top:12px;'>Free-for-all claims</h4>"
+        + (
+            "<ul style='margin:6px 0 0 18px;'>" + "".join(global_preview_items) + "</ul>"
+            if global_preview_items
+            else "<div class='muted'>No submissions waiting.</div>"
+        )
+        + "<a href='/admin?section=payouts' class='button-link secondary' style='margin-top:6px;'>Review claims</a>"
+    )
+    request_preview_items: List[str] = []
+    for req in pending_money_requests[:4]:
+        sender = kids_by_id.get(req.from_kid_id)
+        recipient = kids_by_id.get(req.to_kid_id)
+        sender_label = html_escape(sender.name) if sender else html_escape(req.from_kid_id)
+        recipient_label = html_escape(recipient.name) if recipient else html_escape(req.to_kid_id)
+        reason_note = f" <span class='muted'>({html_escape(req.reason)})</span>" if req.reason else ""
+        request_preview_items.append(
+            f"<li><b>{sender_label}</b> → {recipient_label} • {usd(req.amount_cents)}{reason_note}</li>"
+        )
+    requests_section = (
+        "<h4 style='margin-top:12px;'>Money requests</h4>"
+        + (
+            "<ul style='margin:6px 0 0 18px;'>" + "".join(request_preview_items) + "</ul>"
+            if request_preview_items
+            else "<div class='muted'>No pending requests.</div>"
+        )
+        + "<a href='/admin?section=accounts' class='button-link secondary' style='margin-top:6px;'>Manage transfers</a>"
+    )
+    goal_preview_items: List[str] = []
+    for goal, child in needs[:4]:
+        goal_preview_items.append(
+            f"<li><b>{html_escape(child.name)}</b> • {html_escape(goal.name)} ({usd(goal.saved_cents)} / {usd(goal.target_cents)})</li>"
+        )
+    goals_section = (
+        "<h4 style='margin-top:12px;'>Goals needing review</h4>"
+        + (
+            "<ul style='margin:6px 0 0 18px;'>" + "".join(goal_preview_items) + "</ul>"
+            if goal_preview_items
+            else "<div class='muted'>No goals ready for action.</div>"
+        )
+        + "<a href='/admin?section=goals' class='button-link secondary' style='margin-top:6px;'>Open goals</a>"
+    )
+    overview_actions_card = (
+        "<div class='card'>"
+        "<h3>Action items</h3>"
+        "<div class='muted'>Keep payouts, requests, and goals moving.</div>"
+        f"{payout_section}{global_section}{requests_section}{goals_section}"
+        "</div>"
+    )
+
+    def format_ratio(value: float) -> str:
+        return f"{value * 100:.1f}%" if value else "0.0%"
+
+    def risk_badge(summary: Dict[str, Any]) -> str:
+        market_ratio = summary.get("market_ratio", 0.0)
+        cash_ratio = summary.get("cash_ratio", 0.0)
+        largest_pct = summary.get("largest_position_pct", 0.0)
+        holding_count = summary.get("holding_count", 0)
+        score = 0
+        if market_ratio > 0.65:
+            score += 1
+        if cash_ratio < 0.1 and market_ratio > 0.2:
+            score += 1
+        if largest_pct > 0.5:
+            score += 1
+        if holding_count <= 1 and market_ratio > 0.25:
+            score += 1
+        labels = ["Very low", "Low", "Balanced", "Elevated", "High"]
+        colors = ["#0f766e", "#15803d", "#2563eb", "#ea580c", "#b91c1c"]
+        idx = min(score, len(labels) - 1)
+        return (
+            f"<span class='pill' style='background:{colors[idx]}; color:#fff;'>"
+            + labels[idx]
+            + "</span>"
+        )
+
+    sorted_summaries = sorted(
+        portfolio_summaries.values(),
+        key=lambda entry: entry["total_assets_c"],
+        reverse=True,
+    )
+    leader_rows = "".join(
+        (
+            "<tr>"
+            + f"<td data-label='Kid'><b>{html_escape(summary['kid'].name)}</b><div class='muted'>{summary['kid'].kid_id}</div></td>"
+            + f"<td data-label='Assets' class='right'>{usd(summary['total_assets_c'])}</td>"
+            + f"<td data-label='Cash %' class='right'>{format_ratio(summary['cash_ratio'])}</td>"
+            + f"<td data-label='Markets %' class='right'>{format_ratio(summary['market_ratio'])}</td>"
+            + f"<td data-label='CD %' class='right'>{format_ratio(summary['cd_ratio'])}</td>"
+            + f"<td data-label='Net P/L' class='right'>{fmt_signed(summary['total_pl_c'])}</td>"
+            + "<td data-label='Risk'>"
+            + risk_badge(summary)
+            + f"<div class='muted'>{summary['holding_count']} holding{'s' if summary['holding_count'] != 1 else ''}</div>"
+            + "</td>"
+            + "</tr>"
+        )
+        for summary in sorted_summaries[:5]
+    ) or "<tr><td colspan='7' class='muted'>No investing activity yet.</td></tr>"
+    portfolio_preview_card = (
+        "<div class='card'>"
+        "<h3>Portfolio highlights</h3>"
+        "<div class='muted'>Diversification and risk snapshot across all kids.</div>"
+        f"<table><tr><th>Kid</th><th>Assets</th><th>Cash %</th><th>Markets %</th><th>CD %</th><th>Net P/L</th><th>Risk</th></tr>{leader_rows}</table>"
+        "</div>"
+    )
+    overview_summary_card = (
+        "<div class='card'>"
+        "<h3>Command center</h3>"
+        f"<div class='muted'>Realtime snapshot across {kids_count} kid{'s' if kids_count != 1 else ''}.</div>"
+        f"{overview_quick_html}"
+        "</div>"
+    )
+    overview_content = overview_summary_card + overview_actions_card + portfolio_preview_card
     children_overview_rows = "".join(
         (
             "<tr>"
@@ -4702,12 +5274,19 @@ def admin_home(
                 "</div>"
             )
     children_content = children_overview_card + child_detail_card
+    filtered_admin_events = filter_events(
+        events,
+        search=admin_events_query,
+        direction=admin_events_dir,
+        kid_lookup=kids_by_id,
+        kid_filter=admin_events_kid,
+    )
     event_rows = "".join(
         (
             "<tr><td data-label='When'>"
             + event.timestamp.strftime("%Y-%m-%d %H:%M")
             + "</td><td data-label='Kid'>"
-            + event.child_id
+            + html_escape(event.child_id)
             + "</td><td data-label='Δ Amount' class='right'>"
             + ("+" if event.change_cents >= 0 else "")
             + usd(event.change_cents)
@@ -4715,11 +5294,58 @@ def admin_home(
             + html_escape(event.reason)
             + "</td></tr>"
         )
-        for event in events
-    ) or "<tr><td colspan='4' class='muted'>(no events yet)</td></tr>"
+        for event in filtered_admin_events
+    ) or "<tr><td colspan='4' class='muted'>No events matched these filters.</td></tr>"
+    if filtered_admin_events:
+        if admin_events_query or admin_events_dir != "all" or admin_events_kid:
+            events_summary_html = (
+                f"<div class='muted' style='margin-bottom:8px;'>Showing {len(filtered_admin_events)} of {len(events)} recent events.</div>"
+            )
+        else:
+            events_summary_html = (
+                f"<div class='muted' style='margin-bottom:8px;'>Latest {len(filtered_admin_events)} events.</div>"
+            )
+    else:
+        events_summary_html = (
+            f"<div class='muted' style='margin-bottom:8px;'>No matches found across {len(events)} recent events.</div>"
+        )
+    events_search_value = html_escape(admin_events_query)
+    events_dir_select = "".join(
+        f"<option value='{value}'{' selected' if admin_events_dir == value else ''}>{label}</option>"
+        for value, label in [
+            ("all", "All activity"),
+            ("credit", "Credits"),
+            ("debit", "Debits"),
+            ("zero", "Zero change"),
+        ]
+    )
+    kid_option_bits = ["<option value=''>All kids</option>"]
+    for kid in kids:
+        selected_attr = " selected" if admin_events_kid.lower() == kid.kid_id.lower() else ""
+        kid_option_bits.append(
+            f"<option value='{kid.kid_id}'{selected_attr}>{html_escape(kid.name)} ({kid.kid_id})</option>"
+        )
+    events_kid_select = "".join(kid_option_bits)
+    events_reset_html = (
+        "<a href='/admin?section=events' class='button-link secondary' style='margin-top:6px;'>Reset</a>"
+        if admin_events_query or admin_events_dir != "all" or admin_events_kid
+        else ""
+    )
     events_card = (
         "<div class='card'>"
         "<h3>Recent Events</h3>"
+        "<form method='get' action='/admin' class='stacked-form' style='margin-bottom:12px;'>"
+        "<input type='hidden' name='section' value='events'>"
+        "<label>Search</label>"
+        f"<input name='events_search' placeholder='Search reason, amount, or date' value='{events_search_value}'>"
+        "<label>Type</label>"
+        f"<select name='events_dir'>{events_dir_select}</select>"
+        "<label>Kid</label>"
+        f"<select name='events_kid'>{events_kid_select}</select>"
+        "<button type='submit'>Apply</button>"
+        f"{events_reset_html}"
+        "</form>"
+        f"{events_summary_html}"
         "<p class='muted'>Need a CSV? <a href='/admin/ledger.csv'>Download ledger</a></p>"
         f"<table><tr><th>When</th><th>Kid</th><th>Δ Amount</th><th>Reason</th></tr>{event_rows}</table>"
         "</div>"
@@ -4786,7 +5412,6 @@ def admin_home(
         f"<table style='margin-top:10px;'><tr><th>Prize</th><th>Cost</th><th>Actions</th></tr>{prize_rows}</table>"
         "</div>"
     )
-    moment_admin = _time_provider()
     cd_rates_pct = {code: cd_rates_bps.get(code, DEFAULT_CD_RATE_BPS) / 100 for code, _, _ in CD_TERM_OPTIONS}
     active_cd_total = sum(certificate_value_cents(cert, at=moment_admin) for cert in active_certs)
     active_cd_count = len(active_certs)
@@ -4817,51 +5442,107 @@ def admin_home(
         if ready_cd
         else "<div class='muted' style='margin-top:4px;'>Kids manage certificates from their investing page.</div>"
     )
-    instrument_rows = "".join(
+    summary_rows = "".join(
         (
             "<tr>"
-            f"<td data-label='Symbol'><b>{inst.symbol}</b></td>"
-            f"<td data-label='Name'>{html_escape(inst.name or '')}</td>"
-            f"<td data-label='Type'>{('Crypto' if inst.kind == INSTRUMENT_KIND_CRYPTO else 'Stock')}</td>"
-            + (
-                f"<td data-label='Actions' class='right'><span class='pill'>Default</span></td>"
-                if _normalize_symbol(inst.symbol) == _normalize_symbol(DEFAULT_MARKET_SYMBOL)
-                else (
-                    f"<td data-label='Actions' class='right'><form method='post' action='/admin/market_instruments/delete' class='inline' onsubmit=\"return confirm('Remove this market?');\"><input type='hidden' name='instrument_id' value='{inst.id}'><button type='submit' class='danger'>Delete</button></form></td>"
-                )
-            )
+            + f"<td data-label='Kid'><b>{html_escape(summary['kid'].name)}</b><div class='muted'>{summary['kid'].kid_id}</div></td>"
+            + f"<td data-label='Total' class='right'>{usd(summary['total_assets_c'])}</td>"
+            + f"<td data-label='Cash' class='right'>{usd(summary['cash_cents'])}</td>"
+            + f"<td data-label='Markets' class='right'>{usd(summary['total_market_c'])}</td>"
+            + f"<td data-label='CDs' class='right'>{usd(summary['cd_value_c'])}</td>"
+            + f"<td data-label='Unrealized' class='right'>{fmt_signed(summary['unrealized_pl_c'])}</td>"
+            + f"<td data-label='Realized' class='right'>{fmt_signed(summary['realized_pl_c'])}</td>"
+            + "<td data-label='Risk'>"
+            + risk_badge(summary)
+            + f"<div class='muted'>Largest position {format_ratio(summary['largest_position_pct'])}</div>"
+            + "</td>"
             + "</tr>"
         )
-        for inst in instruments
-    ) or "<tr><td colspan='4' class='muted'>No markets configured yet.</td></tr>"
-    investing_card = (
+        for summary in sorted_summaries
+    ) or "<tr><td colspan='8' class='muted'>No investing data available.</td></tr>"
+    investing_summary_card = (
         "<div class='card'>"
-        "<h3>Investing Controls</h3>"
-        "<div class='muted'>Manage available markets and CD settings.</div>"
-        "<form method='post' action='/admin/market_instruments/add' style='margin-top:10px;' class='inline'>"
-        "<input name='symbol' placeholder='Symbol (e.g. SP500)' required>"
-        "<input name='name' placeholder='Display name'>"
-        f"<select name='kind'><option value='{INSTRUMENT_KIND_STOCK}'>Stock / Fund</option><option value='{INSTRUMENT_KIND_CRYPTO}'>Crypto</option></select>"
-        "<button type='submit'>Add / Update</button>"
-        "</form>"
-        f"<table style='margin-top:10px;'><tr><th>Symbol</th><th>Name</th><th>Type</th><th>Actions</th></tr>{instrument_rows}</table>"
-        f"<div style='margin-top:6px;'><b>Current CD rates:</b> {rate_summary}</div>"
-        f"<div>Active certificates: <b>{active_cd_count}</b> worth <b>{usd(active_cd_total)}</b></div>"
+        "<h3>Investing analytics</h3>"
+        "<div class='muted'>Monitor cash reserves, market exposure, and risk by kid.</div>"
+        f"<div style='margin-top:6px;'>Active certificates: <b>{active_cd_count}</b> worth <b>{usd(active_cd_total)}</b></div>"
+        f"<div>CD rates: <b>{rate_summary}</b></div>"
         f"<div>Early withdrawal penalties: <b>{penalty_summary}</b></div>"
         f"{ready_note}"
+        f"<table style='margin-top:10px;'><tr><th>Kid</th><th>Total</th><th>Cash</th><th>Markets</th><th>CDs</th><th>Unrealized</th><th>Realized</th><th>Risk</th></tr>{summary_rows}</table>"
+        "<p class='muted' style='margin-top:6px;'>Risk scores consider concentration, cash buffers, and diversification.</p>"
+        "</div>"
+    )
+    investing_controls_card = (
+        "<div class='card'>"
+        "<h3>CD settings</h3>"
+        "<div class='muted'>Adjust certificate rates and early withdrawal penalties.</div>"
         "<form method='post' action='/admin/certificates/rate' style='margin-top:10px;'>"
-        "  <p class='muted'>Adjust the APR for each available term.</p>"
+        "  <p class='muted'>Annual percentage rates for newly opened certificates.</p>"
         f"{rate_fields_html}"
         "  <button type='submit' style='margin-top:8px;'>Save Rates</button>"
         "</form>"
         "<form method='post' action='/admin/certificates/penalty' style='margin-top:10px;'>"
-        "  <p class='muted'>Set how many days of interest are forfeited when cashing out early.</p>"
+        "  <p class='muted'>Days of interest forfeited when cashing out before maturity.</p>"
         f"{penalty_fields_html}"
         "  <button type='submit' style='margin-top:8px;'>Save Penalties</button>"
         "</form>"
         "</div>"
     )
-    current_display = now_local()
+    detail_cards: List[str] = []
+    for summary in sorted_summaries:
+        kid = summary["kid"]
+        total_assets = summary["total_assets_c"]
+        holdings_rows = "".join(
+            (
+                "<tr>"
+                + f"<td data-label='Symbol'><b>{html_escape(holding['symbol'])}</b></td>"
+                + f"<td data-label='Shares'>{holding['metrics']['shares']:.4f}</td>"
+                + f"<td data-label='Price' class='right'>{usd(holding['metrics']['price_c'])}</td>"
+                + f"<td data-label='Value' class='right'>{usd(holding['metrics']['market_value_c'])}</td>"
+                + f"<td data-label='Invested' class='right'>{usd(holding['metrics']['invested_cost_c'])}</td>"
+                + f"<td data-label='Unrealized' class='right'>{fmt_signed(holding['metrics']['unrealized_pl_c'])}</td>"
+                + f"<td data-label='Realized' class='right'>{fmt_signed(holding['metrics']['realized_pl_c'])}</td>"
+                + (
+                    f"<td data-label='Return %' class='right'>{((holding['metrics']['unrealized_pl_c'] + holding['metrics']['realized_pl_c']) / holding['metrics']['invested_cost_c'] * 100):.2f}%</td>"
+                    if holding["metrics"]["invested_cost_c"]
+                    else "<td data-label='Return %' class='right'>—</td>"
+                )
+                + "</tr>"
+            )
+            for holding in summary["holdings"]
+        ) or "<tr><td colspan='8' class='muted'>No tracked markets yet.</td></tr>"
+        certificate_rows = "".join(
+            (
+                "<tr>"
+                + f"<td data-label='Principal'>{usd(cert['principal_cents'])}</td>"
+                + f"<td data-label='Value' class='right'>{usd(cert['value_cents'])}</td>"
+                + f"<td data-label='Rate'>{cert['rate_bps'] / 100:.2f}%</td>"
+                + f"<td data-label='Term'>{html_escape(cert['term_label'])}</td>"
+                + f"<td data-label='Status'>{'Matured' if cert['matured'] else 'Growing'}</td>"
+                + f"<td data-label='Matures' class='right'>{cert['matures_at']:%Y-%m-%d}</td>"
+                + "</tr>"
+            )
+            for cert in summary["certificates"]
+        ) or "<tr><td colspan='6' class='muted'>No active certificates.</td></tr>"
+        cd_ready_note = ""
+        if summary["cd_ready"]:
+            ready_count = summary["cd_ready"]
+            cd_ready_note = f" {ready_count} certificate{'s' if ready_count != 1 else ''} ready to cash out."
+        detail_cards.append(
+            "<div class='card'>"
+            + f"<h3>{html_escape(kid.name)} — Portfolio</h3>"
+            + f"<div class='muted'>Kid ID: {kid.kid_id}</div>"
+            + f"<div style='margin-top:6px;'><b>Total assets:</b> {usd(total_assets)} • Cash {usd(summary['cash_cents'])} • Markets {usd(summary['total_market_c'])} • CDs {usd(summary['cd_value_c'])}</div>"
+            + f"<div style='margin-top:6px;'>{risk_badge(summary)} <span class='muted' style='margin-left:8px;'>Cash {format_ratio(summary['cash_ratio'])} • Markets {format_ratio(summary['market_ratio'])} • CDs {format_ratio(summary['cd_ratio'])}</span></div>"
+            + f"<p class='muted' style='margin-top:6px;'>Unrealized {fmt_signed(summary['unrealized_pl_c'])} • Realized {fmt_signed(summary['realized_pl_c'])} • Largest position {format_ratio(summary['largest_position_pct'])}.{cd_ready_note}</p>"
+            + "<h4 style='margin-top:10px;'>Stock &amp; fund holdings</h4>"
+            + f"<table><tr><th>Symbol</th><th>Shares</th><th>Price</th><th>Value</th><th>Invested</th><th>Unrealized</th><th>Realized</th><th>Return %</th></tr>{holdings_rows}</table>"
+            + "<h4 style='margin-top:12px;'>Certificates of Deposit</h4>"
+            + f"<table><tr><th>Principal</th><th>Value</th><th>Rate</th><th>Term</th><th>Status</th><th>Matures</th></tr>{certificate_rows}</table>"
+            + "</div>"
+        )
+    investing_card = investing_summary_card + investing_controls_card + "".join(detail_cards)
+    current_display = moment_admin
     mode_value = time_settings.get("mode", TIME_MODE_AUTO)
     offset_value = time_settings.get("offset", 0)
     manual_raw = time_settings.get("manual") or ""
@@ -4964,12 +5645,13 @@ def admin_home(
         "</div>"
     )
     sections: List[Tuple[str, str, str, str]] = [
+        ("overview", "Command center", overview_content, ""),
         ("goals", "Goals needing action", goals_card, ""),
         ("payouts", "Pending payouts", pending_card, "".join(multi_modals)),
         ("children", "Children overview", children_content, ""),
         ("events", "Recent events", events_card, ""),
         ("accounts", "Account tools", accounts_content, ""),
-        ("investing", "Investing controls", investing_card, ""),
+        ("investing", "Portfolios & analytics", investing_card, ""),
         ("chores", "Chore publishing", chores_card, ""),
         ("prizes", "Prizes", prizes_card, ""),
         ("rules", "Allowance rules", rules_card, ""),
@@ -4978,7 +5660,7 @@ def admin_home(
     ]
     sections_map = {key: {"label": label, "content": content, "extra": extra} for key, label, content, extra in sections}
     if selected_section not in sections_map:
-        selected_section = "goals"
+        selected_section = "overview"
     sidebar_links = "".join(
         (
             f"<a href='/admin?section={key}' class='{ 'active' if key == selected_section else ''}'>{html_escape(cfg['label'])}</a>"
@@ -5221,6 +5903,7 @@ def admin_manage_chores(request: Request, kid_id: str = Query(...)):
                     f"<form method='post' action='/admin/global_chore/claims' style='margin-top:8px;'>"
                     f"<input type='hidden' name='chore_id' value='{chore_id_val}'>"
                     f"<input type='hidden' name='period_key' value='{period_key}'>"
+                    "<input type='hidden' name='redirect' value='/admin?section=payouts'>"
                     f"<table><tr><th>Select</th><th>Kid</th><th>Submitted</th><th>Override ($)</th></tr>{table_rows}</table>"
                     f"<div style='display:flex; gap:8px; flex-wrap:wrap; margin-top:8px;'>"
                     f"<button type='submit' name='decision' value='approve'>Approve Selected</button>"
@@ -5371,6 +6054,9 @@ async def admin_global_chore_claims(request: Request):
     chore_id_raw = form.get("chore_id") or "0"
     period_key = (form.get("period_key") or "").strip()
     reason_text = (form.get("reason") or "").strip()
+    redirect_target = (form.get("redirect") or "").strip()
+    if not redirect_target or not redirect_target.startswith("/"):
+        redirect_target = f"/admin/chores?kid_id={GLOBAL_CHORE_KID_ID}"
     try:
         chore_id = int(chore_id_raw)
     except ValueError:
@@ -5495,9 +6181,9 @@ async def admin_global_chore_claims(request: Request):
                     reason += f" ({reason_text})"
                 event = Event(child_id=child.kid_id, change_cents=award_cents, reason=reason)
                 session.add(event)
-                session.add(child)
+            session.add(child)
         session.commit()
-    return RedirectResponse(f"/admin/chores?kid_id={GLOBAL_CHORE_KID_ID}", status_code=302)
+    return RedirectResponse(redirect_target, status_code=302)
 
 
 @app.post("/admin/chores/activate")
@@ -5621,8 +6307,27 @@ def admin_statement(request: Request, kid_id: str = Query(...)):
             .order_by(desc(Certificate.opened_at))
         ).all()
         cd_rates_bps = get_all_cd_rate_bps(session)
-    metrics = compute_holdings_metrics(kid_id, DEFAULT_MARKET_SYMBOL)
     moment = datetime.utcnow()
+    instruments = list_market_instruments_for_kid(kid_id)
+    holding_details: List[Dict[str, Any]] = []
+    total_market_c = 0
+    total_invested_c = 0
+    total_unrealized_c = 0
+    total_realized_c = 0
+    for inst in instruments:
+        metrics = compute_holdings_metrics(kid_id, inst.symbol)
+        holding_details.append(
+            {
+                "symbol": inst.symbol,
+                "name": inst.name or inst.symbol,
+                "kind": inst.kind,
+                "metrics": metrics,
+            }
+        )
+        total_market_c += metrics["market_value_c"]
+        total_invested_c += metrics["invested_cost_c"]
+        total_unrealized_c += metrics["unrealized_pl_c"]
+        total_realized_c += metrics["realized_pl_c"]
     goal_rows = "".join(
         f"<tr><td data-label='Goal'><b>{goal.name}</b></td>"
         f"<td data-label='Saved' class='right'>{usd(goal.saved_cents)} / {usd(goal.target_cents)}</td>"
@@ -5647,6 +6352,30 @@ def admin_statement(request: Request, kid_id: str = Query(...)):
         f"<td data-label='Reason'>{event.reason}</td></tr>"
         for event in events
     ) or "<tr><td>(no events)</td></tr>"
+    def fmt_signed(value: int) -> str:
+        return f"{'+' if value >= 0 else ''}{usd(value)}"
+
+    holdings_rows = "".join(
+        (
+            "<tr>"
+            + f"<td data-label='Symbol'><b>{html_escape(holding['symbol'])}</b></td>"
+            + f"<td data-label='Name'>{html_escape(holding['name'])}</td>"
+            + f"<td data-label='Shares'>{holding['metrics']['shares']:.4f}</td>"
+            + f"<td data-label='Price' class='right'>{usd(holding['metrics']['price_c'])}</td>"
+            + f"<td data-label='Value' class='right'>{usd(holding['metrics']['market_value_c'])}</td>"
+            + f"<td data-label='Invested' class='right'>{usd(holding['metrics']['invested_cost_c'])}</td>"
+            + f"<td data-label='Unrealized' class='right'>{fmt_signed(holding['metrics']['unrealized_pl_c'])}</td>"
+            + f"<td data-label='Realized' class='right'>{fmt_signed(holding['metrics']['realized_pl_c'])}</td>"
+            + (
+                f"<td data-label='Return %' class='right'>{((holding['metrics']['unrealized_pl_c'] + holding['metrics']['realized_pl_c']) / holding['metrics']['invested_cost_c'] * 100):.2f}%</td>"
+                if holding["metrics"]["invested_cost_c"]
+                else "<td data-label='Return %' class='right'>—</td>"
+            )
+            + "</tr>"
+        )
+        for holding in holding_details
+    ) or "<tr><td colspan='9' class='muted'>No tracked holdings yet.</td></tr>"
+
     cert_rows = ""
     active_cd_total = 0
     active_cd_count = 0
@@ -5700,11 +6429,26 @@ def admin_statement(request: Request, kid_id: str = Query(...)):
       <div class='muted' style='margin-top:6px;'>Last updated {(child.updated_at or datetime.utcnow()):%Y-%m-%d %H:%M}</div>
     </div>
     """
+    net_pl_c = total_unrealized_c + total_realized_c
+    total_assets_c = child.balance_cents + total_market_c + active_cd_total
+    total_return_pct = (net_pl_c / total_invested_c * 100) if total_invested_c else None
+    return_line = (
+        f"Total return {total_return_pct:.2f}%"
+        if total_return_pct is not None
+        else "Total return —"
+    )
     investing_card = f"""
     <div class='card'>
       <h3>Investing Overview</h3>
-      <div><b>Stocks:</b> {usd(metrics['market_value_c'])} ({metrics['shares']:.4f} sh @ {usd(metrics['price_c'])})</div>
-      <div>Certificates: <b>{usd(active_cd_total)}</b> across {active_cd_count} active • Rates {cd_rates_summary}</div>
+      <div><b>Total assets:</b> {usd(total_assets_c)}</div>
+      <div><b>Cash:</b> {usd(child.balance_cents)}</div>
+      <div><b>Markets:</b> {usd(total_market_c)} • CDs {usd(active_cd_total)}</div>
+      <div><b>P/L:</b> {fmt_signed(total_unrealized_c)} unrealized, {fmt_signed(total_realized_c)} realized • {return_line}</div>
+      <h4 style='margin-top:12px;'>Stock &amp; fund holdings</h4>
+      <table><tr><th>Symbol</th><th>Name</th><th>Shares</th><th>Price</th><th>Value</th><th>Invested</th><th>Unrealized</th><th>Realized</th><th>Return %</th></tr>{holdings_rows}</table>
+      <h4 style='margin-top:12px;'>Certificates of Deposit</h4>
+      <div class='muted'>Current rates: {cd_rates_summary}</div>
+      <div class='muted'>Active certificates: {active_cd_count} worth {usd(active_cd_total)}.</div>
       {ready_note}
       <table style='margin-top:10px;'><tr><th>Principal</th><th>Rate</th><th>Term</th><th>Value</th><th>Progress</th><th>Status</th></tr>{cert_rows}</table>
     </div>
@@ -6125,40 +6869,56 @@ def delete_prize(request: Request, prize_id: int = Form(...)):
     return RedirectResponse("/admin", status_code=302)
 
 @app.post("/admin/chore_deny")
-def admin_chore_deny(request: Request, instance_id: int = Form(...)):
+def admin_chore_deny(
+    request: Request,
+    instance_id: int = Form(...),
+    redirect_to: str = Form("/admin?section=payouts"),
+):
     if (redirect := require_admin(request)) is not None:
         return redirect
+    redirect_target = (redirect_to or "").strip()
+    if not redirect_target or not redirect_target.startswith("/"):
+        redirect_target = "/admin?section=payouts"
     with Session(engine) as session:
         instance = session.get(ChoreInstance, instance_id)
         if not instance or instance.status != "pending":
-            return RedirectResponse("/admin", status_code=302)
+            return RedirectResponse(redirect_target, status_code=302)
         instance.status = "available"
         instance.completed_at = None
         session.add(instance)
         session.commit()
-    return RedirectResponse("/admin", status_code=302)
+    return RedirectResponse(redirect_target, status_code=302)
 
 
 @app.post("/admin/chore_payout")
-def admin_chore_payout(request: Request, instance_id: int = Form(...), amount: str = Form(""), reason: str = Form("")):
+def admin_chore_payout(
+    request: Request,
+    instance_id: int = Form(...),
+    amount: str = Form(""),
+    reason: str = Form(""),
+    redirect_to: str = Form("/admin?section=payouts"),
+):
     if (redirect := require_admin(request)) is not None:
         return redirect
+    redirect_target = (redirect_to or "").strip()
+    if not redirect_target or not redirect_target.startswith("/"):
+        redirect_target = "/admin?section=payouts"
     with Session(engine) as session:
         instance = session.get(ChoreInstance, instance_id)
         if not instance or instance.status != "pending":
-            return RedirectResponse("/admin", status_code=302)
+            return RedirectResponse(redirect_target, status_code=302)
         chore = session.get(Chore, instance.chore_id)
         if not chore:
-            return RedirectResponse("/admin", status_code=302)
+            return RedirectResponse(redirect_target, status_code=302)
         child = session.exec(select(Child).where(Child.kid_id == chore.kid_id)).first()
         if not child:
-            return RedirectResponse("/admin", status_code=302)
+            return RedirectResponse(redirect_target, status_code=302)
         raw_amount = (amount or "").strip()
         if not raw_amount:
             payout_c = chore.award_cents
         else:
-            payout_c = to_cents_from_dollars_str(raw_amount, chore.award_cents)
-        payout_c = max(0, payout_c)
+            parsed_amount = to_cents_from_dollars_str(raw_amount, chore.award_cents)
+            payout_c = chore.award_cents if parsed_amount <= 0 else parsed_amount
         moment = _time_provider()
         child.balance_cents += payout_c
         child.updated_at = moment
@@ -6173,7 +6933,7 @@ def admin_chore_payout(request: Request, instance_id: int = Form(...), amount: s
         instance.paid_event_id = event.id
         session.add(instance)
         session.commit()
-    return RedirectResponse("/admin", status_code=302)
+    return RedirectResponse(redirect_target, status_code=302)
 
 
 @app.post("/admin/rules")
