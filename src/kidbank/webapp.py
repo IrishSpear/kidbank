@@ -532,6 +532,7 @@ def base_styles() -> str:
       }
       button:hover{filter:brightness(1.05)}
       .danger{ background:var(--bad); }
+      .stat-value{font-size:28px; font-weight:700;}
       form.inline{ display:grid; grid-template-columns: 1fr auto; gap:8px; align-items:end; }
       @media (min-width: 900px){ .card form.inline{ grid-template-columns: 1fr 1fr auto; } }
       .stacked-form{display:flex; flex-direction:column; gap:8px;}
@@ -2118,11 +2119,12 @@ def kid_login(request: Request, kid_id: str = Form(...), kid_pin: str = Form(...
 
 
 @app.get("/kid", response_class=HTMLResponse)
-def kid_home(request: Request) -> HTMLResponse:
+def kid_home(request: Request, section: str = Query("overview")) -> HTMLResponse:
     if (redirect := require_kid(request)) is not None:
         return redirect
     kid_id = kid_authed(request)
     assert kid_id
+    selected_section = (section or "overview").strip().lower()
     moment = now_local()
     today = moment.date()
     global_infos: List[Dict[str, Any]] = []
@@ -2204,7 +2206,7 @@ def kid_home(request: Request) -> HTMLResponse:
         event_rows = "".join(
             f"<tr><td data-label='When'>{event.timestamp.strftime('%Y-%m-%d %H:%M')}</td>"
             f"<td data-label='Δ Amount' class='right'>{'+' if event.change_cents>=0 else ''}{usd(event.change_cents)}</td>"
-            f"<td data-label='Reason'>{event.reason}</td></tr>"
+            f"<td data-label='Reason'>{html_escape(event.reason)}</td></tr>"
             for event in events
         ) or "<tr><td>(no events)</td></tr>"
         chore_cards = ""
@@ -2222,9 +2224,15 @@ def kid_home(request: Request) -> HTMLResponse:
                 action = "<span class='pill'>Paid</span>"
             window = ""
             if chore.start_date or chore.end_date:
-                window = f"<div class='muted' style='margin-top:4px;'>Active: {chore.start_date or '…'} → {chore.end_date or '…'}</div>"
+                start_display = html_escape(str(chore.start_date)) if chore.start_date else "…"
+                end_display = html_escape(str(chore.end_date)) if chore.end_date else "…"
+                window = (
+                    f"<div class='muted' style='margin-top:4px;'>Active: {start_display} → {end_display}</div>"
+                )
+            chore_name = html_escape(chore.name)
+            chore_type = html_escape(chore.type)
             chore_cards += (
-                f"<div class='card'><div><b>{chore.name}</b> <span class='muted'>({chore.type})</span></div>"
+                f"<div class='card'><div><b>{chore_name}</b> <span class='muted'>({chore_type})</span></div>"
                 f"{window}<div style='margin-top:6px;'>{action}</div></div>"
             )
         if not chore_cards:
@@ -2343,7 +2351,7 @@ def kid_home(request: Request) -> HTMLResponse:
           </div>
         """
         goal_rows = "".join(
-            f"<tr><td data-label='Goal'><b>{goal.name}</b>"
+            f"<tr><td data-label='Goal'><b>{html_escape(goal.name)}</b>"
             + (" <span class='pill' title='Goal reached'>Reached</span>" if goal.saved_cents >= goal.target_cents else "")
             + "</td>"
             f"<td data-label='Saved' class='right'>{usd(goal.saved_cents)} / {usd(goal.target_cents)}"
@@ -2359,7 +2367,8 @@ def kid_home(request: Request) -> HTMLResponse:
             "<button type='submit' class='danger'>Delete</button></form></td></tr>"
             for goal in goals
         ) or "<tr><td>(no goals)</td></tr>"
-        investing_card = _safe_investing_card(kid_id)
+        investing_snapshot = _kid_investing_snapshot(kid_id)
+        investing_card = _safe_investing_card(kid_id, snapshot=investing_snapshot)
         notice_msg, notice_kind = pop_kid_notice(request)
         notice_html = ""
         if notice_msg:
@@ -2468,24 +2477,154 @@ def kid_home(request: Request) -> HTMLResponse:
             {pending_requests_section}
           </div>
         """
-        inner = f"""
-        <div class='card kiosk'>
-          <div>
-            <div class='name'>{child.name} <span class='muted'>({child.kid_id})</span></div>
-            <div class='muted'>Level {child.level} • Streak {child.streak_days} days • Badges: {_badges_html(child.badges)}</div>
+        available_chore_count = sum(1 for _, inst in chores if not inst or inst.status == "available")
+        pending_chore_count = sum(1 for _, inst in chores if inst and inst.status == "pending")
+        open_global_count = sum(
+            1 for info in global_infos if info["total_claims"] < info["chore"].max_claimants
+        )
+        pending_global_count = sum(
+            1 for claim in kid_global_claims if claim.status == GLOBAL_CHORE_STATUS_PENDING
+        )
+        approved_global_count = sum(
+            1 for claim in kid_global_claims if claim.status == GLOBAL_CHORE_STATUS_APPROVED
+        )
+        achieved_goals = sum(1 for goal in goals if goal.saved_cents >= goal.target_cents)
+        incoming_count = len(incoming_requests)
+        pending_outgoing_count = len(pending_requests)
+        snapshot_ok = bool(investing_snapshot.get("ok"))
+        holdings_count = investing_snapshot.get("holdings_count", 0) if snapshot_ok else 0
+        cd_count = investing_snapshot.get("cd_count", 0) if snapshot_ok else 0
+        total_invested = usd(investing_snapshot.get("total_c", 0) if snapshot_ok else 0)
+        quick_cards: List[str] = [
+            (
+                "<div class='card'><div class='muted'>Balance</div>"
+                f"<div class='stat-value'>{usd(child.balance_cents)}</div>"
+                f"<div class='muted' style='margin-top:4px;'>Allowance {usd(child.allowance_cents)} / week</div>"
+                "</div>"
+            ),
+            (
+                "<div class='card'><div class='muted'>Chores</div>"
+                f"<div class='stat-value'>{available_chore_count} ready</div>"
+                f"<div class='muted' style='margin-top:4px;'>Pending approval {pending_chore_count}</div>"
+                "<a href='/kid?section=chores' class='button-link secondary' style='margin-top:10px;'>Open chores</a></div>"
+            ),
+            (
+                "<div class='card'><div class='muted'>Free-for-all</div>"
+                f"<div class='stat-value'>{open_global_count} open</div>"
+                f"<div class='muted' style='margin-top:4px;'>Pending submissions {pending_global_count}</div>"
+                "<a href='/kid?section=freeforall' class='button-link secondary' style='margin-top:10px;'>See chores</a></div>"
+            ),
+            (
+                "<div class='card'><div class='muted'>Goals</div>"
+                f"<div class='stat-value'>{len(goals)} active</div>"
+                f"<div class='muted' style='margin-top:4px;'>Reached {achieved_goals}</div>"
+                "<a href='/kid?section=goals' class='button-link secondary' style='margin-top:10px;'>View goals</a></div>"
+            ),
+            (
+                "<div class='card'><div class='muted'>Money moves</div>"
+                f"<div class='stat-value'>{incoming_count} requests</div>"
+                f"<div class='muted' style='margin-top:4px;'>You sent {pending_outgoing_count} pending</div>"
+                "<a href='/kid?section=money' class='button-link secondary' style='margin-top:10px;'>Go to money</a></div>"
+            ),
+        ]
+        if snapshot_ok:
+            quick_cards.append(
+                "<div class='card'><div class='muted'>Investing</div>"
+                f"<div class='stat-value'>{total_invested}</div>"
+                f"<div class='muted' style='margin-top:4px;'>Markets {holdings_count} • CDs {cd_count}</div>"
+                "<a href='/kid?section=investing' class='button-link secondary' style='margin-top:10px;'>View investing</a></div>"
+            )
+        else:
+            quick_cards.append(
+                "<div class='card'><div class='muted'>Investing</div><div class='stat-value'>—</div>"
+                "<div class='muted' style='margin-top:4px;'>Data unavailable.</div>"
+                "<a href='/kid?section=investing' class='button-link secondary' style='margin-top:10px;'>View investing</a></div>"
+            )
+        overview_quick_html = (
+            "<div class='grid admin-top' style='margin-top:12px;'>" + "".join(quick_cards) + "</div>"
+        )
+        available_preview = [
+            (chore, inst)
+            for chore, inst in chores
+            if not inst or inst.status == "available"
+        ][:3]
+        highlight_items: List[str] = [
+            "<li><b>"
+            + html_escape(chore.name)
+            + "</b> ready (+"
+            + usd(chore.award_cents)
+            + ")</li>"
+            for chore, _ in available_preview
+        ]
+        if incoming_count:
+            highlight_items.append(
+                f"<li><b>{incoming_count}</b> money request{'s' if incoming_count != 1 else ''} waiting for you.</li>"
+            )
+        if pending_outgoing_count:
+            highlight_items.append(
+                f"<li>You have <b>{pending_outgoing_count}</b> sent request{'s' if pending_outgoing_count != 1 else ''} pending.</li>"
+            )
+        if pending_global_count:
+            highlight_items.append(
+                f"<li><b>{pending_global_count}</b> Free-for-all submission{'s' if pending_global_count != 1 else ''} pending review.</li>"
+            )
+        if approved_global_count:
+            highlight_items.append(
+                f"<li><b>{approved_global_count}</b> Free-for-all win{'s' if approved_global_count != 1 else ''} awarded.</li>"
+            )
+        if achieved_goals:
+            highlight_items.append(
+                f"<li><b>{achieved_goals}</b> goal{'s' if achieved_goals != 1 else ''} reached so far.</li>"
+            )
+        if events:
+            last_event = events[0]
+            change_text = ("+" if last_event.change_cents >= 0 else "") + usd(last_event.change_cents)
+            highlight_items.append(
+                "<li>Latest activity: "
+                + last_event.timestamp.strftime("%b %d, %I:%M %p")
+                + " • "
+                + change_text
+                + " for "
+                + html_escape(last_event.reason)
+                + "</li>"
+            )
+        if not highlight_items:
+            highlight_items.append("<li class='muted'>You're all caught up!</li>")
+        highlight_list_html = "".join(highlight_items)
+        highlights_card = f"""
+          <div class='card'>
+            <h3>Highlights</h3>
+            <ul style='margin:12px 0 0 18px; padding:0; list-style:disc;'>
+              {highlight_list_html}
+            </ul>
+            <div class='actions' style='margin-top:12px;'>
+              <a href='/kid?section=chores' class='button-link secondary'>My chores</a>
+              <a href='/kid?section=freeforall' class='button-link secondary'>Free-for-all</a>
+              <a href='/kid?section=money' class='button-link secondary'>Money moves</a>
+              <a href='/kid?section=goals' class='button-link secondary'>Goals</a>
+              <a href='/kid?section=activity' class='button-link secondary'>Recent activity</a>
+            </div>
           </div>
-          <div class='balance'>{usd(child.balance_cents)}</div>
-        </div>
-        {notice_html}
-        {notifications_html}
-        <div class='grid'>
+        """
+        kid_name_html = html_escape(child.name)
+        kid_id_html = html_escape(child.kid_id)
+        kiosk_card = f"""
+          <div class='card kiosk'>
+            <div>
+              <div class='name'>{kid_name_html} <span class='muted'>({kid_id_html})</span></div>
+              <div class='muted'>Level {child.level} • Streak {child.streak_days} day{'s' if child.streak_days != 1 else ''} • Badges: {_badges_html(child.badges)}</div>
+            </div>
+            <div class='balance'>{usd(child.balance_cents)}</div>
+          </div>
+        """
+        overview_content = kiosk_card + overview_quick_html + highlights_card
+        chores_content = f"""
           <div class='card'>
             <h3>My Chores</h3>
             {chore_cards}
           </div>
-          {global_card}
-          {investing_card}
-          {money_card}
+        """
+        goals_content = f"""
           <div class='card'>
             <h3>My Goals</h3>
             <form method='post' action='/kid/goal_create' class='inline'>
@@ -2494,14 +2633,52 @@ def kid_home(request: Request) -> HTMLResponse:
               <button type='submit'>Create Goal</button>
             </form>
             <table style='margin-top:8px;'><tr><th>Goal</th><th>Saved</th><th>Actions</th></tr>{goal_rows}</table>
-            <form method='post' action='/kid/logout' style='margin-top:10px;'><button type='submit'>Logout</button></form>
           </div>
+        """
+        activity_content = f"""
           <div class='card'>
             <h3>Recent Activity</h3>
             <table><tr><th>When</th><th>Δ Amount</th><th>Reason</th></tr>{event_rows}</table>
           </div>
-        </div>
         """
+        money_content = (notifications_html if notifications_html else "") + money_card
+        sections: List[Tuple[str, str, str]] = [
+            ("overview", "Overview", overview_content),
+            ("chores", "My Chores", chores_content),
+            ("freeforall", "Free-for-all", global_card),
+            ("goals", "Goals", goals_content),
+            ("money", "Money Moves", money_content),
+            ("investing", "Investing", investing_card),
+            ("activity", "Activity", activity_content),
+        ]
+        sections_map = {key: {"label": label, "content": content} for key, label, content in sections}
+        if selected_section not in sections_map:
+            selected_section = "overview"
+        sidebar_links = "".join(
+            f"<a href='/kid?section={key}' class='{ 'active' if key == selected_section else ''}'>{html_escape(cfg['label'])}</a>"
+            for key, cfg in sections_map.items()
+        )
+        content_html = f"{notice_html}{sections_map[selected_section]['content']}"
+        requests_badge = ""
+        if incoming_count:
+            requests_badge = (
+                f"<span class='pill' style='background:#f59e0b; color:#78350f;'>Requests: {incoming_count}</span>"
+            )
+        topbar = (
+            "<div class='topbar'><h3>Kid Kiosk</h3><div style='display:flex; gap:8px; align-items:center; flex-wrap:wrap;'>"
+            f"<span class='pill'>{kid_name_html} ({kid_id_html})</span>"
+            + requests_badge
+            + "<form method='post' action='/kid/logout' style='display:inline-block;'><button type='submit' class='pill'>Logout</button></form>"
+            + "</div></div>"
+        )
+        inner = (
+            topbar
+            + "<div class='layout'><nav class='sidebar'>"
+            + sidebar_links
+            + "</nav><div class='content'>"
+            + content_html
+            + "</div></div>"
+        )
         return HTMLResponse(frame(f"{child.name} — Kid", inner))
     except Exception:
         body = """
@@ -2514,10 +2691,11 @@ def kid_home(request: Request) -> HTMLResponse:
         return HTMLResponse(frame("Kid — Error", body))
 
 
-def _safe_investing_card(kid_id: str) -> str:
+def _kid_investing_snapshot(kid_id: str) -> Dict[str, Any]:
+    snapshot: Dict[str, Any] = {"ok": False}
     try:
         instruments = list_market_instruments()
-        holdings: List[Tuple[MarketInstrument, float, int, int]] = []
+        holdings: List[Dict[str, Any]] = []
         cd_total_c = 0
         cd_count = 0
         ready_count = 0
@@ -2534,7 +2712,14 @@ def _safe_investing_card(kid_id: str) -> str:
                 share_count = holding.shares if holding else 0.0
                 price_c = market_price_cents(instrument.symbol)
                 value_c = int(round(share_count * price_c))
-                holdings.append((instrument, share_count, price_c, value_c))
+                holdings.append(
+                    {
+                        "symbol": instrument.symbol,
+                        "shares": share_count,
+                        "price_c": price_c,
+                        "value_c": value_c,
+                    }
+                )
             certificates = session.exec(
                 select(Certificate)
                 .where(Certificate.kid_id == kid_id)
@@ -2548,31 +2733,66 @@ def _safe_investing_card(kid_id: str) -> str:
                 if moment >= certificate_maturity_date(certificate):
                     ready_count += 1
             cd_count = len(certificates)
-        total_market_c = sum(value for _, _, _, value in holdings)
+        total_market_c = sum(item["value_c"] for item in holdings)
         total_c = total_market_c + cd_total_c
+        default_symbol = _normalize_symbol(DEFAULT_MARKET_SYMBOL)
+        primary_entry = next(
+            (item for item in holdings if _normalize_symbol(item["symbol"]) == default_symbol),
+            holdings[0] if holdings else None,
+        )
         rate_summary = ", ".join(
             f"{label} {cd_rates_bps.get(code, DEFAULT_CD_RATE_BPS) / 100:.2f}%"
             for code, label, _ in CD_TERM_OPTIONS
         )
+        snapshot.update(
+            {
+                "ok": True,
+                "total_market_c": total_market_c,
+                "total_c": total_c,
+                "cd_total_c": cd_total_c,
+                "cd_count": cd_count,
+                "ready_count": ready_count,
+                "holdings_count": len(holdings),
+                "primary": primary_entry,
+                "rate_summary": rate_summary,
+            }
+        )
+        return snapshot
+    except Exception:
+        return snapshot
+
+
+def _safe_investing_card(kid_id: str, snapshot: Optional[Dict[str, Any]] = None) -> str:
+    try:
+        data = snapshot or _kid_investing_snapshot(kid_id)
+        if not data.get("ok"):
+            raise RuntimeError("snapshot unavailable")
+        total_market_c = data.get("total_market_c", 0)
+        total_c = data.get("total_c", 0)
+        cd_total_c = data.get("cd_total_c", 0)
+        cd_count = data.get("cd_count", 0)
+        ready_count = data.get("ready_count", 0)
+        holdings_count = data.get("holdings_count", 0)
+        rate_summary = data.get("rate_summary", "")
         if cd_count:
             ready_text = f" • {ready_count} ready" if ready_count else ""
-            cd_line = (
-                f"Certificates: <b>{usd(cd_total_c)}</b> across {cd_count} active{ready_text}"
-            )
+            cd_line = f"Certificates: <b>{usd(cd_total_c)}</b> across {cd_count} active{ready_text}"
         else:
             cd_line = "Certificates: <span class='muted'>none yet</span>"
-        if holdings:
-            default_symbol = _normalize_symbol(DEFAULT_MARKET_SYMBOL)
-            primary = next((entry for entry in holdings if _normalize_symbol(entry[0].symbol) == default_symbol), holdings[0])
-            instrument, shares, price_c, value_c = primary
-            primary_line = (
-                f"Primary market: <b>{usd(value_c)}</b> ({shares:.4f} @ {usd(price_c)})"
-                if price_c > 0
-                else f"Primary market: <b>{usd(value_c)}</b>"
-            )
+        if holdings_count:
+            primary = data.get("primary") or {}
+            shares = primary.get("shares", 0.0)
+            price_c = primary.get("price_c", 0)
+            value_c = primary.get("value_c", 0)
+            if price_c > 0:
+                primary_line = f"Primary market: <b>{usd(value_c)}</b> ({shares:.4f} @ {usd(price_c)})"
+            else:
+                primary_line = f"Primary market: <b>{usd(value_c)}</b>"
         else:
             primary_line = "Markets: <span class='muted'>no holdings yet</span>"
-        market_line = f"Markets: <b>{usd(total_market_c)}</b> across {len(holdings) or 0} instrument{'s' if len(holdings) != 1 else ''}"
+        market_line = (
+            f"Markets: <b>{usd(total_market_c)}</b> across {holdings_count} instrument{'s' if holdings_count != 1 else ''}"
+        )
         return f"""
           <div class='card'>
             <h3>Investing</h3>
