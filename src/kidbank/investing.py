@@ -22,6 +22,7 @@ class CertificateOfDeposit:
     rate: Decimal
     term_months: int
     opened_on: datetime = field(default_factory=datetime.utcnow)
+    penalty_days: int = 0
 
     def __post_init__(self) -> None:
         principal = _to_decimal(self.principal)
@@ -31,6 +32,8 @@ class CertificateOfDeposit:
         rate = Decimal(self.rate).quantize(Decimal("0.0001"))
         object.__setattr__(self, "principal", principal)
         object.__setattr__(self, "rate", rate)
+        if self.penalty_days < 0:
+            raise ValueError("penalty_days cannot be negative")
 
     @property
     def term(self) -> timedelta:
@@ -87,7 +90,9 @@ class InvestmentPortfolio:
             "p_l": "Profit and loss shows how much your investments changed from what you put in.",
             "diversification": "Putting money in different buckets keeps your eggs out of one basket.",
         }
-        self._cd_rate = Decimal("0.02")
+        self._default_cd_rate = Decimal("0.02")
+        self._cd_rates: Dict[int, Decimal] = {}
+        self._cd_penalties: Dict[int, int] = {}
         self._certificates: list[CertificateOfDeposit] = []
 
     # Cash handling ---------------------------------------------------------
@@ -131,17 +136,46 @@ class InvestmentPortfolio:
             self.positions["cash"] += residual
 
     # Certificates of deposit ------------------------------------------------
-    def set_cd_rate(self, rate: float, *, update_existing: bool = True) -> Decimal:
+    def set_cd_rate(
+        self,
+        rate: float,
+        *,
+        term_months: int | None = None,
+        update_existing: bool = False,
+    ) -> Decimal:
         """Update the annual rate used for certificates of deposit."""
 
         new_rate = Decimal(rate).quantize(Decimal("0.0001"))
         if new_rate < Decimal("0"):
             raise ValueError("rate cannot be negative")
-        self._cd_rate = new_rate
-        if update_existing:
-            for certificate in self._certificates:
-                object.__setattr__(certificate, "rate", new_rate)
+        if term_months is None:
+            self._default_cd_rate = new_rate
+            if update_existing:
+                for certificate in self._certificates:
+                    object.__setattr__(certificate, "rate", new_rate)
+        else:
+            if term_months <= 0:
+                raise ValueError("term_months must be positive")
+            self._cd_rates[term_months] = new_rate
+            if update_existing:
+                for certificate in self._certificates:
+                    if certificate.term_months == term_months:
+                        object.__setattr__(certificate, "rate", new_rate)
         return new_rate
+
+    def set_cd_penalty(self, term_months: int, days: int) -> int:
+        if term_months <= 0:
+            raise ValueError("term_months must be positive")
+        if days < 0:
+            raise ValueError("Penalty days cannot be negative.")
+        self._cd_penalties[term_months] = days
+        return days
+
+    def _rate_for_term(self, term_months: int) -> Decimal:
+        return self._cd_rates.get(term_months, self._default_cd_rate)
+
+    def _penalty_for_term(self, term_months: int) -> int:
+        return self._cd_penalties.get(term_months, 0)
 
     def open_certificate(
         self,
@@ -157,9 +191,10 @@ class InvestmentPortfolio:
         self.positions["cash"] -= value
         certificate = CertificateOfDeposit(
             principal=value,
-            rate=self._cd_rate,
+            rate=self._rate_for_term(term_months),
             term_months=term_months,
             opened_on=opened_on or datetime.utcnow(),
+            penalty_days=self._penalty_for_term(term_months),
         )
         self._certificates.append(certificate)
         return certificate
@@ -170,19 +205,41 @@ class InvestmentPortfolio:
     def total_certificate_value(self, *, at: Optional[datetime] = None) -> Decimal:
         return sum((certificate.value(at=at) for certificate in self._certificates), Decimal("0.00"))
 
+    def close_certificate(
+        self, certificate: CertificateOfDeposit, *, at: Optional[datetime] = None
+    ) -> Tuple[Decimal, Decimal, Decimal]:
+        try:
+            self._certificates.remove(certificate)
+        except ValueError as exc:  # pragma: no cover - defensive guard
+            raise ValueError("Certificate not found in portfolio.") from exc
+        moment = at or datetime.utcnow()
+        if moment >= certificate.matures_on:
+            gross = certificate.payout_amount()
+            penalty = Decimal("0.00")
+        else:
+            gross = certificate.value(at=moment)
+            total_days = certificate.term.days or 1
+            daily_interest = (certificate.principal * certificate.rate) / Decimal(total_days)
+            penalty = (
+                daily_interest * Decimal(min(certificate.penalty_days, total_days))
+            ).quantize(Decimal("0.01"))
+            accrued_interest = max(Decimal("0.00"), gross - certificate.principal)
+            penalty = min(penalty, accrued_interest)
+        net = (gross - penalty).quantize(Decimal("0.01"))
+        gross = gross.quantize(Decimal("0.01"))
+        penalty = penalty.quantize(Decimal("0.01"))
+        return gross, penalty, net
+
     def mature_certificates(self, *, at: Optional[datetime] = None) -> Decimal:
         """Return matured certificates to cash and remove them from the ladder."""
 
         matured_total = Decimal("0.00")
         moment = at or datetime.utcnow()
-        remaining: list[CertificateOfDeposit] = []
-        for certificate in self._certificates:
+        certificates = list(self._certificates)
+        for certificate in certificates:
             if moment >= certificate.matures_on:
-                payout = certificate.payout_amount()
-                matured_total += payout
-            else:
-                remaining.append(certificate)
-        self._certificates = remaining
+                _, _, net = self.close_certificate(certificate, at=moment)
+                matured_total += net
         return matured_total
 
     # DCA -------------------------------------------------------------------

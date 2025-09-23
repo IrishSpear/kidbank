@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 from typing import Callable, Dict, Mapping, Optional, Sequence, Tuple
 from uuid import uuid4
@@ -11,7 +11,16 @@ from uuid import uuid4
 from .account import Account
 from .admin import AuditLog, FeatureFlagRegistry, UndoManager
 from .api import ApiExporter, WebhookDispatcher
-from .chores import Chore, ChoreBoard, ChorePack, ChoreSchedule, TimeWindow, Weekday
+from .chores import (
+    Chore,
+    ChoreBoard,
+    ChorePack,
+    ChoreSchedule,
+    GlobalChore,
+    GlobalChoreSubmission,
+    TimeWindow,
+    Weekday,
+)
 from .exceptions import AccountNotFoundError, DuplicateAccountError, InsufficientFundsError
 from .i18n import Translator
 from .investing import CertificateOfDeposit, InvestmentPortfolio
@@ -24,6 +33,8 @@ from .models import (
     Reward,
     PayoutRequest,
     PayoutStatus,
+    TransferRequest,
+    TransferRequestStatus,
     ScheduledDigest,
     Transaction,
     TransactionType,
@@ -41,6 +52,7 @@ class KidBank:
     __slots__ = (
         "_accounts",
         "_chores",
+        "_global_chores",
         "_portfolios",
         "_notifications",
         "_audit_log",
@@ -63,11 +75,13 @@ class KidBank:
         "_earned_badges",
         "_next_allowance_eta",
         "_default_soft_limit",
+        "_transfer_requests",
     )
 
     def __init__(self, *, soft_limit: AmountLike = Decimal("20")) -> None:
         self._accounts: Dict[str, Account] = {}
         self._chores: Dict[str, ChoreBoard] = {}
+        self._global_chores: Dict[str, GlobalChore] = {}
         self._portfolios: Dict[str, InvestmentPortfolio] = {}
         self._notifications = NotificationCenter()
         self._audit_log = AuditLog()
@@ -101,6 +115,7 @@ class KidBank:
         self._earned_badges: Dict[str, set[str]] = defaultdict(set)
         self._next_allowance_eta: Dict[str, Optional[datetime]] = {}
         self._default_soft_limit = to_decimal(soft_limit)
+        self._transfer_requests: Dict[str, TransferRequest] = {}
 
     # ------------------------------------------------------------------
     # Core account operations
@@ -177,13 +192,90 @@ class KidBank:
         recipient: str,
         amount: AmountLike,
         description: str | None = None,
+        *,
+        comment: str | None = None,
     ) -> tuple[Transaction, Transaction]:
         source = self.get_account(sender)
         destination = self.get_account(recipient)
-        outgoing, incoming = source.transfer_to(destination, amount, description)
+        note = description or comment or f"Transfer to {recipient}"
+        metadata = {"comment": comment} if comment else None
+        outgoing, incoming = source.transfer_to(
+            destination,
+            amount,
+            note,
+            metadata=metadata,
+        )
         self._after_transaction(sender, outgoing)
         self._after_transaction(recipient, incoming)
         return outgoing, incoming
+
+    def request_money(
+        self,
+        requester: str,
+        from_child: str,
+        amount: AmountLike,
+        *,
+        comment: str = "",
+    ) -> TransferRequest:
+        if requester == from_child:
+            raise ValueError("Cannot request money from the same account.")
+        self.get_account(requester)
+        self.get_account(from_child)
+        value = to_decimal(amount)
+        request = TransferRequest(
+            request_id=str(uuid4()),
+            sender=from_child,
+            recipient=requester,
+            amount=value,
+            comment=comment.strip(),
+        )
+        self._transfer_requests[request.request_id] = request
+        self._audit_log.record(requester, "request_transfer", request.request_id)
+        return request
+
+    def transfer_requests(
+        self,
+        *,
+        for_child: str | None = None,
+        status: TransferRequestStatus | None = None,
+    ) -> Sequence[TransferRequest]:
+        requests = self._transfer_requests.values()
+        if for_child is not None:
+            requests = [
+                request
+                for request in requests
+                if request.sender == for_child or request.recipient == for_child
+            ]
+        if status is not None:
+            requests = [request for request in requests if request.status is status]
+        return tuple(requests)
+
+    def respond_money_request(
+        self,
+        request_id: str,
+        *,
+        responder: str,
+        approve: bool,
+    ) -> TransferRequest:
+        request = self._transfer_requests[request_id]
+        if request.status is not TransferRequestStatus.PENDING:
+            return request
+        if responder != request.sender:
+            raise PermissionError("Only the requested sender may respond.")
+        if approve:
+            request.approve(responder)
+            self.transfer(
+                request.sender,
+                request.recipient,
+                request.amount,
+                description=request.comment or None,
+                comment=request.comment or None,
+            )
+            self._audit_log.record(responder, "approve_transfer_request", request_id)
+        else:
+            request.decline(responder)
+            self._audit_log.record(responder, "decline_transfer_request", request_id)
+        return request
 
     def redeem_reward(
         self,
@@ -253,14 +345,32 @@ class KidBank:
         *,
         name: str,
         value: AmountLike,
-        weekdays: Sequence[int | Weekday],
+        weekdays: Sequence[int | Weekday] | Weekday | int | None = None,
+        dates: Sequence[date] | date | None = None,
         after: Optional[TimeWindow | Tuple[int, int]] = None,
         before: Optional[Tuple[int, int]] = None,
         requires_proof: bool = False,
         proof_type: str | None = None,
     ) -> Chore:
         board = self._chores[child_name]
-        weekday_set = frozenset(Weekday(day) for day in weekdays)
+        if dates is not None:
+            if isinstance(dates, date):
+                date_values = {dates}
+            else:
+                date_values = {d for d in dates}
+        else:
+            date_values = None
+
+        if weekdays is None and date_values is None:
+            weekday_iterable = Weekday
+        elif weekdays is None:
+            weekday_iterable = []
+        elif isinstance(weekdays, (Weekday, int)):
+            weekday_iterable = [weekdays]
+        else:
+            weekday_iterable = weekdays
+
+        weekday_set = frozenset(Weekday(day) for day in weekday_iterable)
         window: TimeWindow | None
         if isinstance(after, TimeWindow):
             window = after
@@ -277,7 +387,11 @@ class KidBank:
         chore = Chore(
             name=name,
             value=to_decimal(value),
-            schedule=ChoreSchedule(weekdays=weekday_set, window=window),
+            schedule=ChoreSchedule(
+                weekdays=weekday_set,
+                window=window,
+                specific_dates=frozenset(date_values) if date_values is not None else None,
+            ),
             requires_proof=requires_proof,
             proof_type=proof_type,
         )
@@ -347,6 +461,79 @@ class KidBank:
                 metadata={"pack": name},
             )
         return bonus
+
+    def create_global_chore(
+        self,
+        *,
+        name: str,
+        reward: AmountLike,
+        max_claims: int,
+        description: str = "",
+    ) -> GlobalChore:
+        if name in self._global_chores:
+            raise ValueError(f"Global chore '{name}' already exists.")
+        chore = GlobalChore(
+            name=name,
+            reward=to_decimal(reward),
+            max_claims=max_claims,
+            description=description,
+        )
+        self._global_chores[name] = chore
+        return chore
+
+    def global_chores(self, *, include_inactive: bool = False) -> Sequence[GlobalChore]:
+        return tuple(
+            chore
+            for chore in self._global_chores.values()
+            if include_inactive or chore.active
+        )
+
+    def submit_global_chore(
+        self,
+        child_name: str,
+        chore_name: str,
+        *,
+        comment: str = "",
+        proof: Optional[str] = None,
+    ) -> GlobalChoreSubmission:
+        chore = self._global_chores.get(chore_name)
+        if not chore:
+            raise KeyError(f"Global chore '{chore_name}' does not exist.")
+        submission = chore.submit(child_name, comment=comment, proof=proof)
+        return submission
+
+    def global_chore_submissions(self, chore_name: str) -> Sequence[GlobalChoreSubmission]:
+        chore = self._global_chores.get(chore_name)
+        if not chore:
+            raise KeyError(f"Global chore '{chore_name}' does not exist.")
+        return tuple(chore.submissions.values())
+
+    def approve_global_chore(
+        self,
+        chore_name: str,
+        participants: Sequence[str],
+        *,
+        amount_override: Mapping[str, AmountLike] | None = None,
+        approved_by: str = "guardian",
+    ) -> Dict[str, Decimal]:
+        chore = self._global_chores.get(chore_name)
+        if not chore:
+            raise KeyError(f"Global chore '{chore_name}' does not exist.")
+        override_decimals: Mapping[str, Decimal] | None = None
+        if amount_override is not None:
+            override_decimals = {child: to_decimal(amount) for child, amount in amount_override.items()}
+        payouts = chore.approve(participants, amount_override=override_decimals)
+        for child, amount in payouts.items():
+            metadata = {"global_chore": chore.name, "approved_by": approved_by}
+            self.deposit(
+                child,
+                amount,
+                f"Global chore: {chore.name}",
+                category=EventCategory.CHORE,
+                metadata=metadata,
+            )
+        self._audit_log.record(approved_by, "approve_global_chore", chore_name)
+        return payouts
 
     def auto_republish_chores(self, *, at: Optional[datetime] = None) -> Dict[str, Sequence[str]]:
         republished: Dict[str, Sequence[str]] = {}
@@ -624,9 +811,19 @@ class KidBank:
         return self._portfolios[child_name].certificates()
 
     def set_certificate_rate(
-        self, child_name: str, rate: float, *, update_existing: bool = True
+        self,
+        child_name: str,
+        rate: float,
+        *,
+        term_months: int | None = None,
+        update_existing: bool = False,
     ) -> Decimal:
-        return self._portfolios[child_name].set_cd_rate(rate, update_existing=update_existing)
+        return self._portfolios[child_name].set_cd_rate(
+            rate, term_months=term_months, update_existing=update_existing
+        )
+
+    def set_certificate_penalty(self, child_name: str, term_months: int, days: int) -> int:
+        return self._portfolios[child_name].set_cd_penalty(term_months, days)
 
     def open_certificate(
         self,
@@ -661,6 +858,38 @@ class KidBank:
             opened_on=opened_on,
         )
         return certificate
+
+    def withdraw_certificate(
+        self,
+        child_name: str,
+        certificate: CertificateOfDeposit,
+        *,
+        at: datetime | None = None,
+        note: str | None = None,
+    ) -> tuple[Decimal, Decimal, Decimal]:
+        portfolio = self._portfolios[child_name]
+        gross, penalty, net = portfolio.close_certificate(certificate, at=at)
+        account = self.get_account(child_name)
+        metadata = {"investment": "certificate_of_deposit"}
+        metadata["status"] = "early" if penalty > Decimal("0") else "matured"
+        description = note or "Certificate of deposit withdrawal"
+        deposit_tx = account.deposit(
+            gross,
+            description,
+            category=EventCategory.INVEST,
+            metadata=metadata,
+        )
+        self._after_transaction(child_name, deposit_tx)
+        if penalty > Decimal("0"):
+            penalty_tx = account.withdraw(
+                penalty,
+                "Certificate early withdrawal penalty",
+                category=EventCategory.PENALTY,
+                metadata={"investment": "certificate_of_deposit"},
+            )
+            self._after_transaction(child_name, penalty_tx)
+        self._audit_log.record("system", "withdraw_certificate", f"{child_name}:{gross}")
+        return gross, penalty, net
 
     def mature_certificates(self, child_name: str, *, at: datetime | None = None) -> Decimal:
         portfolio = self._portfolios[child_name]
