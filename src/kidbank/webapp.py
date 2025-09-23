@@ -388,6 +388,10 @@ def _cd_rate_meta_key(term_code: str) -> str:
     return f"{CD_RATE_KEY}_{term_code.strip().lower()}"
 
 
+def _cd_penalty_meta_key(term_code: str) -> str:
+    return f"{CD_PENALTY_DAYS_KEY}_{term_code.strip().lower()}"
+
+
 def usd(cents: int) -> str:
     try:
         return f"${(cents or 0) / 100:.2f}"
@@ -495,6 +499,16 @@ def base_styles() -> str:
         margin:24px auto;
         padding:0 16px;
       }
+      .layout{display:grid; grid-template-columns:220px 1fr; gap:16px; align-items:flex-start;}
+      .layout .content{min-width:0;}
+      .sidebar{display:flex; flex-direction:column; gap:6px; position:sticky; top:24px;}
+      .sidebar a{display:block; padding:10px 12px; border-radius:10px; text-decoration:none; color:var(--text); background:rgba(255,255,255,0.04); transition:filter .15s ease, transform .15s ease;}
+      .sidebar a:hover{filter:brightness(1.05); transform:translateX(2px);}
+      .sidebar a.active{background:var(--accent); color:#fff; box-shadow:0 10px 24px rgba(37,99,235,0.25);}
+      .button-link{display:inline-flex; align-items:center; justify-content:center; padding:10px 14px; border-radius:10px; text-decoration:none; font-weight:600; background:rgba(255,255,255,0.06); color:var(--text);} 
+      .button-link.secondary{background:rgba(148,163,184,0.16); color:var(--text);} 
+      .button-link.danger{background:var(--bad); color:#fff;}
+      .button-link:hover{filter:brightness(1.05);}
       .grid{
         display:grid;
         grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
@@ -520,6 +534,10 @@ def base_styles() -> str:
       .danger{ background:var(--bad); }
       form.inline{ display:grid; grid-template-columns: 1fr auto; gap:8px; align-items:end; }
       @media (min-width: 900px){ .card form.inline{ grid-template-columns: 1fr 1fr auto; } }
+      .stacked-form{display:flex; flex-direction:column; gap:8px;}
+      .stacked-form label{font-weight:600;}
+      .stacked-form .actions{justify-content:flex-end;}
+      .actions{display:flex; gap:8px; flex-wrap:wrap; align-items:center;}
       table{width:100%; border-collapse:collapse}
       th,td{padding:10px; border-bottom:1px solid #243041; text-align:left; vertical-align:top}
       .right{text-align:right}
@@ -534,8 +552,25 @@ def base_styles() -> str:
       @media (min-width:1280px){ .admin-top > .card{ grid-column: span 3; } }
       @media (max-width:1150px){ .grid{ grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); } }
       @media (max-width:900px){ .grid{ grid-template-columns: 1fr; } }
+      .notice{border-radius:12px; padding:14px 16px; margin:12px 0;}
+      .notice.success{background:#dcfce7; border-left:4px solid #86efac; color:#166534;}
+      .notice.error{background:#fee2e2; border-left:4px solid #fca5a5; color:#b91c1c;}
+      .chart{width:100%; height:auto;}
+      .chart--detail{background:rgba(148,163,184,0.08); border-radius:12px; padding:12px;}
+      .chart-legend{display:flex; justify-content:space-between; color:var(--muted); font-size:13px; margin-top:6px; gap:8px; flex-wrap:wrap;}
+      .chart-toggle{margin-top:8px; display:flex; gap:6px; flex-wrap:wrap; align-items:center; color:var(--muted);}
+      .chart-toggle a{padding:6px 10px; border-radius:999px; text-decoration:none; background:rgba(148,163,184,0.16); color:var(--text); font-size:13px;}
+      .chart-toggle a.active{background:var(--accent); color:#fff;}
+      .modal-overlay{position:fixed; inset:0; background:rgba(15,23,42,0.78); display:none; align-items:center; justify-content:center; padding:16px; z-index:1000;}
+      .modal-overlay:target{display:flex;}
+      .modal-card{background:var(--card); border-radius:12px; padding:20px; max-width:720px; width:100%; max-height:90vh; overflow:auto; box-shadow:0 28px 48px rgba(0,0,0,0.4);}
+      .modal-head{display:flex; justify-content:space-between; align-items:center; gap:12px; margin-bottom:12px;}
+      .modal-card table{margin-top:10px;}
       @media (max-width: 640px){
         .card{padding:12px}
+        .layout{grid-template-columns:1fr;}
+        .sidebar{flex-direction:row; position:static; overflow-x:auto;}
+        .sidebar a{white-space:nowrap;}
         table, thead, tbody, th, td, tr { display:block; width:100%; }
         thead { display:none; }
         tr { margin-bottom:12px; border:1px solid #243041; border-radius:8px; padding:8px; background:var(--card); }
@@ -559,6 +594,7 @@ def base_styles() -> str:
         button{ width:100%; }
         .kiosk{flex-direction:column; align-items:flex-start}
         .kiosk .balance{font-size:42px}
+        .modal-card{padding:16px; border-radius:10px; max-height:96vh;}
       }
     </style>
     """
@@ -1104,15 +1140,35 @@ def get_all_cd_rate_bps(session: Session) -> Dict[str, int]:
     return {code: get_cd_rate_bps(session, code) for code, _, _ in CD_TERM_OPTIONS}
 
 
-def get_cd_penalty_days(session: Session) -> int:
-    raw = MetaDAO.get(session, CD_PENALTY_DAYS_KEY)
-    if raw is None:
-        return DEFAULT_CD_PENALTY_DAYS
-    try:
-        days = int(raw)
-    except ValueError:
-        return DEFAULT_CD_PENALTY_DAYS
-    return max(0, days)
+def get_cd_penalty_days(session: Session, term_code: Optional[str] = None) -> int:
+    normalized = (term_code or "").strip().lower()
+    if normalized:
+        specific_raw = MetaDAO.get(session, _cd_penalty_meta_key(normalized))
+        if specific_raw is not None:
+            try:
+                return max(0, int(specific_raw))
+            except ValueError:
+                pass
+    default_raw = MetaDAO.get(session, _cd_penalty_meta_key(DEFAULT_CD_TERM_CODE))
+    if default_raw is not None:
+        try:
+            return max(0, int(default_raw))
+        except ValueError:
+            pass
+    legacy_raw = MetaDAO.get(session, CD_PENALTY_DAYS_KEY)
+    if legacy_raw is not None:
+        try:
+            return max(0, int(legacy_raw))
+        except ValueError:
+            pass
+    return DEFAULT_CD_PENALTY_DAYS
+
+
+def get_all_cd_penalty_days(session: Session) -> Dict[str, int]:
+    penalties: Dict[str, int] = {}
+    for code, _label, _days in CD_TERM_OPTIONS:
+        penalties[code] = get_cd_penalty_days(session, code)
+    return penalties
 
 
 def resolve_certificate_term(selection: str) -> Tuple[str, int, int]:
@@ -1186,35 +1242,79 @@ def certificate_maturity_date(certificate: Certificate) -> datetime:
     return certificate.opened_at + timedelta(days=certificate_term_days(certificate))
 
 
+def _decimal_to_cents(value: Decimal) -> int:
+    return int((value * Decimal(100)).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+
+
+def _certificate_compound_value(
+    principal_cents: int, rate_bps: int, days: float, total_days: float
+) -> Decimal:
+    principal = Decimal(principal_cents) / Decimal(100)
+    rate = Decimal(max(0, rate_bps)) / Decimal(10000)
+    if total_days <= 0 or rate <= Decimal("0") or days <= 0:
+        return principal.quantize(Decimal("0.01"))
+    clamped_days = max(0.0, min(days, total_days))
+    if clamped_days <= 0:
+        return principal.quantize(Decimal("0.01"))
+    try:
+        fraction = clamped_days / total_days
+    except ZeroDivisionError:  # pragma: no cover - defensive
+        return principal.quantize(Decimal("0.01"))
+    try:
+        growth = math.exp(math.log1p(float(rate)) * fraction)
+    except ValueError:
+        growth = 1.0
+    try:
+        return (principal * Decimal(str(growth))).quantize(Decimal("0.01"))
+    except (ValueError, ArithmeticError):  # pragma: no cover - defensive
+        return principal.quantize(Decimal("0.01"))
+
+
+def _certificate_elapsed_days(
+    certificate: Certificate, *, at: Optional[datetime] = None
+) -> float:
+    total_days = float(max(0, certificate_term_days(certificate)))
+    if total_days <= 0:
+        return 0.0
+    moment = at or _time_provider()
+    if certificate.matured_at:
+        moment = min(moment, certificate.matured_at)
+    elapsed_seconds = (moment - certificate.opened_at).total_seconds()
+    elapsed_days = elapsed_seconds / 86400.0
+    return max(0.0, min(elapsed_days, total_days))
+
+
 def certificate_maturity_value_cents(certificate: Certificate) -> int:
-    principal = Decimal(certificate.principal_cents)
-    rate = Decimal(certificate.rate_bps) / Decimal(10000)
-    interest = (principal * rate).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
-    return int(principal + interest)
+    total_days = float(certificate_term_days(certificate))
+    return _decimal_to_cents(
+        _certificate_compound_value(
+            certificate.principal_cents,
+            certificate.rate_bps,
+            total_days,
+            total_days,
+        )
+    )
 
 
 def _certificate_elapsed_fraction(certificate: Certificate, *, at: Optional[datetime] = None) -> float:
     total_days = certificate_term_days(certificate)
-    total_seconds = total_days * 86400
-    if total_seconds <= 0:
+    if total_days <= 0:
         return 1.0
-    moment = at or datetime.utcnow()
-    if certificate.matured_at:
-        moment = max(moment, certificate.matured_at)
-    elapsed_seconds = (moment - certificate.opened_at).total_seconds()
-    elapsed_seconds = max(0.0, min(elapsed_seconds, total_seconds))
-    return elapsed_seconds / total_seconds if total_seconds else 1.0
+    elapsed_days = _certificate_elapsed_days(certificate, at=at)
+    return min(1.0, max(0.0, elapsed_days / total_days))
 
 
 def certificate_value_cents(certificate: Certificate, *, at: Optional[datetime] = None) -> int:
-    principal = Decimal(certificate.principal_cents)
-    rate = Decimal(certificate.rate_bps) / Decimal(10000)
-    fraction = _certificate_elapsed_fraction(certificate, at=at)
-    if fraction <= 0 or rate <= 0:
-        return int(principal)
-    growth = math.exp(fraction * math.log1p(float(rate)))
-    value = (principal * Decimal(str(growth))).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
-    return int(value)
+    elapsed_days = _certificate_elapsed_days(certificate, at=at)
+    total_days = float(certificate_term_days(certificate))
+    return _decimal_to_cents(
+        _certificate_compound_value(
+            certificate.principal_cents,
+            certificate.rate_bps,
+            elapsed_days,
+            total_days,
+        )
+    )
 
 
 def certificate_penalty_cents(certificate: Certificate, *, at: Optional[datetime] = None) -> int:
@@ -1222,27 +1322,33 @@ def certificate_penalty_cents(certificate: Certificate, *, at: Optional[datetime
         return 0
     if certificate.matured_at is not None:
         return 0
-    total_days = certificate_term_days(certificate)
-    if total_days <= 0:
-        return 0
-    moment = at or datetime.utcnow()
+    moment = at or _time_provider()
     if moment >= certificate_maturity_date(certificate):
         return 0
-    penalty_days = max(0, min(certificate.penalty_days, total_days))
-    if penalty_days == 0:
+    elapsed_days = _certificate_elapsed_days(certificate, at=moment)
+    if elapsed_days <= 0:
         return 0
-    principal = Decimal(certificate.principal_cents)
-    rate = Decimal(certificate.rate_bps) / Decimal(10000)
-    penalty = (
-        principal
-        * rate
-        * Decimal(penalty_days)
-        / Decimal(total_days)
-    ).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
-    gross = Decimal(certificate_value_cents(certificate, at=moment))
-    accrued = max(Decimal("0"), gross - principal)
-    penalty = min(penalty, accrued)
-    return int(penalty)
+    penalty_window = min(float(certificate.penalty_days), elapsed_days)
+    if penalty_window <= 0:
+        return 0
+    total_days = float(certificate_term_days(certificate))
+    current_value = _certificate_compound_value(
+        certificate.principal_cents,
+        certificate.rate_bps,
+        elapsed_days,
+        total_days,
+    )
+    prior_value = _certificate_compound_value(
+        certificate.principal_cents,
+        certificate.rate_bps,
+        elapsed_days - penalty_window,
+        total_days,
+    )
+    penalty_value = max(Decimal("0.00"), current_value - prior_value)
+    principal_value = Decimal(certificate.principal_cents) / Decimal(100)
+    accrued = max(Decimal("0.00"), current_value - principal_value)
+    penalty_value = min(penalty_value, accrued)
+    return _decimal_to_cents(penalty_value)
 
 
 def certificate_sale_breakdown_cents(
@@ -1257,8 +1363,11 @@ def certificate_sale_breakdown_cents(
 def certificate_progress_percent(certificate: Certificate, *, at: Optional[datetime] = None) -> float:
     if certificate.matured_at:
         return 100.0
-    fraction = _certificate_elapsed_fraction(certificate, at=at)
-    pct = fraction * 100
+    total_days = certificate_term_days(certificate)
+    if total_days <= 0:
+        return 0.0
+    elapsed_days = _certificate_elapsed_days(certificate, at=at)
+    pct = (elapsed_days / total_days) * 100
     return min(100.0, max(0.0, pct))
 
 
@@ -1510,11 +1619,20 @@ PRICE_HISTORY_RANGES: Dict[str, Dict[str, Any]] = {
     "5y": {"label": "5yr", "range": "5y", "interval": "1mo", "ttl": 1440},
 }
 DEFAULT_PRICE_RANGE = "1m"
+CHART_VIEW_COMPACT = "compact"
+CHART_VIEW_DETAIL = "detail"
+DEFAULT_CHART_VIEW = CHART_VIEW_COMPACT
+CHART_VIEWS = {CHART_VIEW_COMPACT, CHART_VIEW_DETAIL}
 
 
 def normalize_history_range(value: str) -> str:
     normalized = (value or "").lower()
     return normalized if normalized in PRICE_HISTORY_RANGES else DEFAULT_PRICE_RANGE
+
+
+def normalize_chart_view(value: str) -> str:
+    normalized = (value or "").strip().lower()
+    return normalized if normalized in CHART_VIEWS else DEFAULT_CHART_VIEW
 
 
 def _price_history_range_cache_key(symbol: str, range_code: str) -> str:
@@ -1796,6 +1914,128 @@ def sparkline_svg_from_history(hist: Iterable[dict], width: int = 320, height: i
         f"<svg width='{width}' height='{height}' viewBox='0 0 {width} {height}' "
         f"xmlns='http://www.w3.org/2000/svg' role='img' aria-label='7-day price sparkline'>"
         f"<path d='{path}' fill='none' stroke='{color}' stroke-width='2'/></svg>"
+    )
+
+
+def detailed_history_chart_svg(
+    hist: Iterable[dict], *, width: int = 640, height: int = 240
+) -> str:
+    points: List[Tuple[datetime, int]] = []
+    for entry in hist:
+        price_raw = entry.get("p")
+        timestamp_raw = entry.get("t")
+        if price_raw is None or timestamp_raw is None:
+            continue
+        try:
+            price_c = int(price_raw)
+        except (TypeError, ValueError):
+            continue
+        try:
+            moment = (
+                datetime.fromisoformat(timestamp_raw)
+                if isinstance(timestamp_raw, str)
+                else datetime.fromtimestamp(int(timestamp_raw))
+            )
+        except (TypeError, ValueError, OSError):
+            continue
+        points.append((moment, price_c))
+    if len(points) < 2:
+        return (
+            f"<svg class='chart chart--detail' width='{width}' height='{height}'></svg>"
+        )
+    points.sort(key=lambda item: item[0])
+    pad_left = 60.0
+    pad_right = 16.0
+    pad_top = 24.0
+    pad_bottom = 36.0
+    inner_width = width - pad_left - pad_right
+    inner_height = height - pad_top - pad_bottom
+    if inner_width <= 0 or inner_height <= 0:
+        return (
+            f"<svg class='chart chart--detail' width='{width}' height='{height}'></svg>"
+        )
+    start_time = points[0][0]
+    offsets = [(point[0] - start_time).total_seconds() for point in points]
+    span = offsets[-1]
+    if span <= 0:
+        x_positions = [
+            pad_left + (inner_width * idx / (len(points) - 1))
+            for idx in range(len(points))
+        ]
+    else:
+        x_positions = [pad_left + (offset / span) * inner_width for offset in offsets]
+    prices = [price for _, price in points]
+    min_price = min(prices)
+    max_price = max(prices)
+    price_range = max(1, max_price - min_price)
+    y_positions = [
+        pad_top + (inner_height * (1 - (price - min_price) / price_range))
+        for price in prices
+    ]
+    baseline = pad_top + inner_height
+    color = "#16a34a" if prices[-1] >= prices[0] else "#dc2626"
+    axis_color = "#94a3b8"
+    path_parts = [f"M {x_positions[0]:.2f} {y_positions[0]:.2f}"]
+    for x, y in zip(x_positions[1:], y_positions[1:]):
+        path_parts.append(f"L {x:.2f} {y:.2f}")
+    path_data = " ".join(path_parts)
+    fill_data = (
+        path_data
+        + f" L {pad_left + inner_width:.2f} {baseline:.2f}"
+        + f" L {pad_left:.2f} {baseline:.2f} Z"
+    )
+    y_ticks = [min_price, (min_price + max_price) / 2, max_price]
+    y_labels = []
+    for value in y_ticks:
+        y = pad_top + (inner_height * (1 - (float(value) - min_price) / price_range))
+        y_labels.append(
+            f"<text x='{pad_left - 10:.2f}' y='{y:.2f}' fill='{axis_color}' "
+            "font-size='12' text-anchor='end' dominant-baseline='middle'>"
+            + usd(int(round(value)))
+            + "</text>"
+        )
+    total_seconds = points[-1][0] - points[0][0]
+    span_seconds = max(1.0, total_seconds.total_seconds())
+    if span_seconds <= 36_000:  # ~10 hours
+        tick_fmt = "%b %d %H:%M"
+    elif span_seconds <= 86_400 * 90:
+        tick_fmt = "%b %d"
+    elif span_seconds <= 86_400 * 540:
+        tick_fmt = "%b %Y"
+    else:
+        tick_fmt = "%Y"
+    tick_candidates = [0, len(points) // 3, (2 * len(points)) // 3, len(points) - 1]
+    ticks: List[int] = []
+    for idx in tick_candidates:
+        if 0 <= idx < len(points) and idx not in ticks:
+            ticks.append(idx)
+    x_labels = []
+    for idx in ticks:
+        tick_x = x_positions[idx]
+        tick_label = points[idx][0].strftime(tick_fmt)
+        x_labels.append(
+            f"<text x='{tick_x:.2f}' y='{height - pad_bottom + 18:.2f}' fill='{axis_color}' "
+            "font-size='12' text-anchor='middle'>"
+            + html_escape(tick_label)
+            + "</text>"
+        )
+    marker = f"<circle cx='{x_positions[-1]:.2f}' cy='{y_positions[-1]:.2f}' r='3.5' fill='{color}'/>"
+    return (
+        f"<svg class='chart chart--detail' width='{width}' height='{height}' "
+        f"viewBox='0 0 {width} {height}' xmlns='http://www.w3.org/2000/svg' "
+        f"role='img' aria-label='Price history detailed chart'>"
+        f"<rect x='{pad_left:.2f}' y='{pad_top:.2f}' width='{inner_width:.2f}' "
+        f"height='{inner_height:.2f}' fill='none' stroke='rgba(148,163,184,0.18)' stroke-width='1'/>"
+        f"<path d='{fill_data}' fill='{color}' fill-opacity='0.15' stroke='none'/>"
+        f"<path d='{path_data}' fill='none' stroke='{color}' stroke-width='2.5' stroke-linejoin='round'/>"
+        f"<line x1='{pad_left:.2f}' y1='{baseline:.2f}' x2='{pad_left + inner_width:.2f}' y2='{baseline:.2f}' "
+        f"stroke='{axis_color}' stroke-width='1'/>"
+        f"<line x1='{pad_left:.2f}' y1='{pad_top:.2f}' x2='{pad_left:.2f}' y2='{baseline:.2f}' "
+        f"stroke='{axis_color}' stroke-width='1'/>"
+        + "".join(y_labels)
+        + "".join(x_labels)
+        + marker
+        + "</svg>"
     )
 
 
@@ -2719,11 +2959,19 @@ def kid_invest_home(
     symbol: Optional[str] = Query(None),
     range_code: str = Query(DEFAULT_PRICE_RANGE, alias="range"),
     lookup: str = Query(""),
+    chart_view: str = Query(DEFAULT_CHART_VIEW, alias="chart"),
 ) -> HTMLResponse:
     if (redirect := require_kid(request)) is not None:
         return redirect
     kid_id = kid_authed(request)
     assert kid_id
+    notice_msg, notice_kind = pop_kid_notice(request)
+    notice_html = ""
+    if notice_msg:
+        notice_class = "error" if notice_kind == "error" else "success"
+        notice_html = (
+            f"<div class='notice {notice_class}'>{html_escape(notice_msg)}</div>"
+        )
     try:
         instruments = list_market_instruments()
         if not instruments:
@@ -2738,9 +2986,13 @@ def kid_invest_home(
             selected_symbol = default_symbol if default_symbol in instrument_map else next(iter(instrument_map.keys()))
         active_instrument = instrument_map[selected_symbol]
         selected_range = normalize_history_range(range_code)
+        chart_mode = normalize_chart_view(chart_view)
         metrics = compute_holdings_metrics(kid_id, selected_symbol)
         history = fetch_price_history_range(selected_symbol, selected_range)
-        svg = sparkline_svg_from_history(history)
+        if chart_mode == CHART_VIEW_DETAIL:
+            svg = detailed_history_chart_svg(history)
+        else:
+            svg = sparkline_svg_from_history(history)
         cd_rates_bps = {code: DEFAULT_CD_RATE_BPS for code, _, _ in CD_TERM_OPTIONS}
         with Session(engine) as session:
             child = session.exec(select(Child).where(Child.kid_id == kid_id)).first()
@@ -2751,12 +3003,12 @@ def kid_invest_home(
                 .order_by(desc(Certificate.opened_at))
             ).all()
             cd_rates_bps = get_all_cd_rate_bps(session)
-            penalty_days_setting = get_cd_penalty_days(session)
+            penalty_days_by_term = get_all_cd_penalty_days(session)
 
         def fmt(value: int) -> str:
             return f"{'+' if value >= 0 else ''}{usd(value)}"
 
-        moment = datetime.utcnow()
+        moment = _time_provider()
         cd_total_c = 0
         matured_ready = 0
         next_maturity: Optional[datetime] = None
@@ -2790,6 +3042,9 @@ def kid_invest_home(
                 f"<td data-label='Actions'>"
                 f"<form class='inline' method='post' action='/kid/invest/cd/cashout'>"
                 f"<input type='hidden' name='certificate_id' value='{certificate.id}'>"
+                f"<input type='hidden' name='symbol' value='{instrument_symbol_raw}'>"
+                f"<input type='hidden' name='range' value='{selected_range}'>"
+                f"<input type='hidden' name='chart' value='{chart_mode}'>"
                 f"<button type='submit'{button_class_attr}>{'Cash Out' if certificate.matured_at is None else 'Remove'}</button>"
                 f"</form></td></tr>"
             )
@@ -2810,17 +3065,31 @@ def kid_invest_home(
             summary_bits.append(
                 f"<div class='muted'>{matured_ready} certificate{'s' if matured_ready != 1 else ''} ready to cash out.</div>"
             )
-        penalty_summary = (
-            f"<div>Early withdrawal penalty: <b>{penalty_days_setting} day{'s' if penalty_days_setting != 1 else ''}</b> of interest</div>"
-            if penalty_days_setting
-            else "<div>No penalty for early withdrawals right now.</div>"
-        )
+        penalty_active = any(days > 0 for days in penalty_days_by_term.values())
+        if penalty_active:
+            penalty_parts = []
+            for code, label, _ in CD_TERM_OPTIONS:
+                days = penalty_days_by_term.get(code, 0)
+                penalty_parts.append(
+                    f"{label}: {days} day{'s' if days != 1 else ''}"
+                )
+            penalty_summary = (
+                "<div>Early withdrawal penalty: <b>"
+                + ", ".join(penalty_parts)
+                + "</b></div>"
+            )
+        else:
+            penalty_summary = "<div>No penalty for early withdrawals right now.</div>"
         summary_bits.append(penalty_summary)
         cd_summary_html = "".join(summary_bits)
+        instrument_symbol_raw = active_instrument.symbol
         cash_out_form = ""
         if matured_ready:
             cash_out_form = (
                 "<form method='post' action='/kid/invest/cd/mature' style='margin-top:10px;'>"
+                f"<input type='hidden' name='symbol' value='{instrument_symbol_raw}'>"
+                f"<input type='hidden' name='range' value='{selected_range}'>"
+                f"<input type='hidden' name='chart' value='{chart_mode}'>"
                 "<button type='submit'>Cash out matured</button>"
                 "</form>"
             )
@@ -2836,7 +3105,9 @@ def kid_invest_home(
             for inst in instruments:
                 normalized = _normalize_symbol(inst.symbol)
                 active_style = "background:var(--accent); color:#fff;" if normalized == selected_symbol else ""
-                link_url = f"/kid/invest?symbol={inst.symbol}&range={selected_range}"
+                link_url = (
+                    f"/kid/invest?symbol={inst.symbol}&range={selected_range}&chart={chart_mode}"
+                )
                 links.append(
                     f"<a href='{link_url}' class='pill' style='margin-right:6px;{active_style}'>"
                     f"{html_escape(inst.name or inst.symbol)}</a>"
@@ -2847,12 +3118,25 @@ def kid_invest_home(
         for code, cfg in PRICE_HISTORY_RANGES.items():
             label = cfg.get("label", code)
             active_style = "background:var(--accent); color:#fff;" if code == selected_range else ""
-            link_url = f"/kid/invest?symbol={active_instrument.symbol}&range={code}"
+            link_url = (
+                f"/kid/invest?symbol={active_instrument.symbol}&range={code}&chart={chart_mode}"
+            )
             range_links.append(
                 f"<a href='{link_url}' class='pill' style='margin-right:6px;{active_style}'>{label}</a>"
             )
-        range_selector_html = "<div class='muted' style='margin-top:8px;'>View: " + "".join(range_links) + "</div>"
-        instrument_symbol_raw = active_instrument.symbol
+        range_selector_html = "<div class='muted' style='margin-top:8px;'>Range: " + "".join(range_links) + "</div>"
+        compact_url = (
+            f"/kid/invest?symbol={active_instrument.symbol}&range={selected_range}&chart={CHART_VIEW_COMPACT}"
+        )
+        detail_url = (
+            f"/kid/invest?symbol={active_instrument.symbol}&range={selected_range}&chart={CHART_VIEW_DETAIL}"
+        )
+        chart_toggle_html = (
+            "<div class='chart-toggle'>Chart: "
+            + f"<a href='{compact_url}' class='{'active' if chart_mode == CHART_VIEW_COMPACT else ''}'>Compact</a>"
+            + f"<a href='{detail_url}' class='{'active' if chart_mode == CHART_VIEW_DETAIL else ''}'>Detailed</a>"
+            + "</div>"
+        )
         lookup_value = html_escape(lookup_query)
         if lookup_query and lookup_results:
             suggestion_items = []
@@ -2872,6 +3156,7 @@ def kid_invest_home(
                     + f"<input type='hidden' name='name' value='{html_escape(name_val)}'>"
                     + f"<input type='hidden' name='kind' value='{html_escape(kind_val)}'>"
                     + f"<input type='hidden' name='range' value='{selected_range}'>"
+                    + f"<input type='hidden' name='chart' value='{chart_mode}'>"
                     + "<button type='submit'>Track</button></form></li>"
                 )
             search_results_html = (
@@ -2890,6 +3175,7 @@ def kid_invest_home(
           <form method='get' action='/kid/invest' class='inline'>
             <input type='hidden' name='symbol' value='{html_escape(instrument_symbol_raw)}'>
             <input type='hidden' name='range' value='{selected_range}'>
+            <input type='hidden' name='chart' value='{chart_mode}'>
             <input name='lookup' placeholder='Search ticker or name' value='{lookup_value}'>
             <button type='submit'>Search</button>
           </form>
@@ -2901,9 +3187,20 @@ def kid_invest_home(
         instrument_symbol = html_escape(instrument_symbol_raw)
         kind_label = "Crypto" if active_instrument.kind == INSTRUMENT_KIND_CRYPTO else "Stock"
         unit_label = "per coin" if active_instrument.kind == INSTRUMENT_KIND_CRYPTO else "per share"
+        allow_remove = _normalize_symbol(instrument_symbol_raw) != _normalize_symbol(DEFAULT_MARKET_SYMBOL)
+        remove_button_html = ""
+        if allow_remove:
+            remove_button_html = (
+                "<form method='post' action='/kid/invest/delete' style='margin-top:10px;'>"
+                f"<input type='hidden' name='symbol' value='{instrument_symbol}'>"
+                f"<input type='hidden' name='range' value='{selected_range}'>"
+                f"<input type='hidden' name='chart' value='{chart_mode}'>"
+                "<button type='submit' class='danger secondary'>Remove from dashboard</button>"
+                "</form>"
+            )
 
         inner = f"""
-        {search_card_html}
+        {notice_html}{search_card_html}
         {tabs_html}
         <div class='card'>
           <h3>Investing — {instrument_label}</h3>
@@ -2916,6 +3213,7 @@ def kid_invest_home(
               <div class='muted'>{unit_label}</div>
               <div style='margin-top:8px;'>{svg}</div>
               {range_selector_html}
+              {chart_toggle_html}
             </div>
             <div class='card'>
               <div><b>Your Holdings</b></div>
@@ -2925,12 +3223,14 @@ def kid_invest_home(
               <div>Invested: <b>{usd(metrics['invested_cost_c'])}</b></div>
               <div style='color:#{'16a34a' if metrics['unrealized_pl_c']>=0 else 'dc2626'};'>Unrealized P/L: <b>{fmt(metrics['unrealized_pl_c'])}</b></div>
               <div style='color:#{'16a34a' if metrics['realized_pl_c']>=0 else 'dc2626'};'>Realized P/L: <b>{fmt(metrics['realized_pl_c'])}</b></div>
+              {remove_button_html}
             </div>
           </div>
           <h4 style='margin-top:12px;'>Buy (deposit from balance)</h4>
           <form method='post' action='/kid/invest/buy' class='inline'>
             <input type='hidden' name='symbol' value='{instrument_symbol}'>
             <input type='hidden' name='range' value='{selected_range}'>
+            <input type='hidden' name='chart' value='{chart_mode}'>
             <input name='amount' type='text' data-money placeholder='amount $' required>
             <button type='submit'>Buy</button>
           </form>
@@ -2938,6 +3238,7 @@ def kid_invest_home(
           <form method='post' action='/kid/invest/sell' class='inline'>
             <input type='hidden' name='symbol' value='{instrument_symbol}'>
             <input type='hidden' name='range' value='{selected_range}'>
+            <input type='hidden' name='chart' value='{chart_mode}'>
             <input name='amount' type='text' data-money placeholder='amount $' required>
             <button type='submit' class='danger'>Sell</button>
           </form>
@@ -2949,6 +3250,9 @@ def kid_invest_home(
           {cash_out_form}
           <h4 style='margin-top:12px;'>Open a certificate</h4>
           <form method='post' action='/kid/invest/cd/open' class='inline'>
+            <input type='hidden' name='symbol' value='{instrument_symbol}'>
+            <input type='hidden' name='range' value='{selected_range}'>
+            <input type='hidden' name='chart' value='{chart_mode}'>
             <input name='amount' type='text' data-money placeholder='amount $' required>
             <label style='margin-left:6px;'>Term</label>
             <select name='term_choice'>
@@ -2977,7 +3281,8 @@ def kid_invest_track(
     symbol: str = Form(...),
     name: str = Form(""),
     kind: str = Form(INSTRUMENT_KIND_STOCK),
-    range_code: str = Form(DEFAULT_PRICE_RANGE),
+    range_code: str = Form(DEFAULT_PRICE_RANGE, alias="range"),
+    chart_view: str = Form(DEFAULT_CHART_VIEW, alias="chart"),
 ):
     if (redirect := require_kid(request)) is not None:
         return redirect
@@ -2998,7 +3303,11 @@ def kid_invest_track(
         return RedirectResponse("/kid/invest", status_code=302)
     set_kid_notice(request, f"Tracking {instrument.symbol}.", "success")
     next_range = normalize_history_range(range_code)
-    return RedirectResponse(f"/kid/invest?symbol={instrument.symbol}&range={next_range}", status_code=302)
+    next_chart = normalize_chart_view(chart_view)
+    return RedirectResponse(
+        f"/kid/invest?symbol={instrument.symbol}&range={next_range}&chart={next_chart}",
+        status_code=302,
+    )
 
 
 @app.post("/kid/invest/buy")
@@ -3006,25 +3315,37 @@ def kid_invest_buy(
     request: Request,
     amount: str = Form(...),
     symbol: str = Form(DEFAULT_MARKET_SYMBOL),
-    range_code: str = Form(DEFAULT_PRICE_RANGE),
+    range_code: str = Form(DEFAULT_PRICE_RANGE, alias="range"),
+    chart_view: str = Form(DEFAULT_CHART_VIEW, alias="chart"),
 ):
     if (redirect := require_kid(request)) is not None:
         return redirect
     kid_id = kid_authed(request)
     assert kid_id
     next_range = normalize_history_range(range_code)
+    chart_mode = normalize_chart_view(chart_view)
     amount_c = to_cents_from_dollars_str(amount, 0)
     if amount_c <= 0:
-        return RedirectResponse(f"/kid/invest?symbol={symbol}&range={next_range}", status_code=302)
+        return RedirectResponse(
+            f"/kid/invest?symbol={symbol}&range={next_range}&chart={chart_mode}",
+            status_code=302,
+        )
     normalized_symbol = _normalize_symbol(symbol)
     price_c = market_price_cents(normalized_symbol)
     if price_c <= 0:
-        return RedirectResponse(f"/kid/invest?symbol={symbol}&range={next_range}", status_code=302)
+        return RedirectResponse(
+            f"/kid/invest?symbol={symbol}&range={next_range}&chart={chart_mode}",
+            status_code=302,
+        )
     price = price_c / 100.0
     with Session(engine) as session:
         child = session.exec(select(Child).where(Child.kid_id == kid_id)).first()
         if not child or amount_c > child.balance_cents:
-            return RedirectResponse(f"/kid/invest?symbol={symbol}&range={next_range}", status_code=302)
+            return RedirectResponse(
+                f"/kid/invest?symbol={symbol}&range={next_range}&chart={chart_mode}",
+                status_code=302,
+            )
+        moment = _time_provider()
         shares = (amount_c / 100.0) / price
         holding = session.exec(
             select(Investment).where(Investment.kid_id == kid_id, Investment.fund == normalized_symbol)
@@ -3033,7 +3354,7 @@ def kid_invest_buy(
             holding = Investment(kid_id=kid_id, fund=normalized_symbol, shares=0.0)
         holding.shares += shares
         child.balance_cents -= amount_c
-        child.updated_at = datetime.utcnow()
+        child.updated_at = moment
         tx = InvestmentTx(
             kid_id=kid_id,
             fund=normalized_symbol,
@@ -3054,7 +3375,10 @@ def kid_invest_buy(
             )
         )
         session.commit()
-    return RedirectResponse(f"/kid/invest?symbol={symbol}&range={next_range}", status_code=302)
+    return RedirectResponse(
+        f"/kid/invest?symbol={symbol}&range={next_range}&chart={chart_mode}",
+        status_code=302,
+    )
 
 
 @app.post("/kid/invest/sell")
@@ -3062,20 +3386,28 @@ def kid_invest_sell(
     request: Request,
     amount: str = Form(...),
     symbol: str = Form(DEFAULT_MARKET_SYMBOL),
-    range_code: str = Form(DEFAULT_PRICE_RANGE),
+    range_code: str = Form(DEFAULT_PRICE_RANGE, alias="range"),
+    chart_view: str = Form(DEFAULT_CHART_VIEW, alias="chart"),
 ):
     if (redirect := require_kid(request)) is not None:
         return redirect
     kid_id = kid_authed(request)
     assert kid_id
     next_range = normalize_history_range(range_code)
+    chart_mode = normalize_chart_view(chart_view)
     amount_c = to_cents_from_dollars_str(amount, 0)
     if amount_c <= 0:
-        return RedirectResponse(f"/kid/invest?symbol={symbol}&range={next_range}", status_code=302)
+        return RedirectResponse(
+            f"/kid/invest?symbol={symbol}&range={next_range}&chart={chart_mode}",
+            status_code=302,
+        )
     normalized_symbol = _normalize_symbol(symbol)
     price_c = market_price_cents(normalized_symbol)
     if price_c <= 0:
-        return RedirectResponse(f"/kid/invest?symbol={symbol}&range={next_range}", status_code=302)
+        return RedirectResponse(
+            f"/kid/invest?symbol={symbol}&range={next_range}&chart={chart_mode}",
+            status_code=302,
+        )
     price = price_c / 100.0
     with Session(engine) as session:
         holding = session.exec(
@@ -3083,12 +3415,18 @@ def kid_invest_sell(
         ).first()
         child = session.exec(select(Child).where(Child.kid_id == kid_id)).first()
         if not holding or not child or holding.shares <= 0:
-            return RedirectResponse(f"/kid/invest?symbol={symbol}&range={next_range}", status_code=302)
+            return RedirectResponse(
+                f"/kid/invest?symbol={symbol}&range={next_range}&chart={chart_mode}",
+                status_code=302,
+            )
         need_shares = (amount_c / 100.0) / price
         sell_shares = min(holding.shares, need_shares)
         proceeds_c = int(round(sell_shares * price * 100))
         if sell_shares <= 0 or proceeds_c <= 0:
-            return RedirectResponse(f"/kid/invest?symbol={symbol}&range={next_range}", status_code=302)
+            return RedirectResponse(
+                f"/kid/invest?symbol={symbol}&range={next_range}&chart={chart_mode}",
+                status_code=302,
+            )
         txs = session.exec(
             select(InvestmentTx)
             .where(InvestmentTx.kid_id == kid_id, InvestmentTx.fund == normalized_symbol)
@@ -3111,7 +3449,8 @@ def kid_invest_sell(
         realized_pl = proceeds_c - sold_cost_c
         holding.shares -= sell_shares
         child.balance_cents += proceeds_c
-        child.updated_at = datetime.utcnow()
+        moment = _time_provider()
+        child.updated_at = moment
         tx = InvestmentTx(
             kid_id=kid_id,
             fund=normalized_symbol,
@@ -3132,7 +3471,10 @@ def kid_invest_sell(
             )
         )
         session.commit()
-    return RedirectResponse(f"/kid/invest?symbol={symbol}&range={next_range}", status_code=302)
+    return RedirectResponse(
+        f"/kid/invest?symbol={symbol}&range={next_range}&chart={chart_mode}",
+        status_code=302,
+    )
 
 
 @app.post("/kid/invest/cd/open")
@@ -3140,6 +3482,9 @@ def kid_invest_cd_open(
     request: Request,
     amount: str = Form(...),
     term_choice: str = Form(...),
+    symbol: str = Form(DEFAULT_MARKET_SYMBOL),
+    range_code: str = Form(DEFAULT_PRICE_RANGE, alias="range"),
+    chart_view: str = Form(DEFAULT_CHART_VIEW, alias="chart"),
 ):
     if (redirect := require_kid(request)) is not None:
         return redirect
@@ -3148,24 +3493,35 @@ def kid_invest_cd_open(
     amount_c = to_cents_from_dollars_str(amount, 0)
     term_code, term_days, term_months_value = resolve_certificate_term(term_choice)
     if amount_c <= 0:
-        return RedirectResponse("/kid/invest", status_code=302)
+        next_range = normalize_history_range(range_code)
+        chart_mode = normalize_chart_view(chart_view)
+        return RedirectResponse(
+            f"/kid/invest?symbol={symbol}&range={next_range}&chart={chart_mode}",
+            status_code=302,
+        )
     with Session(engine) as session:
         child = session.exec(select(Child).where(Child.kid_id == kid_id)).first()
         if not child or amount_c > child.balance_cents:
-            return RedirectResponse("/kid/invest", status_code=302)
+            next_range = normalize_history_range(range_code)
+            chart_mode = normalize_chart_view(chart_view)
+            return RedirectResponse(
+                f"/kid/invest?symbol={symbol}&range={next_range}&chart={chart_mode}",
+                status_code=302,
+            )
         rate_bps = get_cd_rate_bps(session, term_code)
-        penalty_days = get_cd_penalty_days(session)
+        penalty_days = get_cd_penalty_days(session, term_code)
+        now = _time_provider()
         certificate = Certificate(
             kid_id=kid_id,
             principal_cents=amount_c,
             rate_bps=rate_bps,
             term_months=term_months_value,
             term_days=term_days,
-            opened_at=datetime.utcnow(),
+            opened_at=now,
             penalty_days=penalty_days,
         )
         child.balance_cents -= amount_c
-        child.updated_at = datetime.utcnow()
+        child.updated_at = now
         rate_pct = rate_bps / 100
         session.add(child)
         session.add(certificate)
@@ -3177,25 +3533,41 @@ def kid_invest_cd_open(
             )
         )
         session.commit()
-    return RedirectResponse("/kid/invest", status_code=302)
+    next_range = normalize_history_range(range_code)
+    chart_mode = normalize_chart_view(chart_view)
+    set_kid_notice(request, f"Locked savings for a {term_code} certificate.", "success")
+    return RedirectResponse(
+        f"/kid/invest?symbol={symbol}&range={next_range}&chart={chart_mode}",
+        status_code=302,
+    )
 
 
 @app.post("/kid/invest/cd/mature")
-def kid_invest_cd_mature(request: Request):
+def kid_invest_cd_mature(
+    request: Request,
+    symbol: str = Form(DEFAULT_MARKET_SYMBOL),
+    range_code: str = Form(DEFAULT_PRICE_RANGE, alias="range"),
+    chart_view: str = Form(DEFAULT_CHART_VIEW, alias="chart"),
+):
     if (redirect := require_kid(request)) is not None:
         return redirect
     kid_id = kid_authed(request)
     assert kid_id
+    next_range = normalize_history_range(range_code)
+    chart_mode = normalize_chart_view(chart_view)
     with Session(engine) as session:
         child = session.exec(select(Child).where(Child.kid_id == kid_id)).first()
         if not child:
-            return RedirectResponse("/kid/invest", status_code=302)
+            return RedirectResponse(
+                f"/kid/invest?symbol={symbol}&range={next_range}&chart={chart_mode}",
+                status_code=302,
+            )
         certificates = session.exec(
             select(Certificate)
             .where(Certificate.kid_id == kid_id)
             .where(Certificate.matured_at == None)  # noqa: E711
         ).all()
-        moment = datetime.utcnow()
+        moment = _time_provider()
         payout_total = 0
         matured_count = 0
         for certificate in certificates:
@@ -3207,7 +3579,7 @@ def kid_invest_cd_mature(request: Request):
                 session.add(certificate)
         if payout_total > 0 and matured_count > 0:
             child.balance_cents += payout_total
-            child.updated_at = datetime.utcnow()
+            child.updated_at = moment
             session.add(child)
             session.add(
                 Event(
@@ -3217,35 +3589,62 @@ def kid_invest_cd_mature(request: Request):
                 )
             )
             session.commit()
+            plural = "s" if matured_count != 1 else ""
+            set_kid_notice(
+                request,
+                f"Cashed out {matured_count} matured certificate{plural}.",
+                "success",
+            )
         else:
             session.rollback()
-    return RedirectResponse("/kid/invest", status_code=302)
+            set_kid_notice(request, "No certificates were ready to mature yet.", "error")
+    return RedirectResponse(
+        f"/kid/invest?symbol={symbol}&range={next_range}&chart={chart_mode}",
+        status_code=302,
+    )
 
 
 @app.post("/kid/invest/cd/cashout")
-def kid_invest_cd_cashout(request: Request, certificate_id: int = Form(...)):
+def kid_invest_cd_cashout(
+    request: Request,
+    certificate_id: int = Form(...),
+    symbol: str = Form(DEFAULT_MARKET_SYMBOL),
+    range_code: str = Form(DEFAULT_PRICE_RANGE, alias="range"),
+    chart_view: str = Form(DEFAULT_CHART_VIEW, alias="chart"),
+):
     if (redirect := require_kid(request)) is not None:
         return redirect
     kid_id = kid_authed(request)
     assert kid_id
+    next_range = normalize_history_range(range_code)
+    chart_mode = normalize_chart_view(chart_view)
     with Session(engine) as session:
         child = session.exec(select(Child).where(Child.kid_id == kid_id)).first()
         certificate = session.get(Certificate, certificate_id)
         if not child or not certificate or certificate.kid_id != kid_id:
-            return RedirectResponse("/kid/invest", status_code=302)
+            return RedirectResponse(
+                f"/kid/invest?symbol={symbol}&range={next_range}&chart={chart_mode}",
+                status_code=302,
+            )
         if certificate.matured_at is not None:
             session.delete(certificate)
             session.commit()
             set_kid_notice(request, "Removed the cashed-out certificate.", "success")
-            return RedirectResponse("/kid/invest", status_code=302)
-        moment = datetime.utcnow()
+            return RedirectResponse(
+                f"/kid/invest?symbol={symbol}&range={next_range}&chart={chart_mode}",
+                status_code=302,
+            )
+        moment = _time_provider()
         maturity = certificate_maturity_date(certificate)
         if moment < maturity:
-            return RedirectResponse(f"/kid/invest/cd/sell?certificate_id={certificate.id}", status_code=302)
+            return RedirectResponse(
+                f"/kid/invest/cd/sell?certificate_id={certificate.id}&symbol={symbol}&range={next_range}&chart={chart_mode}",
+                status_code=302,
+            )
         payout_c = certificate_maturity_value_cents(certificate)
         certificate.matured_at = moment
         child.balance_cents += payout_c
-        child.updated_at = datetime.utcnow()
+        child.updated_at = moment
         session.add(child)
         session.add(certificate)
         session.add(
@@ -3257,11 +3656,20 @@ def kid_invest_cd_cashout(request: Request, certificate_id: int = Form(...)):
         )
         session.commit()
     set_kid_notice(request, "Cashed out your certificate!", "success")
-    return RedirectResponse("/kid/invest", status_code=302)
+    return RedirectResponse(
+        f"/kid/invest?symbol={symbol}&range={next_range}&chart={chart_mode}",
+        status_code=302,
+    )
 
 
 @app.get("/kid/invest/cd/sell", response_class=HTMLResponse)
-def kid_invest_cd_sell_confirm(request: Request, certificate_id: int = Query(...)):
+def kid_invest_cd_sell_confirm(
+    request: Request,
+    certificate_id: int = Query(...),
+    symbol: str = Query(DEFAULT_MARKET_SYMBOL),
+    range_code: str = Query(DEFAULT_PRICE_RANGE, alias="range"),
+    chart_view: str = Query(DEFAULT_CHART_VIEW, alias="chart"),
+):
     if (redirect := require_kid(request)) is not None:
         return redirect
     kid_id = kid_authed(request)
@@ -3269,16 +3677,24 @@ def kid_invest_cd_sell_confirm(request: Request, certificate_id: int = Query(...
     with Session(engine) as session:
         certificate = session.get(Certificate, certificate_id)
         if not certificate or certificate.kid_id != kid_id:
-            return RedirectResponse("/kid/invest", status_code=302)
+            return RedirectResponse(
+                f"/kid/invest?symbol={symbol}&range={normalize_history_range(range_code)}&chart={normalize_chart_view(chart_view)}",
+                status_code=302,
+            )
     if certificate.matured_at is not None:
-        return RedirectResponse("/kid/invest", status_code=302)
-    moment = datetime.utcnow()
+        return RedirectResponse(
+            f"/kid/invest?symbol={symbol}&range={normalize_history_range(range_code)}&chart={normalize_chart_view(chart_view)}",
+            status_code=302,
+        )
+    moment = _time_provider()
     gross_c, penalty_c, net_c = certificate_sale_breakdown_cents(certificate, at=moment)
     maturity = certificate_maturity_date(certificate)
     matured = moment >= maturity
     term_days = certificate_term_days(certificate)
     penalty_days = min(certificate.penalty_days, term_days)
     rate_display = certificate.rate_bps / 100
+    next_range = normalize_history_range(range_code)
+    chart_mode = normalize_chart_view(chart_view)
     if matured or penalty_c == 0:
         penalty_note = "No penalty applies. Selling now returns your savings to the balance."
     else:
@@ -3287,6 +3703,7 @@ def kid_invest_cd_sell_confirm(request: Request, certificate_id: int = Query(...
             f"Selling early forfeits {usd(penalty_c)} of interest (up to {penalty_days} {day_label})."
         )
     button_class_attr = " class='danger'" if penalty_c > 0 and not matured else ""
+    symbol_safe = html_escape(symbol)
     inner = f"""
     <div class='card'>
       <h3>Sell certificate?</h3>
@@ -3301,35 +3718,52 @@ def kid_invest_cd_sell_confirm(request: Request, certificate_id: int = Query(...
       </div>
       <form method='post' action='/kid/invest/cd/sell' style='margin-top:16px;'>
         <input type='hidden' name='certificate_id' value='{certificate.id}'>
+        <input type='hidden' name='symbol' value='{symbol_safe}'>
+        <input type='hidden' name='range' value='{next_range}'>
+        <input type='hidden' name='chart' value='{chart_mode}'>
         <button type='submit'{button_class_attr}>Yes, sell certificate</button>
       </form>
-      <p class='muted' style='margin-top:12px;'><a href='/kid/invest'>No, keep it growing</a></p>
+      <p class='muted' style='margin-top:12px;'><a href='/kid/invest?symbol={symbol_safe}&range={next_range}&chart={chart_mode}'>No, keep it growing</a></p>
     </div>
     """
     return HTMLResponse(frame("Sell Certificate", inner))
 
 
 @app.post("/kid/invest/cd/sell")
-def kid_invest_cd_sell(request: Request, certificate_id: int = Form(...)):
+def kid_invest_cd_sell(
+    request: Request,
+    certificate_id: int = Form(...),
+    symbol: str = Form(DEFAULT_MARKET_SYMBOL),
+    range_code: str = Form(DEFAULT_PRICE_RANGE, alias="range"),
+    chart_view: str = Form(DEFAULT_CHART_VIEW, alias="chart"),
+):
     if (redirect := require_kid(request)) is not None:
         return redirect
     kid_id = kid_authed(request)
     assert kid_id
+    next_range = normalize_history_range(range_code)
+    chart_mode = normalize_chart_view(chart_view)
     with Session(engine) as session:
         child = session.exec(select(Child).where(Child.kid_id == kid_id)).first()
         certificate = session.get(Certificate, certificate_id)
         if not child or not certificate or certificate.kid_id != kid_id:
-            return RedirectResponse("/kid/invest", status_code=302)
+            return RedirectResponse(
+                f"/kid/invest?symbol={symbol}&range={next_range}&chart={chart_mode}",
+                status_code=302,
+            )
         if certificate.matured_at is not None:
-            return RedirectResponse("/kid/invest", status_code=302)
-        moment = datetime.utcnow()
-        gross_c, penalty_c, _ = certificate_sale_breakdown_cents(certificate, at=moment)
+            return RedirectResponse(
+                f"/kid/invest?symbol={symbol}&range={next_range}&chart={chart_mode}",
+                status_code=302,
+            )
+        moment = _time_provider()
+        gross_c, penalty_c, net_c = certificate_sale_breakdown_cents(certificate, at=moment)
         certificate.matured_at = moment
         session.add(certificate)
         child.balance_cents += gross_c
         if penalty_c > 0:
             child.balance_cents -= penalty_c
-        child.updated_at = datetime.utcnow()
+        child.updated_at = moment
         session.add(child)
         status_tag = "matured" if moment >= certificate_maturity_date(certificate) else "early"
         session.add(
@@ -3348,7 +3782,87 @@ def kid_invest_cd_sell(request: Request, certificate_id: int = Form(...)):
                 )
             )
         session.commit()
-    return RedirectResponse("/kid/invest", status_code=302)
+    set_kid_notice(request, f"Added {usd(net_c)} to your balance.", "success")
+    return RedirectResponse(
+        f"/kid/invest?symbol={symbol}&range={next_range}&chart={chart_mode}",
+        status_code=302,
+    )
+
+
+@app.post("/kid/invest/delete")
+def kid_invest_delete(
+    request: Request,
+    symbol: str = Form(...),
+    range_code: str = Form(DEFAULT_PRICE_RANGE, alias="range"),
+    chart_view: str = Form(DEFAULT_CHART_VIEW, alias="chart"),
+):
+    if (redirect := require_kid(request)) is not None:
+        return redirect
+    kid_id = kid_authed(request)
+    assert kid_id
+    normalized_symbol = _normalize_symbol(symbol)
+    next_range = normalize_history_range(range_code)
+    chart_mode = normalize_chart_view(chart_view)
+    if not normalized_symbol:
+        set_kid_notice(request, "Choose a stock to remove first.", "error")
+        return RedirectResponse(
+            f"/kid/invest?symbol={symbol}&range={next_range}&chart={chart_mode}",
+            status_code=302,
+        )
+    if normalized_symbol == _normalize_symbol(DEFAULT_MARKET_SYMBOL):
+        set_kid_notice(request, "The default market cannot be removed.", "error")
+        return RedirectResponse(
+            f"/kid/invest?symbol={symbol}&range={next_range}&chart={chart_mode}",
+            status_code=302,
+        )
+    with Session(engine) as session:
+        instrument = session.exec(
+            select(MarketInstrument).where(MarketInstrument.symbol == normalized_symbol)
+        ).first()
+        if not instrument:
+            set_kid_notice(request, "That market is no longer tracked.", "error")
+            return RedirectResponse(
+                f"/kid/invest?symbol={symbol}&range={next_range}&chart={chart_mode}",
+                status_code=302,
+            )
+        holdings = session.exec(
+            select(Investment).where(Investment.fund == normalized_symbol)
+        ).all()
+        active_holders = [h for h in holdings if h.shares > 1e-6]
+        own_active = next((h for h in active_holders if h.kid_id == kid_id), None)
+        if own_active is not None:
+            set_kid_notice(request, "Sell your shares before removing this stock.", "error")
+            return RedirectResponse(
+                f"/kid/invest?symbol={symbol}&range={next_range}&chart={chart_mode}",
+                status_code=302,
+            )
+        other_active = [h for h in active_holders if h.kid_id != kid_id]
+        if other_active:
+            set_kid_notice(
+                request,
+                "Another kid is still invested in this stock, so it can't be removed yet.",
+                "error",
+            )
+            return RedirectResponse(
+                f"/kid/invest?symbol={symbol}&range={next_range}&chart={chart_mode}",
+                status_code=302,
+            )
+        for holding in holdings:
+            if holding.kid_id == kid_id:
+                session.delete(holding)
+        session.delete(instrument)
+        session.commit()
+    remaining = list_market_instruments()
+    fallback_symbol = symbol
+    if not any(_normalize_symbol(inst.symbol) == normalized_symbol for inst in remaining):
+        fallback_symbol = (
+            remaining[0].symbol if remaining else DEFAULT_MARKET_SYMBOL
+        )
+    set_kid_notice(request, f"Removed {normalized_symbol} from your dashboard.", "success")
+    return RedirectResponse(
+        f"/kid/invest?symbol={fallback_symbol}&range={next_range}&chart={chart_mode}",
+        status_code=302,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -3400,11 +3914,17 @@ def _kid_options(kids: Iterable[Child]) -> str:
 
 
 @app.get("/admin", response_class=HTMLResponse)
-def admin_home(request: Request):
+def admin_home(
+    request: Request,
+    section: str = Query("goals"),
+    child: Optional[str] = Query(None),
+):
     if (redirect := require_admin(request)) is not None:
         return redirect
     run_weekly_allowance_if_needed()
     role = admin_role(request)
+    selected_section = (section or "goals").strip().lower()
+    selected_child = (child or "").strip()
     cd_rates_bps = {code: DEFAULT_CD_RATE_BPS for code, _, _ in CD_TERM_OPTIONS}
     with Session(engine) as session:
         kids = session.exec(select(Child).order_by(Child.name)).all()
@@ -3436,118 +3956,290 @@ def admin_home(request: Request):
             .order_by(desc(Goal.created_at))
         ).all()
         cd_rates_bps = get_all_cd_rate_bps(session)
-        cd_penalty_days = get_cd_penalty_days(session)
+        cd_penalty_days = get_all_cd_penalty_days(session)
         active_certs = session.exec(
             select(Certificate).where(Certificate.matured_at == None)  # noqa: E711
         ).all()
         instruments = list_market_instruments(session)
         time_settings = get_time_settings(session)
         parent_admins = all_parent_admins(session)
-    kids_rows = "".join(
-        f"<tr>"
-        f"<td data-label='Child'><b>{child.name}</b><div class='muted'>{child.kid_id} • Level {child.level} • Streak {child.streak_days} • {_badges_html(child.badges)}</div></td>"
-        f"<td data-label='Balance' class='right'><b>{usd(child.balance_cents)}</b></td>"
-        f"<td data-label='Actions' class='right'>"
-        f"<a href='/admin/kiosk?kid_id={child.kid_id}'><button type='button'>Kiosk</button></a> "
-        f"<a href='/admin/kiosk_full?kid_id={child.kid_id}' style='margin-left:6px;'><button type='button'>Kiosk (auto)</button></a> "
-        f"<a href='/admin/chores?kid_id={child.kid_id}' style='margin-left:6px;'><button type='button'>Manage Chores</button></a> "
-        f"<a href='/admin/goals?kid_id={child.kid_id}' style='margin-left:6px;'><button type='button'>Goals</button></a> "
-        f"<a href='/admin/statement?kid_id={child.kid_id}' style='margin-left:6px;'><button type='button'>Statement</button></a> "
-        f"<form class='inline' method='post' action='/admin/set_allowance' style='margin-left:6px;'>"
-        f"<input type='hidden' name='kid_id' value='{child.kid_id}'>"
-        f"<input name='allowance' type='text' data-money value='{dollars_value(child.allowance_cents)}' style='max-width:130px' placeholder='allowance $'>"
-        f"<button type='submit'>Save</button></form> "
-        f"<form class='inline' method='post' action='/admin/set_kid_pin' style='margin-left:6px;'>"
-        f"<input type='hidden' name='kid_id' value='{child.kid_id}'>"
-        f"<input name='new_pin' placeholder='kid PIN' style='max-width:130px;'>"
-        f"<button type='submit'>Set PIN</button></form> "
-        f"<form class='inline' method='post' action='/delete_kid' onsubmit=\"return confirm('Delete kid and all events?');\" style='margin-left:6px;'>"
-        f"<input type='hidden' name='kid_id' value='{child.kid_id}'>"
-        f"<input name='pin' placeholder='parent PIN' style='max-width:110px;'>"
-        f"<button type='submit' class='danger'>Delete</button></form>"
-        f"</td></tr>"
-        for child in kids
-    ) or "<tr><td>(no kids yet)</td></tr>"
-    prize_rows = "".join(
-        f"<tr><td data-label='Prize'><b>{prize.name}</b><div class='muted'>{prize.notes or ''}</div></td>"
-        f"<td data-label='Cost' class='right'>{usd(prize.cost_cents)}</td>"
-        f"<td data-label='Actions' class='right'>"
-        f"<form class='inline' method='post' action='/delete_prize' onsubmit=\"return confirm('Delete this prize?');\">"
-        f"<input type='hidden' name='prize_id' value='{prize.id}'><button type='submit' class='danger'>Delete</button></form>"
-        f"</td></tr>"
-        for prize in prizes
-    ) or "<tr><td>(no prizes yet)</td></tr>"
+        approved_global_claims = session.exec(
+            select(GlobalChoreClaim)
+            .where(GlobalChoreClaim.status == GLOBAL_CHORE_STATUS_APPROVED)
+        ).all()
+    approved_lookup: Dict[Tuple[int, str], List[GlobalChoreClaim]] = {}
+    for approved in approved_global_claims:
+        approved_lookup.setdefault((approved.chore_id, approved.period_key), []).append(approved)
+    kids_by_id = {kid.kid_id: kid for kid in kids}
+    kid_options_html = _kid_options(kids)
     parent_options_html = "".join(
         f"<option value='{admin['role']}'>{html_escape(admin['label'])}</option>"
         for admin in parent_admins
     )
-    admin_list_html = "".join(
-        f"<li>{html_escape(admin['label'])} <span class='muted'>({admin['role']})</span></li>"
-        for admin in parent_admins
-    ) or "<li class='muted'>(none yet)</li>"
-    event_rows = "".join(
-        f"<tr><td data-label='When'>{event.timestamp.strftime('%Y-%m-%d %H:%M')}</td>"
-        f"<td data-label='Kid'>{event.child_id}</td>"
-        f"<td data-label='Δ Amount' class='right'>{'+' if event.change_cents>=0 else ''}{usd(event.change_cents)}</td>"
-        f"<td data-label='Reason'>{event.reason}</td></tr>"
-        for event in events
-    ) or "<tr><td>(no events yet)</td></tr>"
-    pending_rows_parts = [
-        f"<tr>"
-        f"<td data-label='Kid'><b>{child.name}</b><div class='muted'>{child.kid_id}</div></td>"
-        f"<td data-label='Chore'><b>{chore.name}</b><div class='muted'>{chore.type}</div></td>"
-        f"<td data-label='Award' class='right'><b>{usd(chore.award_cents)}</b></td>"
-        f"<td data-label='Completed'>{inst.completed_at.strftime('%Y-%m-%d %H:%M') if inst.completed_at else ''}</td>"
-        f"<td data-label='Actions' class='right'>"
-        f"<form class='inline' method='post' action='/admin/chore_payout'>"
-        f"<input type='hidden' name='instance_id' value='{inst.id}'>"
-        f"<input name='amount' type='text' data-money placeholder='override $ (optional)' style='max-width:150px'>"
-        f"<input name='reason' type='text' placeholder='reason (optional)' style='max-width:200px'>"
-        f"<button type='submit'>Payout</button></form> "
-        f"<form class='inline' method='post' action='/admin/chore_deny' style='margin-left:6px;' onsubmit=\"return confirm('Deny and push back to Available?');\">"
-        f"<input type='hidden' name='instance_id' value='{inst.id}'><button type='submit' class='danger'>Deny</button></form>"
-        f"</td></tr>"
-        for inst, chore, child in pending
-    ]
-    pending_rows_parts.extend(
-        [
-            f"<tr>"
-            f"<td data-label='Kid'><b>{child.name}</b><div class='muted'>{child.kid_id}</div></td>"
-            f"<td data-label='Chore'><b>{chore.name}</b><div class='muted'>Free-for-all ({claim.period_key})</div></td>"
-            f"<td data-label='Award' class='right'><b>{usd(chore.award_cents)}</b></td>"
-            f"<td data-label='Completed'>{claim.submitted_at.strftime('%Y-%m-%d %H:%M')}</td>"
-            f"<td data-label='Actions' class='right'>"
-            f"<a href='/admin/chores?kid_id={GLOBAL_CHORE_KID_ID}'><button type='button'>Review</button></a>"
-            f"</td></tr>"
-            for claim, child, chore in global_pending
-        ]
-    )
-    pending_rows = "".join(pending_rows_parts) or "<tr><td>(no pending)</td></tr>"
     goals_rows = "".join(
-        f"<tr>"
-        f"<td data-label='Kid'><b>{child.name}</b><div class='muted'>{child.kid_id}</div></td>"
-        f"<td data-label='Goal'><b>{goal.name}</b></td>"
-        f"<td data-label='Saved' class='right'>{usd(goal.saved_cents)} / {usd(goal.target_cents)}"
-        f"<div class='muted'>{format_percent(percent_complete(goal.saved_cents, goal.target_cents))} complete</div></td>"
-        f"<td data-label='Actions' class='right'>"
-        f"<form class='inline' method='post' action='/admin/goal_grant'>"
-        f"<input type='hidden' name='goal_id' value='{goal.id}'><button type='submit'>Grant Goal</button></form> "
-        f"<form class='inline' method='post' action='/admin/goal_return_funds' style='margin-left:6px;'>"
-        f"<input type='hidden' name='goal_id' value='{goal.id}'><button type='submit' class='danger'>Return Funds</button></form>"
-        f"</td></tr>"
+        (
+            "<tr>"
+            f"<td data-label='Kid'><b>{html_escape(child.name)}</b><div class='muted'>{child.kid_id}</div></td>"
+            f"<td data-label='Goal'><b>{html_escape(goal.name)}</b></td>"
+            f"<td data-label='Saved' class='right'>{usd(goal.saved_cents)} / {usd(goal.target_cents)}"
+            f"<div class='muted'>{format_percent(percent_complete(goal.saved_cents, goal.target_cents))} complete</div></td>"
+            f"<td data-label='Actions' class='right'>"
+            f"<form class='inline' method='post' action='/admin/goal_grant'><input type='hidden' name='goal_id' value='{goal.id}'><button type='submit'>Grant Goal</button></form> "
+            f"<form class='inline' method='post' action='/admin/goal_return_funds' style='margin-left:6px;'><input type='hidden' name='goal_id' value='{goal.id}'><button type='submit' class='danger'>Return Funds</button></form>"
+            "</td></tr>"
+        )
         for goal, child in needs
-    ) or "<tr><td>(none)</td></tr>"
-    moment_admin = datetime.utcnow()
+    ) or "<tr><td colspan='4' class='muted'>(none)</td></tr>"
+    goals_card = (
+        "<div class='card'>"
+        "<h3>Goals Needing Action</h3>"
+        "<table><tr><th>Kid</th><th>Goal</th><th>Saved</th><th>Actions</th></tr>"
+        f"{goals_rows}</table>"
+        "<p class='muted' style='margin-top:6px;'>Grant allows the kid to spend the saved amount. Return moves funds back to their balance.</p>"
+        "</div>"
+    )
+    pending_rows_parts: List[str] = []
+    for inst, chore, child in pending:
+        submitted = inst.completed_at.strftime("%Y-%m-%d %H:%M") if inst.completed_at else ""
+        pending_rows_parts.append(
+            "<tr>"
+            f"<td data-label='Kid'><b>{html_escape(child.name)}</b><div class='muted'>{child.kid_id}</div></td>"
+            f"<td data-label='Chore'><b>{html_escape(chore.name)}</b><div class='muted'>{chore.type}</div></td>"
+            f"<td data-label='Award' class='right'><b>{usd(chore.award_cents)}</b></td>"
+            f"<td data-label='Completed'>{submitted}</td>"
+            "<td data-label='Actions' class='right'>"
+            f"<form class='inline' method='post' action='/admin/chore_payout'><input type='hidden' name='instance_id' value='{inst.id}'>"
+            "<input name='amount' type='text' data-money placeholder='override $ (optional)' style='max-width:150px'>"
+            "<input name='reason' type='text' placeholder='reason (optional)' style='max-width:200px'>"
+            "<button type='submit'>Payout</button></form> "
+            f"<form class='inline' method='post' action='/admin/chore_deny' style='margin-left:6px;' onsubmit='return confirm(\"Deny and push back to Available?\");'><input type='hidden' name='instance_id' value='{inst.id}'><button type='submit' class='danger'>Deny</button></form>"
+            "</td></tr>"
+        )
+    global_groups: Dict[Tuple[int, str], Dict[str, Any]] = {}
+    for claim, claimant, chore in global_pending:
+        key = (claim.chore_id, claim.period_key)
+        entry = global_groups.setdefault(key, {"chore": chore, "claims": []})
+        entry["claims"].append({"claim": claim, "child": claimant})
+    multi_modals: List[str] = []
+    for (chore_id_val, period_key), data in global_groups.items():
+        chore = data["chore"]
+        claim_entries = data["claims"]
+        participants = ", ".join(html_escape(item["child"].name) for item in claim_entries)
+        latest_submitted = max((item["claim"].submitted_at for item in claim_entries), default=None)
+        submitted_display = latest_submitted.strftime("%Y-%m-%d %H:%M") if latest_submitted else ""
+        key = (chore_id_val, period_key)
+        approved_existing = approved_lookup.get(key, [])
+        if len(claim_entries) == 1:
+            entry = claim_entries[0]
+            claim = entry["claim"]
+            child_obj = entry["child"]
+            pending_rows_parts.append(
+                "<tr>"
+                f"<td data-label='Kid'><b>{html_escape(child_obj.name)}</b><div class='muted'>{child_obj.kid_id}</div></td>"
+                f"<td data-label='Chore'><b>{html_escape(chore.name)}</b><div class='muted'>Free-for-all ({html_escape(period_key)})</div></td>"
+                f"<td data-label='Award' class='right'><b>{usd(chore.award_cents)}</b></td>"
+                f"<td data-label='Completed'>{submitted_display}</td>"
+                "<td data-label='Actions'>"
+                "<form class='stacked-form' method='post' action='/admin/global_chore/claims'>"
+                f"<input type='hidden' name='chore_id' value='{chore_id_val}'>"
+                f"<input type='hidden' name='period_key' value='{html_escape(period_key)}'>"
+                f"<input type='hidden' name='claim_ids' value='{claim.id}'>"
+                f"<input name='amount_{claim.id}' type='text' data-money placeholder='override $ (optional)'>"
+                "<input name='reason' type='text' placeholder='reason (optional)'>"
+                "<div class='actions'>"
+                "<button type='submit' name='decision' value='approve'>Payout</button>"
+                "<button type='submit' name='decision' value='reject' class='danger'>Deny</button>"
+                "</div></form></td></tr>"
+            )
+            continue
+        safe_period = re.sub(r"[^a-z0-9]+", "-", period_key.lower()) or "period"
+        modal_id = f"modal-{chore_id_val}-{safe_period}"
+        remaining_award = max(0, chore.award_cents - sum(cl.award_cents for cl in approved_existing))
+        remaining_slots = max(0, chore.max_claimants - len(approved_existing))
+        modal_rows = "".join(
+            "<tr>"
+            f"<td data-label='Select'><input type='checkbox' name='claim_ids' value='{item['claim'].id}' checked></td>"
+            f"<td data-label='Kid'><b>{html_escape(item['child'].name)}</b><div class='muted'>{item['child'].kid_id}</div></td>"
+            f"<td data-label='Submitted'>{item['claim'].submitted_at.strftime('%Y-%m-%d %H:%M')}</td>"
+            f"<td data-label='Override ($)' class='right'><input name='amount_{item['claim'].id}' type='text' data-money placeholder='optional'></td>"
+            "</tr>"
+            for item in claim_entries
+        )
+        if not modal_rows:
+            modal_rows = "<tr><td colspan='4' class='muted'>(no pending claims)</td></tr>"
+        multi_modals.append(
+            "<div id='" + modal_id + "' class='modal-overlay'><div class='modal-card'>"
+            + f"<div class='modal-head'><h3>Free-for-all — {html_escape(chore.name)}</h3><a href='#' class='pill'>Close</a></div>"
+            + f"<p class='muted'>Period {html_escape(period_key)} • Award {usd(chore.award_cents)} • Max winners {chore.max_claimants}</p>"
+            + f"<p class='muted'>Approved so far: {len(approved_existing)} • Slots left {remaining_slots} • Remaining award {usd(remaining_award)}</p>"
+            + "<form method='post' action='/admin/global_chore/claims' class='stacked-form'>"
+            + f"<input type='hidden' name='chore_id' value='{chore_id_val}'>"
+            + f"<input type='hidden' name='period_key' value='{html_escape(period_key)}'>"
+            + "<table><tr><th>Select</th><th>Kid</th><th>Submitted</th><th>Override ($)</th></tr>"
+            + modal_rows
+            + "</table>"
+            + "<input name='reason' type='text' placeholder='reason (optional)'>"
+            + "<div class='actions'>"
+            + "<button type='submit' name='decision' value='approve'>Payout Selected</button>"
+            + "<button type='submit' name='decision' value='reject' class='danger'>Deny Selected</button>"
+            + "<a href='#' class='button-link secondary'>Cancel</a>"
+            + "</div></form></div></div>"
+        )
+        pending_rows_parts.append(
+            "<tr>"
+            "<td data-label='Kid'><b>Multiple kids</b><div class='muted'>"
+            + html_escape(participants or "No names")
+            + "</div></td>"
+            f"<td data-label='Chore'><b>{html_escape(chore.name)}</b><div class='muted'>Free-for-all ({html_escape(period_key)})</div></td>"
+            f"<td data-label='Award' class='right'><b>{usd(chore.award_cents)}</b></td>"
+            f"<td data-label='Completed'>{submitted_display}</td>"
+            f"<td data-label='Actions' class='right'><a href='#{modal_id}' class='button-link'>Manage</a></td>"
+            "</tr>"
+        )
+    pending_rows = "".join(pending_rows_parts) or "<tr><td colspan='5' class='muted'>(no pending)</td></tr>"
+    pending_card = (
+        "<div class='card'>"
+        "<h3>Pending Payouts</h3>"
+        "<table><tr><th>Kid</th><th>Chore</th><th>Award</th><th>Completed</th><th>Actions</th></tr>"
+        f"{pending_rows}</table>"
+        "<p class='muted' style='margin-top:6px;'>Audit trail: <a href='/admin/audit'>Pending vs Paid</a></p>"
+        "</div>"
+    )
+    children_overview_rows = "".join(
+        (
+            "<tr>"
+            f"<td data-label='Child'><b>{html_escape(child.name)}</b><div class='muted'>{child.kid_id}</div></td>"
+            f"<td data-label='Level'>L{child.level}</td>"
+            f"<td data-label='Streak'>{child.streak_days} day{'s' if child.streak_days != 1 else ''}</td>"
+            f"<td data-label='Balance' class='right'>{usd(child.balance_cents)}</td>"
+            f"<td data-label='Actions' class='right'><a href='/admin?section=children&child={child.kid_id}' class='button-link secondary'>Expand</a></td>"
+            "</tr>"
+        )
+        for child in kids
+    ) or "<tr><td colspan='5' class='muted'>(no kids yet)</td></tr>"
+    children_overview_card = (
+        "<div class='card'>"
+        "<h3>Children Overview</h3>"
+        "<table><tr><th>Child</th><th>Level</th><th>Streak</th><th>Balance</th><th>Actions</th></tr>"
+        f"{children_overview_rows}</table>"
+        "</div>"
+    )
+    child_detail_card = ""
+    if selected_child:
+        child_obj = kids_by_id.get(selected_child)
+        if child_obj:
+            child_detail_card = (
+                "<div class='card'>"
+                f"<h3>{html_escape(child_obj.name)} — Details</h3>"
+                f"<div class='muted'>{child_obj.kid_id} • Level {child_obj.level} • Streak {child_obj.streak_days} day{'s' if child_obj.streak_days != 1 else ''}</div>"
+                f"<div style='margin-top:6px;'><b>Balance:</b> {usd(child_obj.balance_cents)}</div>"
+                "<div class='actions' style='margin-top:12px; flex-wrap:wrap; gap:8px;'>"
+                f"<a href='/admin/kiosk?kid_id={child_obj.kid_id}' class='button-link secondary'>Kiosk</a>"
+                f"<a href='/admin/kiosk_full?kid_id={child_obj.kid_id}' class='button-link secondary'>Kiosk (auto)</a>"
+                f"<a href='/admin/chores?kid_id={child_obj.kid_id}' class='button-link secondary'>Manage chores</a>"
+                f"<a href='/admin/goals?kid_id={child_obj.kid_id}' class='button-link secondary'>Goals</a>"
+                f"<a href='/admin/statement?kid_id={child_obj.kid_id}' class='button-link secondary'>Statement</a>"
+                "</div>"
+                "<div class='grid' style='grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); gap:12px; margin-top:12px;'>"
+                f"<form method='post' action='/admin/set_allowance' class='stacked-form'><input type='hidden' name='kid_id' value='{child_obj.kid_id}'><label>Allowance (dollars / week)</label><input name='allowance' type='text' data-money value='{dollars_value(child_obj.allowance_cents)}'><button type='submit'>Save Allowance</button></form>"
+                f"<form method='post' action='/admin/set_kid_pin' class='stacked-form'><input type='hidden' name='kid_id' value='{child_obj.kid_id}'><label>Set kid PIN</label><input name='new_pin' placeholder='e.g. 4321'><button type='submit'>Set PIN</button></form>"
+                f"<form method='post' action='/delete_kid' class='stacked-form' onsubmit='return confirm(\"Delete kid and all events?\");'><input type='hidden' name='kid_id' value='{child_obj.kid_id}'><label>Parent PIN (confirm)</label><input name='pin' placeholder='parent PIN'><button type='submit' class='danger'>Delete Kid</button></form>"
+                "</div>"
+                "<p class='muted' style='margin-top:10px;'><a href='/admin?section=children'>← Back to overview</a></p>"
+                "</div>"
+            )
+    children_content = children_overview_card + child_detail_card
+    event_rows = "".join(
+        (
+            "<tr><td data-label='When'>"
+            + event.timestamp.strftime("%Y-%m-%d %H:%M")
+            + "</td><td data-label='Kid'>"
+            + event.child_id
+            + "</td><td data-label='Δ Amount' class='right'>"
+            + ("+" if event.change_cents >= 0 else "")
+            + usd(event.change_cents)
+            + "</td><td data-label='Reason'>"
+            + html_escape(event.reason)
+            + "</td></tr>"
+        )
+        for event in events
+    ) or "<tr><td colspan='4' class='muted'>(no events yet)</td></tr>"
+    events_card = (
+        "<div class='card'>"
+        "<h3>Recent Events</h3>"
+        "<p class='muted'>Need a CSV? <a href='/admin/ledger.csv'>Download ledger</a></p>"
+        f"<table><tr><th>When</th><th>Kid</th><th>Δ Amount</th><th>Reason</th></tr>{event_rows}</table>"
+        "</div>"
+    )
+    create_kid_card = (
+        "<div class='card'>"
+        "<h3>Create Kid</h3>"
+        "<form method='post' action='/create_kid' class='stacked-form'>"
+        "<label>kid_id</label><input name='kid_id' placeholder='alex01' required>"
+        "<label>Name</label><input name='name' placeholder='Alex' required>"
+        "<div class='grid' style='grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:8px;'>"
+        "<div><label>Starting (dollars)</label><input name='starting' type='text' data-money value='0.00'></div>"
+        "<div><label>Allowance (dollars / week)</label><input name='allowance' type='text' data-money value='0.00'></div>"
+        "</div>"
+        "<label>Set kid PIN (optional)</label><input name='kid_pin' placeholder='e.g. 4321'>"
+        "<button type='submit'>Create Kid</button>"
+        "</form>"
+        "</div>"
+    )
+    credit_card = (
+        "<div class='card'>"
+        "<h3>Credit / Debit</h3>"
+        "<form method='post' action='/adjust_balance' class='stacked-form'>"
+        f"<label>kid_id</label><select name='kid_id' required>{kid_options_html}</select>"
+        "<div class='grid' style='grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:8px;'>"
+        "<div><label>Amount (dollars)</label><input name='amount' type='text' data-money value='1.00'></div>"
+        "<div><label>Type</label><select name='kind'><option value='credit'>Credit (chore)</option><option value='debit'>Debit (redeem)</option></select></div>"
+        "</div>"
+        "<label>Reason</label><input name='reason' placeholder='chore / redeem'>"
+        "<button type='submit'>Apply</button>"
+        "</form>"
+        "</div>"
+    )
+    transfer_card = (
+        "<div class='card'>"
+        "<h3>Family Transfer</h3>"
+        "<form method='post' action='/admin/transfer' class='stacked-form'>"
+        f"<label>From</label><select name='from_kid' required>{kid_options_html}</select>"
+        f"<label>To</label><select name='to_kid' required>{kid_options_html}</select>"
+        "<label>Amount (dollars)</label><input name='amount' type='text' data-money value='1.00'>"
+        "<label>Note</label><input name='note' placeholder='optional note'>"
+        "<button type='submit'>Transfer</button>"
+        "</form>"
+        "</div>"
+    )
+    accounts_content = create_kid_card + credit_card + transfer_card
+    prize_rows = "".join(
+        (
+            f"<tr><td data-label='Prize'><b>{html_escape(prize.name)}</b><div class='muted'>{html_escape(prize.notes or '')}</div></td>"
+            f"<td data-label='Cost' class='right'>{usd(prize.cost_cents)}</td>"
+            f"<td data-label='Actions' class='right'><form method='post' action='/delete_prize' class='inline' onsubmit=\"return confirm('Delete this prize?');\"><input type='hidden' name='prize_id' value='{prize.id}'><button type='submit' class='danger'>Delete</button></form></td></tr>"
+        )
+        for prize in prizes
+    ) or "<tr><td colspan='3' class='muted'>(no prizes yet)</td></tr>"
+    prizes_card = (
+        "<div class='card'>"
+        "<h3>Prizes</h3>"
+        "<form method='post' action='/add_prize' class='stacked-form'>"
+        "<label>Name</label><input name='name' placeholder='Ice cream' required>"
+        "<label>Cost (dollars)</label><input name='cost' type='text' data-money value='1.00'>"
+        "<label>Notes</label><input name='notes' placeholder='One serving'>"
+        "<button type='submit'>Add Prize</button>"
+        "</form>"
+        f"<table style='margin-top:10px;'><tr><th>Prize</th><th>Cost</th><th>Actions</th></tr>{prize_rows}</table>"
+        "</div>"
+    )
+    moment_admin = _time_provider()
+    cd_rates_pct = {code: cd_rates_bps.get(code, DEFAULT_CD_RATE_BPS) / 100 for code, _, _ in CD_TERM_OPTIONS}
     active_cd_total = sum(certificate_value_cents(cert, at=moment_admin) for cert in active_certs)
     active_cd_count = len(active_certs)
     ready_cd = sum(1 for cert in active_certs if moment_admin >= certificate_maturity_date(cert))
-    cd_rates_pct = {
-        code: cd_rates_bps.get(code, DEFAULT_CD_RATE_BPS) / 100 for code, _, _ in CD_TERM_OPTIONS
-    }
-    rate_summary = " • ".join(
-        f"{label}: {cd_rates_pct[code]:.2f}%" for code, label, _ in CD_TERM_OPTIONS
-    )
-    rate_field_blocks: List[str] = []
+    rate_summary = " • ".join(f"{label}: {cd_rates_pct[code]:.2f}%" for code, label, _ in CD_TERM_OPTIONS)
+    rate_field_blocks = []
     for idx, (code, label, _) in enumerate(CD_TERM_OPTIONS):
         label_style = " style='margin-top:6px;'" if idx else ""
         rate_field_blocks.append(
@@ -3555,11 +4247,18 @@ def admin_home(request: Request):
             f"        <input name='rate_{code}' type='number' step='0.01' min='0' value='{cd_rates_pct[code]:.2f}' required>\n"
         )
     rate_fields_html = "".join(rate_field_blocks)
-    penalty_text = (
-        f"{cd_penalty_days} day{'s' if cd_penalty_days != 1 else ''} of interest"
-        if cd_penalty_days
-        else "None (kids receive all accrued interest)"
+    penalty_summary = ", ".join(
+        f"{label}: {cd_penalty_days.get(code, 0)} day{'s' if cd_penalty_days.get(code, 0) != 1 else ''}"
+        for code, label, _ in CD_TERM_OPTIONS
     )
+    penalty_field_blocks = []
+    for idx, (code, label, _) in enumerate(CD_TERM_OPTIONS):
+        label_style = " style='margin-top:6px;'" if idx else ""
+        penalty_field_blocks.append(
+            f"        <label{label_style}>{label} penalty (days of interest)</label>\n"
+            f"        <input name='penalty_{code}' type='number' min='0' step='1' value='{cd_penalty_days.get(code, 0)}' required>\n"
+        )
+    penalty_fields_html = "".join(penalty_field_blocks)
     ready_note = (
         f"<div class='muted' style='margin-top:4px;'>{ready_cd} certificate{'s' if ready_cd != 1 else ''} ready to cash out.</div>"
         if ready_cd
@@ -3567,7 +4266,7 @@ def admin_home(request: Request):
     )
     instrument_rows = "".join(
         (
-            f"<tr>"
+            "<tr>"
             f"<td data-label='Symbol'><b>{inst.symbol}</b></td>"
             f"<td data-label='Name'>{html_escape(inst.name or '')}</td>"
             f"<td data-label='Type'>{('Crypto' if inst.kind == INSTRUMENT_KIND_CRYPTO else 'Stock')}</td>"
@@ -3575,18 +4274,40 @@ def admin_home(request: Request):
                 f"<td data-label='Actions' class='right'><span class='pill'>Default</span></td>"
                 if _normalize_symbol(inst.symbol) == _normalize_symbol(DEFAULT_MARKET_SYMBOL)
                 else (
-                    f"<td data-label='Actions' class='right'>"
-                    f"<form method='post' action='/admin/market_instruments/delete' class='inline' onsubmit=\"return confirm('Remove this market?');\">"
-                    f"<input type='hidden' name='instrument_id' value='{inst.id}'>"
-                    f"<button type='submit' class='danger'>Delete</button></form></td>"
+                    f"<td data-label='Actions' class='right'><form method='post' action='/admin/market_instruments/delete' class='inline' onsubmit=\"return confirm('Remove this market?');\"><input type='hidden' name='instrument_id' value='{inst.id}'><button type='submit' class='danger'>Delete</button></form></td>"
                 )
             )
             + "</tr>"
         )
         for inst in instruments
+    ) or "<tr><td colspan='4' class='muted'>No markets configured yet.</td></tr>"
+    investing_card = (
+        "<div class='card'>"
+        "<h3>Investing Controls</h3>"
+        "<div class='muted'>Manage available markets and CD settings.</div>"
+        "<form method='post' action='/admin/market_instruments/add' style='margin-top:10px;' class='inline'>"
+        "<input name='symbol' placeholder='Symbol (e.g. SP500)' required>"
+        "<input name='name' placeholder='Display name'>"
+        f"<select name='kind'><option value='{INSTRUMENT_KIND_STOCK}'>Stock / Fund</option><option value='{INSTRUMENT_KIND_CRYPTO}'>Crypto</option></select>"
+        "<button type='submit'>Add / Update</button>"
+        "</form>"
+        f"<table style='margin-top:10px;'><tr><th>Symbol</th><th>Name</th><th>Type</th><th>Actions</th></tr>{instrument_rows}</table>"
+        f"<div style='margin-top:6px;'><b>Current CD rates:</b> {rate_summary}</div>"
+        f"<div>Active certificates: <b>{active_cd_count}</b> worth <b>{usd(active_cd_total)}</b></div>"
+        f"<div>Early withdrawal penalties: <b>{penalty_summary}</b></div>"
+        f"{ready_note}"
+        "<form method='post' action='/admin/certificates/rate' style='margin-top:10px;'>"
+        "  <p class='muted'>Adjust the APR for each available term.</p>"
+        f"{rate_fields_html}"
+        "  <button type='submit' style='margin-top:8px;'>Save Rates</button>"
+        "</form>"
+        "<form method='post' action='/admin/certificates/penalty' style='margin-top:10px;'>"
+        "  <p class='muted'>Set how many days of interest are forfeited when cashing out early.</p>"
+        f"{penalty_fields_html}"
+        "  <button type='submit' style='margin-top:8px;'>Save Penalties</button>"
+        "</form>"
+        "</div>"
     )
-    if not instrument_rows:
-        instrument_rows = "<tr><td colspan='4' class='muted'>No markets configured yet.</td></tr>"
     current_display = now_local()
     mode_value = time_settings.get("mode", TIME_MODE_AUTO)
     offset_value = time_settings.get("offset", 0)
@@ -3598,215 +4319,133 @@ def admin_home(request: Request):
             manual_display = manual_dt.strftime("%Y-%m-%dT%H:%M")
         except ValueError:
             manual_display = manual_raw
+    time_card = (
+        "<div class='card'>"
+        "<h3>Time Controls</h3>"
+        f"<div class='muted'>Current app time: {current_display.strftime('%Y-%m-%d %H:%M:%S')}</div>"
+        "<form method='post' action='/admin/time_settings' class='stacked-form'>"
+        f"<label>Mode</label><select name='mode'><option value='{TIME_MODE_AUTO}' {'selected' if mode_value == TIME_MODE_AUTO else ''}>Auto (system clock)</option><option value='{TIME_MODE_MANUAL}' {'selected' if mode_value == TIME_MODE_MANUAL else ''}>Manual override</option></select>"
+        f"<label>Offset minutes (auto mode)</label><input name='offset' type='number' step='1' value='{offset_value}'>"
+        f"<label>Manual date &amp; time</label><input name='manual_datetime' type='datetime-local' value='{manual_display}'>"
+        "<div class='muted'>Manual time only applies when manual mode is selected. Leave blank to keep the previous manual value.</div>"
+        "<button type='submit'>Save Time Settings</button>"
+        "</form>"
+        "</div>"
+    )
+    rules_card = (
+        "<div class='card'>"
+        "<h3>Allowance Rules</h3>"
+        "<form method='post' action='/admin/rules' class='stacked-form'>"
+        f"<label><input type='checkbox' name='bonus_all' {'checked' if bonus_on_all else ''}> Bonus if all chores complete</label>"
+        f"<input name='bonus' type='text' data-money value='{dollars_value(bonus_cents)}' placeholder='bonus $'>"
+        f"<label><input type='checkbox' name='penalty_miss' {'checked' if penalty_on_miss else ''}> Penalty if chores missed</label>"
+        f"<input name='penalty' type='text' data-money value='{dollars_value(penalty_cents)}' placeholder='penalty $'>"
+        "<button type='submit'>Save Rules</button>"
+        "</form>"
+        "<p class='muted' style='margin-top:6px;'>Rules apply when weekly allowance runs (first admin view each Sunday).</p>"
+        "</div>"
+    )
+    admin_list_items = []
+    for admin in parent_admins:
+        role_key = admin["role"]
+        label = html_escape(admin["label"])
+        if role_key in DEFAULT_PARENT_ROLES:
+            admin_list_items.append(
+                f"<li>{label} <span class='muted'>({role_key})</span> <span class='pill'>Default</span></li>"
+            )
+        else:
+            admin_list_items.append(
+                "<li>"
+                + f"{label} <span class='muted'>({role_key})</span>"
+                + f"<form method='post' action='/admin/delete_parent_admin' class='inline' style='margin-left:8px;'><input type='hidden' name='role' value='{role_key}'><button type='submit' class='danger secondary'>Delete</button></form>"
+                + "</li>"
+            )
+    admin_list_html = "".join(admin_list_items) or "<li class='muted'>(none yet)</li>"
+    parent_admins_card = (
+        "<div class='card'>"
+        "<h3>Parent Admins</h3>"
+        f"<ul class='admin-list'>{admin_list_html}</ul>"
+        "<form method='post' action='/admin/set_parent_pin' class='stacked-form' style='margin-top:12px;'>"
+        "<h4>Update PIN</h4>"
+        f"<select name='role'>{parent_options_html}</select>"
+        "<label>New PIN</label><input name='new_pin' type='password' placeholder='****' autocomplete='new-password' required>"
+        "<label>Confirm PIN</label><input name='confirm_pin' type='password' placeholder='****' autocomplete='new-password' required>"
+        "<button type='submit'>Set PIN</button>"
+        "</form>"
+        "<form method='post' action='/admin/add_parent_admin' class='stacked-form' style='margin-top:12px;'>"
+        "<h4>Add another admin</h4>"
+        "<label>Name</label><input name='label' placeholder='Grandma' required>"
+        "<label>PIN</label><input name='pin' type='password' placeholder='****' required>"
+        "<label>Confirm PIN</label><input name='confirm_pin' type='password' placeholder='****' required>"
+        "<button type='submit'>Add Admin</button>"
+        "</form>"
+        "</div>"
+    )
     weekday_selector = "".join(
         f"<label style='margin-right:6px;'><input type='checkbox' name='weekdays' value='{day}'> {label}</label>"
         for day, label in WEEKDAY_OPTIONS
     )
-    goals_card = f"""
-    <div class='card'>
-      <h3>Goals Needing Action</h3>
-      <table><tr><th>Kid</th><th>Goal</th><th>Saved</th><th>Actions</th></tr>{goals_rows}</table>
-      <p class='muted' style='margin-top:6px;'>When a goal is fully funded, approve the purchase (Grant) or return funds.</p>
-    </div>
-    """
-    investing_card = f"""
-      <div class='card'>
-        <h3>Investing Controls</h3>
-        <div class='muted'>Manage available markets and CD settings.</div>
-        <form method='post' action='/admin/market_instruments/add' style='margin-top:10px;' class='inline'>
-          <input name='symbol' placeholder='Symbol (e.g. SP500)' required>
-          <input name='name' placeholder='Display name'>
-          <select name='kind'>
-            <option value='{INSTRUMENT_KIND_STOCK}'>Stock / Fund</option>
-            <option value='{INSTRUMENT_KIND_CRYPTO}'>Crypto</option>
-          </select>
-          <button type='submit'>Add / Update</button>
-        </form>
-        <table style='margin-top:10px;'><tr><th>Symbol</th><th>Name</th><th>Type</th><th>Actions</th></tr>{instrument_rows}</table>
-        <div><b>Current CD rates:</b> {rate_summary}</div>
-        <div>Active certificates: <b>{active_cd_count}</b> worth <b>{usd(active_cd_total)}</b></div>
-        <div>Early withdrawal penalty: <b>{penalty_text}</b></div>
-        {ready_note}
-        <form method='post' action='/admin/certificates/rate' style='margin-top:10px;'>
-          <p class='muted'>Adjust the APR for each available term.</p>
-        {rate_fields_html}
-          <button type='submit' style='margin-top:8px;'>Save Rates</button>
-        </form>
-        <form method='post' action='/admin/certificates/penalty' style='margin-top:10px;'>
-          <label>Set penalty (days of interest forfeited)</label>
-          <input name='penalty_days' type='number' min='0' step='1' value='{cd_penalty_days}' required>
-          <button type='submit' style='margin-top:8px;'>Save Penalty</button>
-        </form>
-    </div>
-    """
-    time_card = f"""
-      <div class='card'>
-        <h3>Time Controls</h3>
-        <div class='muted'>Current app time: {current_display.strftime('%Y-%m-%d %H:%M:%S')}</div>
-        <form method='post' action='/admin/time_settings' style='margin-top:10px;'>
-          <label>Mode</label>
-          <select name='mode'>
-            <option value='{TIME_MODE_AUTO}' {'selected' if mode_value == TIME_MODE_AUTO else ''}>Auto (system clock)</option>
-            <option value='{TIME_MODE_MANUAL}' {'selected' if mode_value == TIME_MODE_MANUAL else ''}>Manual override</option>
-          </select>
-          <label style='margin-top:6px;'>Offset minutes (auto mode)</label>
-          <input name='offset' type='number' step='1' value='{offset_value}'>
-          <label style='margin-top:6px;'>Manual date &amp; time</label>
-          <input name='manual_datetime' type='datetime-local' value='{manual_display}'>
-          <div class='muted' style='margin-top:4px;'>Manual time only applies when manual mode is selected. Leave blank to keep the previous manual value.</div>
-          <button type='submit' style='margin-top:10px;'>Save Time Settings</button>
-        </form>
-      </div>
-    """
-    rules_card = f"""
-    <div class='card'>
-      <h3>Allowance Rules</h3>
-      <form method='post' action='/admin/rules'>
-        <div class='grid' style='grid-template-columns:1fr 1fr; gap:8px;'>
-          <div>
-            <label><input type='checkbox' name='bonus_all' {'checked' if bonus_on_all else ''}> Bonus if all chores complete</label>
-            <input name='bonus' type='text' data-money value='{dollars_value(bonus_cents)}' placeholder='bonus $' style='margin-top:6px;'>
-          </div>
-          <div>
-            <label><input type='checkbox' name='penalty_miss' {'checked' if penalty_on_miss else ''}> Penalty if chores missed</label>
-            <input name='penalty' type='text' data-money value='{dollars_value(penalty_cents)}' placeholder='penalty $' style='margin-top:6px;'>
-          </div>
-        </div>
-        <button type='submit' style='margin-top:10px;'>Save Rules</button>
-      </form>
-      <p class='muted' style='margin-top:6px;'>Rules apply when weekly allowance runs (first admin view each Sunday).</p>
-    </div>
-    """
-    inner = f"""
-    <div class='topbar'><h3>Admin Portal</h3>
-      <div>
-        {_role_badge(role)}
-        <form method='post' action='/admin/logout' style='display:inline-block; margin-left:8px;'><button type='submit' class='pill'>Logout</button></form>
-      </div>
-    </div>
-    <div class='grid admin-top'>
-      <div class='card'>
-        <h3>Create Kid</h3>
-        <form method='post' action='/create_kid'>
-          <label>kid_id</label><input name='kid_id' placeholder='alex01' required>
-          <label style='margin-top:6px;'>Name</label><input name='name' placeholder='Alex' required>
-          <div class='grid' style='grid-template-columns:1fr 1fr; gap:8px;'>
-            <div><label>Starting (dollars)</label><input name='starting' type='text' data-money value='0.00'></div>
-            <div><label>Allowance (dollars / week)</label><input name='allowance' type='text' data-money value='0.00'></div>
-          </div>
-          <label style='margin-top:6px;'>Set kid PIN (optional)</label><input name='kid_pin' placeholder='e.g. 4321'>
-          <button type='submit' style='margin-top:10px;'>Create</button>
-        </form>
-      </div>
-      <div class='card'>
-        <h3>Credit / Debit</h3>
-        <form method='post' action='/adjust_balance'>
-          <label>kid_id</label>
-          <select name='kid_id' required>{_kid_options(kids)}</select>
-          <div class='grid' style='grid-template-columns:1fr 1fr; gap:8px; margin-top:6px;'>
-            <div><label>Amount (dollars)</label><input name='amount' type='text' data-money value='1.00'></div>
-            <div><label>Type</label><select name='kind'><option value='credit'>Credit (chore)</option><option value='debit'>Debit (redeem)</option></select></div>
-          </div>
-          <label style='margin-top:6px;'>Reason</label><input name='reason' placeholder='chore / redeem'>
-          <button type='submit' style='margin-top:10px;'>Apply</button>
-        </form>
-      </div>
-      <div class='card'>
-        <h3>Family Transfer</h3>
-        <form method='post' action='/admin/transfer'>
-          <label>From</label>
-          <select name='from_kid' required>{_kid_options(kids)}</select>
-          <label style='margin-top:6px;'>To</label>
-          <select name='to_kid' required>{_kid_options(kids)}</select>
-          <label style='margin-top:6px;'>Amount (dollars)</label><input name='amount' type='text' data-money value='1.00'>
-          <label style='margin-top:6px;'>Note</label><input name='note' placeholder='optional note'>
-          <button type='submit' style='margin-top:10px;'>Transfer</button>
-        </form>
-      </div>
-      <div class='card'>
-        <h3>Prize Catalog</h3>
-        <form method='post' action='/add_prize'>
-          <label>Name</label><input name='name' placeholder='Ice cream' required>
-          <label style='margin-top:6px;'>Cost (dollars)</label><input name='cost' type='text' data-money value='1.00'>
-          <label style='margin-top:6px;'>Notes</label><input name='notes' placeholder='One serving'>
-          <button type='submit' style='margin-top:10px;'>Add Prize</button>
-        </form>
-      </div>
-      <div class='card'>
-        <h3>Parent PINs</h3>
-        <form method='post' action='/admin/set_parent_pin'>
-          <label>Admin</label>
-          <select name='role'>{parent_options_html}</select>
-          <label style='margin-top:6px;'>New PIN</label><input name='new_pin' type='password' placeholder='****' autocomplete='new-password' required>
-          <label style='margin-top:6px;'>Confirm PIN</label><input name='confirm_pin' type='password' placeholder='****' autocomplete='new-password' required>
-          <button type='submit' style='margin-top:10px;'>Update PIN</button>
-        </form>
-        <form method='post' action='/admin/add_parent_admin' style='margin-top:12px;'>
-          <label>Display name</label><input name='label' placeholder='Grandma' required>
-          <label style='margin-top:6px;'>PIN</label><input name='pin' type='password' placeholder='****' autocomplete='new-password' required>
-          <label style='margin-top:6px;'>Confirm PIN</label><input name='confirm_pin' type='password' placeholder='****' autocomplete='new-password' required>
-          <button type='submit' style='margin-top:10px;'>Add Admin</button>
-        </form>
-        <div style='margin-top:10px;'>
-          <div class='muted'>Current admins</div>
-          <ul style='margin:6px 0 0 18px; padding:0;'>{admin_list_html}</ul>
-        </div>
-        <p class='muted' style='margin-top:6px;'>Updates override the default environment values immediately.</p>
-      </div>
-      {time_card}
-      {rules_card}
-    </div>
-    <div class='grid'>
-      {goals_card}
-      {investing_card}
-      <div class='card'>
-        <h3>Chores</h3>
-        <p style='margin-bottom:8px;'><a href='/admin/chores?kid_id={GLOBAL_CHORE_KID_ID}'><button type='button'>Manage Global Chores</button></a></p>
-        <form method='post' action='/admin/chores/create'>
-          <label>kid_id</label>
-          <select name='kid_id' required>{_kid_options(kids)}<option value='{GLOBAL_CHORE_KID_ID}'>Global (Free-for-all)</option></select>
-          <label style='margin-top:6px;'>Name</label><input name='name' placeholder='Take out trash' required>
-          <div class='grid' style='grid-template-columns:repeat(auto-fit,minmax(140px,1fr)); gap:8px; margin-top:6px;'>
-            <div><label>Type</label><select name='type'><option value='daily'>Daily</option><option value='weekly'>Weekly</option><option value='monthly'>Monthly</option><option value='special'>Special</option></select></div>
-            <div><label>Award (dollars)</label><input name='award' type='text' data-money value='0.50'></div>
-            <div><label>Max claimants (global)</label><input name='max_claimants' type='number' min='1' value='1'></div>
-          </div>
-          <div class='grid' style='grid-template-columns:1fr 1fr; gap:8px; margin-top:6px;'>
-            <div><label>Start Date (optional)</label><input name='start_date' type='date'></div>
-            <div><label>End Date (optional)</label><input name='end_date' type='date'></div>
-          </div>
-          <div style='margin-top:6px;'>
-            <div class='muted' style='margin-bottom:4px;'>Weekdays (optional)</div>
-            <div>{weekday_selector}</div>
-          </div>
-          <label style='margin-top:6px;'>Specific dates (comma separated)</label><input name='specific_dates' placeholder='YYYY-MM-DD,YYYY-MM-DD'>
-          <label style='margin-top:6px;'>Notes</label><input name='notes' placeholder='Any details'>
-          <p class='muted' style='margin-top:6px;'>Global chores appear for all kids under “Free-for-all”. Use max claimants to set how many kids can share the reward per period.</p>
-          <button type='submit' style='margin-top:10px;'>Add Chore</button>
-        </form>
-      </div>
-    </div>
-    <div class='card' id='pending'>
-      <h3>Pending Payouts</h3>
-      <table><tr><th>Kid</th><th>Chore</th><th>Award</th><th>Completed</th><th>Actions</th></tr>{pending_rows}</table>
-      <p class='muted' style='margin-top:6px;'>Audit: <a href='/admin/audit'>Pending vs Paid</a></p>
-    </div>
-    <div class='card'>
-      <h3>Children</h3>
-      <table><tr><th>Child</th><th>Balance</th><th>Actions</th></tr>{kids_rows}</table>
-    </div>
-    <div class='card'>
-      <h3>Prizes</h3>
-      <table><tr><th>Prize</th><th>Cost</th><th>Actions</th></tr>{prize_rows}</table>
-    </div>
-    <div class='card'>
-      <h3>Recent Events</h3>
-      <p class='muted'>Need a CSV? <a href='/admin/ledger.csv'>Download ledger</a></p>
-      <table><tr><th>When</th><th>Kid</th><th>Δ Amount</th><th>Reason</th></tr>{event_rows}</table>
-    </div>
-    """
-    return HTMLResponse(frame("Admin", inner))
-
+    chores_card = (
+        "<div class='card'>"
+        "<h3>Add a Chore</h3>"
+        "<form method='post' action='/admin/chores/create' class='stacked-form'>"
+        f"<label>kid_id</label><select name='kid_id' required>{kid_options_html}<option value='{GLOBAL_CHORE_KID_ID}'>Global (Free-for-all)</option></select>"
+        "<label>Name</label><input name='name' placeholder='Take out trash' required>"
+        "<div class='grid' style='grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:8px;'>"
+        "<div><label>Type</label><select name='type'><option value='daily'>Daily</option><option value='weekly'>Weekly</option><option value='monthly'>Monthly</option><option value='special'>Special</option></select></div>"
+        "<div><label>Award (dollars)</label><input name='award' type='text' data-money value='0.50'></div>"
+        "<div><label>Max claimants (global)</label><input name='max_claimants' type='number' min='1' value='1'></div>"
+        "</div>"
+        "<div class='grid' style='grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:8px;'>"
+        "<div><label>Start Date (optional)</label><input name='start_date' type='date'></div>"
+        "<div><label>End Date (optional)</label><input name='end_date' type='date'></div>"
+        "</div>"
+        "<div style='margin-top:6px;'><div class='muted' style='margin-bottom:4px;'>Weekdays (optional)</div><div>"
+        f"{weekday_selector}"
+        "</div></div>"
+        "<label>Specific dates (comma separated)</label><input name='specific_dates' placeholder='YYYY-MM-DD,YYYY-MM-DD'>"
+        "<label>Notes</label><input name='notes' placeholder='Any details'>"
+        "<p class='muted'>Global chores appear for all kids under “Free-for-all”. Use max claimants to set how many kids can share the reward per period.</p>"
+        "<button type='submit'>Add Chore</button>"
+        "</form>"
+        "</div>"
+    )
+    sections: List[Tuple[str, str, str, str]] = [
+        ("goals", "Goals needing action", goals_card, ""),
+        ("payouts", "Pending payouts", pending_card, "".join(multi_modals)),
+        ("children", "Children overview", children_content, ""),
+        ("events", "Recent events", events_card, ""),
+        ("accounts", "Account tools", accounts_content, ""),
+        ("investing", "Investing controls", investing_card, ""),
+        ("chores", "Chore publishing", chores_card, ""),
+        ("prizes", "Prizes", prizes_card, ""),
+        ("rules", "Allowance rules", rules_card, ""),
+        ("time", "Time controls", time_card, ""),
+        ("admins", "Parent admins", parent_admins_card, ""),
+    ]
+    sections_map = {key: {"label": label, "content": content, "extra": extra} for key, label, content, extra in sections}
+    if selected_section not in sections_map:
+        selected_section = "goals"
+    sidebar_links = "".join(
+        (
+            f"<a href='/admin?section={key}' class='{ 'active' if key == selected_section else ''}'>{html_escape(cfg['label'])}</a>"
+        )
+        for key, cfg in sections_map.items()
+    )
+    selected_content = sections_map[selected_section]["content"]
+    extra_html = sections_map[selected_section].get("extra", "")
+    inner = (
+        "<div class='topbar'><h3>Admin Portal</h3><div>"
+        + _role_badge(role)
+        + "<form method='post' action='/admin/logout' style='display:inline-block; margin-left:8px;'><button type='submit' class='pill'>Logout</button></form>"
+        + "</div></div>"
+        + "<div class='layout'><nav class='sidebar'>"
+        + sidebar_links
+        + "</nav><div class='content'>"
+        + selected_content
+        + "</div></div>"
+    )
+    return HTMLResponse(frame("Admin", inner + extra_html))
 @app.get("/admin/kiosk", response_class=HTMLResponse)
 def admin_kiosk(request: Request, kid_id: str = Query(...)):
     if (redirect := require_admin(request)) is not None:
@@ -4178,6 +4817,7 @@ async def admin_global_chore_claims(request: Request):
     decision = (form.get("decision") or "approve").strip().lower()
     chore_id_raw = form.get("chore_id") or "0"
     period_key = (form.get("period_key") or "").strip()
+    reason_text = (form.get("reason") or "").strip()
     try:
         chore_id = int(chore_id_raw)
     except ValueError:
@@ -4231,16 +4871,21 @@ async def admin_global_chore_claims(request: Request):
                 claim.status = GLOBAL_CHORE_STATUS_REJECTED
                 claim.approved_at = now
                 claim.approved_by = role
+                if reason_text:
+                    claim.notes = reason_text
                 session.add(claim)
                 child = session.exec(select(Child).where(Child.kid_id == claim.kid_id)).first()
                 if child:
                     child.updated_at = now
                     session.add(child)
+                    rejection_reason = f"global_chore_denied:{chore.name}:{period_key}"
+                    if reason_text:
+                        rejection_reason += f" ({reason_text})"
                     session.add(
                         Event(
                             child_id=child.kid_id,
                             change_cents=0,
-                            reason=f"global_chore_denied:{chore.name}:{period_key}",
+                            reason=rejection_reason,
                         )
                     )
             session.commit()
@@ -4283,6 +4928,8 @@ async def admin_global_chore_claims(request: Request):
             claim.award_cents = award_cents
             claim.approved_at = now
             claim.approved_by = role
+            if reason_text:
+                claim.notes = reason_text
             session.add(claim)
             child = session.exec(select(Child).where(Child.kid_id == claim.kid_id)).first()
             if child:
@@ -4291,6 +4938,8 @@ async def admin_global_chore_claims(request: Request):
                     _update_gamification(child, award_cents)
                 child.updated_at = now
                 reason = f"global_chore:{chore.name}:{period_key}"
+                if reason_text:
+                    reason += f" ({reason_text})"
                 event = Event(child_id=child.kid_id, change_cents=award_cents, reason=reason)
                 session.add(event)
                 session.add(child)
@@ -4754,6 +5403,32 @@ def admin_add_parent_admin(
     return RedirectResponse("/admin", status_code=302)
 
 
+@app.post("/admin/delete_parent_admin")
+def admin_delete_parent_admin(request: Request, role: str = Form(...)):
+    if (redirect := require_admin(request)) is not None:
+        return redirect
+    normalized_role = (role or "").strip().lower()
+    if not normalized_role:
+        body = "<div class='card'><p style='color:#ff6b6b;'>Select an admin to delete first.</p><p><a href='/admin'>Back</a></p></div>"
+        return HTMLResponse(frame("Admin", body), status_code=400)
+    if normalized_role in DEFAULT_PARENT_ROLES:
+        body = "<div class='card'><p style='color:#ff6b6b;'>Default admins cannot be removed.</p><p><a href='/admin'>Back</a></p></div>"
+        return HTMLResponse(frame("Admin", body), status_code=400)
+    with Session(engine) as session:
+        extras = _load_extra_parent_admins(session)
+        filtered = [entry for entry in extras if entry["role"] != normalized_role]
+        if len(filtered) == len(extras):
+            body = "<div class='card'><p style='color:#ff6b6b;'>Could not find that admin account.</p><p><a href='/admin'>Back</a></p></div>"
+            return HTMLResponse(frame("Admin", body), status_code=404)
+        MetaDAO.set(session, EXTRA_PARENT_ADMINS_KEY, json.dumps(filtered))
+        pin_key = _parent_pin_meta_key(normalized_role)
+        existing_pin = session.get(MetaKV, pin_key)
+        if existing_pin:
+            session.delete(existing_pin)
+        session.commit()
+    return RedirectResponse("/admin", status_code=302)
+
+
 @app.post("/admin/set_allowance")
 def admin_set_allowance(request: Request, kid_id: str = Form(...), allowance: str = Form("0.00")):
     if (redirect := require_admin(request)) is not None:
@@ -4931,10 +5606,12 @@ def admin_chore_payout(request: Request, instance_id: int = Form(...), amount: s
         else:
             payout_c = to_cents_from_dollars_str(raw_amount, chore.award_cents)
         payout_c = max(0, payout_c)
+        moment = _time_provider()
         child.balance_cents += payout_c
-        child.updated_at = datetime.utcnow()
+        child.updated_at = moment
         _update_gamification(child, payout_c)
-        reason_text = f"chore:{chore.name}" + (f" ({reason.strip()})" if reason.strip() else "")
+        reason_clean = (reason or "").strip()
+        reason_text = f"chore:{chore.name}" + (f" ({reason_clean})" if reason_clean else "")
         event = Event(child_id=child.kid_id, change_cents=payout_c, reason=reason_text)
         session.add(event)
         session.add(child)
@@ -4999,21 +5676,39 @@ async def admin_set_certificate_rate(request: Request):
 
 
 @app.post("/admin/certificates/penalty")
-def admin_set_certificate_penalty(request: Request, penalty_days: str = Form(...)):
+async def admin_set_certificate_penalty(request: Request):
     if (redirect := require_admin(request)) is not None:
         return redirect
-    raw = (penalty_days or "").strip()
-    if not raw:
-        days = 0
-    else:
+    form = await request.form()
+    updates: Dict[str, int] = {}
+    invalid_terms: List[str] = []
+    for code, label, _days in CD_TERM_OPTIONS:
+        raw_value = (form.get(f"penalty_{code}") or "").strip()
+        if raw_value == "":
+            updates[code] = 0
+            continue
         try:
-            days = int(raw)
+            value = int(raw_value)
         except ValueError:
-            body = "<div class='card'><p style='color:#ff6b6b;'>Enter penalty days as a whole number.</p><p><a href='/admin'>Back</a></p></div>"
-            return HTMLResponse(frame("Admin", body), status_code=400)
-    days = max(0, days)
+            invalid_terms.append(label)
+            continue
+        if value < 0:
+            invalid_terms.append(label)
+            continue
+        updates[code] = value
+    if invalid_terms:
+        details = ", ".join(invalid_terms)
+        body = (
+            "<div class='card'><p style='color:#ff6b6b;'>Enter whole number penalties for: "
+            f"{details}.</p><p><a href='/admin'>Back</a></p></div>"
+        )
+        return HTMLResponse(frame("Admin", body), status_code=400)
     with Session(engine) as session:
-        MetaDAO.set(session, CD_PENALTY_DAYS_KEY, str(days))
+        for code, days in updates.items():
+            MetaDAO.set(session, _cd_penalty_meta_key(code), str(days))
+        default_days = updates.get(DEFAULT_CD_TERM_CODE)
+        if default_days is not None:
+            MetaDAO.set(session, CD_PENALTY_DAYS_KEY, str(default_days))
         session.commit()
     return RedirectResponse("/admin", status_code=302)
 
