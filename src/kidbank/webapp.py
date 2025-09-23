@@ -1961,7 +1961,6 @@ def kid_home(request: Request) -> HTMLResponse:
         kid_lookup: Dict[str, Child] = {child.kid_id: child}
         for other in others:
             kid_lookup[other.kid_id] = other
-        lookup_results = search_market_symbols(lookup_query) if lookup_query else []
         event_rows = "".join(
             f"<tr><td data-label='When'>{event.timestamp.strftime('%Y-%m-%d %H:%M')}</td>"
             f"<td data-label='Δ Amount' class='right'>{'+' if event.change_cents>=0 else ''}{usd(event.change_cents)}</td>"
@@ -2732,6 +2731,7 @@ def kid_invest_home(
         instrument_map = {_normalize_symbol(inst.symbol): inst for inst in instruments}
         requested_symbol = _normalize_symbol(symbol) if symbol else ""
         lookup_query = (lookup or "").strip()
+        lookup_results = search_market_symbols(lookup_query) if lookup_query else []
         default_symbol = _normalize_symbol(DEFAULT_MARKET_SYMBOL)
         selected_symbol = requested_symbol or default_symbol
         if selected_symbol not in instrument_map:
