@@ -22,7 +22,8 @@ import os
 import sqlite3
 from decimal import Decimal, ROUND_HALF_UP
 from datetime import date, datetime, timedelta
-from typing import Iterable, List, Literal, Optional, Tuple
+from html import escape as html_escape
+from typing import Dict, Iterable, List, Literal, Optional, Tuple
 from urllib.error import HTTPError, URLError
 from urllib.request import Request as URLRequest, urlopen
 
@@ -82,6 +83,17 @@ class Event(SQLModel, table=True):
     change_cents: int
     reason: str
     timestamp: datetime = Field(default_factory=datetime.utcnow)
+
+
+class MoneyRequest(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    from_kid_id: str
+    to_kid_id: str
+    amount_cents: int
+    reason: str = ""
+    status: str = "pending"  # pending|accepted|declined
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    resolved_at: Optional[datetime] = None
 
 
 class Prize(SQLModel, table=True):
@@ -1008,6 +1020,8 @@ def kid_home(request: Request) -> HTMLResponse:
     assert kid_id
     try:
         others: List[Child] = []
+        incoming_requests: List[MoneyRequest] = []
+        outgoing_requests: List[MoneyRequest] = []
         with Session(engine) as session:
             child = session.exec(select(Child).where(Child.kid_id == kid_id)).first()
             if not child:
@@ -1028,6 +1042,21 @@ def kid_home(request: Request) -> HTMLResponse:
             others = session.exec(
                 select(Child).where(Child.kid_id != kid_id).order_by(Child.name)
             ).all()
+            incoming_requests = session.exec(
+                select(MoneyRequest)
+                .where(MoneyRequest.to_kid_id == kid_id)
+                .where(MoneyRequest.status == "pending")
+                .order_by(desc(MoneyRequest.created_at))
+            ).all()
+            outgoing_requests = session.exec(
+                select(MoneyRequest)
+                .where(MoneyRequest.from_kid_id == kid_id)
+                .order_by(desc(MoneyRequest.created_at))
+                .limit(12)
+            ).all()
+        kid_lookup: Dict[str, Child] = {child.kid_id: child}
+        for other in others:
+            kid_lookup[other.kid_id] = other
         event_rows = "".join(
             f"<tr><td data-label='When'>{event.timestamp.strftime('%Y-%m-%d %H:%M')}</td>"
             f"<td data-label='Δ Amount' class='right'>{'+' if event.change_cents>=0 else ''}{usd(event.change_cents)}</td>"
@@ -1084,16 +1113,28 @@ def kid_home(request: Request) -> HTMLResponse:
             notice_html = (
                 f"<div class='card' style='margin-top:12px; {notice_style}'><div>{notice_msg}</div></div>"
             )
-        request_form = (
-            "<form method='post' action='/kid/request_money'>"
-            "<label>Amount (dollars)</label><input name='amount' type='text' data-money placeholder='e.g. 5.00' required>"
-            "<label style='margin-top:6px;'>Reason</label>"
-            "<textarea name='reason' placeholder='What do you need it for?' style='width:100%; min-height:56px;' required></textarea>"
-            "<button type='submit' style='margin-top:10px;'>Request Money</button>"
-            "</form>"
+        def kid_name(identifier: str) -> str:
+            person = kid_lookup.get(identifier)
+            return person.name if person else identifier
+
+        request_options = "".join(
+            f"<option value='{other.kid_id}'>{html_escape(other.name)} ({other.kid_id})</option>"
+            for other in others
         )
+        if request_options:
+            request_form = (
+                "<form method='post' action='/kid/request_money'>"
+                f"<label>Ask</label><select name='target_kid' required>{request_options}</select>"
+                "<label style='margin-top:6px;'>Amount (dollars)</label><input name='amount' type='text' data-money placeholder='e.g. 5.00' required>"
+                "<label style='margin-top:6px;'>Reason</label>"
+                "<textarea name='reason' placeholder='What do you need it for?' style='width:100%; min-height:56px;' required></textarea>"
+                "<button type='submit' style='margin-top:10px;'>Request Money</button>"
+                "</form>"
+            )
+        else:
+            request_form = "<p class='muted'>No other kids to request money from yet.</p>"
         send_options = "".join(
-            f"<option value='{other.kid_id}'>{other.name} ({other.kid_id})</option>"
+            f"<option value='{other.kid_id}'>{html_escape(other.name)} ({other.kid_id})</option>"
             for other in others
         )
         if send_options:
@@ -1108,6 +1149,57 @@ def kid_home(request: Request) -> HTMLResponse:
             )
         else:
             send_form = "<p class='muted'>No other kids to send money to yet.</p>"
+        pending_requests_section = ""
+        pending_requests = [req for req in outgoing_requests if req.status == "pending"]
+        if pending_requests:
+            pending_items = "".join(
+                "<li><b>"
+                + html_escape(kid_name(req.to_kid_id))
+                + "</b> — "
+                + usd(req.amount_cents)
+                + (" • " + html_escape(req.reason) if req.reason else "")
+                + "</li>"
+                for req in pending_requests
+            )
+            pending_requests_section = (
+                "<div style='margin-top:14px;'>"
+                "<div style='font-weight:600;'>Requests you sent</div>"
+                f"<ul style='margin:8px 0 0 20px; padding:0; list-style:disc;'>{pending_items}</ul>"
+                "</div>"
+            )
+        notifications_html = ""
+        if incoming_requests:
+            request_blocks = []
+            for money_request in incoming_requests:
+                requester_name = html_escape(kid_name(money_request.from_kid_id))
+                if money_request.reason:
+                    reason_line = (
+                        "<div class='muted' style='margin-top:4px;'>Reason: "
+                        + html_escape(money_request.reason)
+                        + "</div>"
+                    )
+                else:
+                    reason_line = "<div class='muted' style='margin-top:4px;'>No reason provided.</div>"
+                sent_at = money_request.created_at.strftime("%Y-%m-%d %H:%M")
+                request_blocks.append(
+                    "<div style='margin-top:12px; padding:12px; border-radius:10px; background:#fffbeb; border:1px solid #fbbf24;'>"
+                    + f"<div><b>{requester_name}</b> asked for {usd(money_request.amount_cents)}</div>"
+                    + reason_line
+                    + f"<div class='muted' style='margin-top:4px;'>Sent {sent_at}</div>"
+                    + "<form method='post' action='/kid/request/respond' style='display:flex; gap:8px; margin-top:10px; flex-wrap:wrap;'>"
+                    + f"<input type='hidden' name='request_id' value='{money_request.id}'>"
+                    + "<button type='submit' name='decision' value='accept'>Accept</button>"
+                    + "<button type='submit' name='decision' value='decline' class='danger'>Decline</button>"
+                    + "</form>"
+                    + "</div>"
+                )
+            notifications_html = f"""
+        <div class='card' style='border:2px solid #f59e0b; background:#fffbeb;'>
+          <h3>Notifications</h3>
+          <div class='muted'>These money requests need your response.</div>
+          {''.join(request_blocks)}
+        </div>
+        """
         money_card = f"""
           <div class='card'>
             <h3>Money Moves</h3>
@@ -1116,6 +1208,7 @@ def kid_home(request: Request) -> HTMLResponse:
             {request_form}
             <div style='font-weight:600; margin-top:14px;'>Send Money</div>
             {send_form}
+            {pending_requests_section}
           </div>
         """
         inner = f"""
@@ -1127,6 +1220,7 @@ def kid_home(request: Request) -> HTMLResponse:
           <div class='balance'>{usd(child.balance_cents)}</div>
         </div>
         {notice_html}
+        {notifications_html}
         <div class='grid'>
           <div class='card'>
             <h3>My Chores</h3>
@@ -1253,6 +1347,7 @@ def kid_checkoff(request: Request, chore_id: int = Form(...)):
 @app.post("/kid/request_money")
 def kid_request_money(
     request: Request,
+    target_kid: str = Form(...),
     amount: str = Form(...),
     reason: str = Form(""),
 ):
@@ -1260,30 +1355,146 @@ def kid_request_money(
         return redirect
     kid_id = kid_authed(request)
     assert kid_id
+    target = (target_kid or "").strip()
     amount_c = to_cents_from_dollars_str(amount, 0)
     note = " ".join((reason or "").split())
     if len(note) > 160:
         note = note[:157] + "…"
+    if not target:
+        set_kid_notice(request, "Choose who to ask for money.", "error")
+        return RedirectResponse("/kid", status_code=302)
+    if target == kid_id:
+        set_kid_notice(request, "Choose someone else to ask for money.", "error")
+        return RedirectResponse("/kid", status_code=302)
     if amount_c <= 0:
         set_kid_notice(request, "Enter an amount greater than zero to request money.", "error")
         return RedirectResponse("/kid", status_code=302)
+    target_name = target
     with Session(engine) as session:
         child = session.exec(select(Child).where(Child.kid_id == kid_id)).first()
         if not child:
             request.session.pop("kid_authed", None)
             return RedirectResponse("/", status_code=302)
-        description = note or "Requested money"
+        target_child = session.exec(select(Child).where(Child.kid_id == target)).first()
+        if not target_child:
+            set_kid_notice(request, "Could not find that kid.", "error")
+            return RedirectResponse("/kid", status_code=302)
+        target_name = target_child.name
+        detail_suffix = f" — {note}" if note else ""
+        money_request = MoneyRequest(
+            from_kid_id=child.kid_id,
+            to_kid_id=target_child.kid_id,
+            amount_cents=amount_c,
+            reason=note,
+        )
+        session.add(money_request)
         session.add(
             Event(
-                child_id=kid_id,
+                child_id=child.kid_id,
                 change_cents=0,
-                reason=f"REQUEST {usd(amount_c)}: {description}",
+                reason=f"Request sent to {target_child.name}: {usd(amount_c)}{detail_suffix}",
             )
         )
-        child.updated_at = datetime.utcnow()
+        session.add(
+            Event(
+                child_id=target_child.kid_id,
+                change_cents=0,
+                reason=f"Request from {child.name}: {usd(amount_c)}{detail_suffix}",
+            )
+        )
+        now = datetime.utcnow()
+        child.updated_at = now
+        target_child.updated_at = now
         session.add(child)
+        session.add(target_child)
         session.commit()
-    set_kid_notice(request, "Request sent! Let your parents know to check it.", "success")
+    set_kid_notice(request, f"Asked {target_name} for {usd(amount_c)}.", "success")
+    return RedirectResponse("/kid", status_code=302)
+
+
+@app.post("/kid/request/respond")
+def kid_request_respond(
+    request: Request,
+    request_id: int = Form(...),
+    decision: str = Form(...),
+):
+    if (redirect := require_kid(request)) is not None:
+        return redirect
+    kid_id = kid_authed(request)
+    assert kid_id
+    decision_value = (decision or "").strip().lower()
+    if decision_value not in {"accept", "decline"}:
+        set_kid_notice(request, "Choose to accept or decline the request.", "error")
+        return RedirectResponse("/kid", status_code=302)
+    with Session(engine) as session:
+        money_request = session.get(MoneyRequest, request_id)
+        if not money_request or money_request.to_kid_id != kid_id:
+            set_kid_notice(request, "That request is no longer waiting on you.", "error")
+            return RedirectResponse("/kid", status_code=302)
+        if money_request.status != "pending":
+            set_kid_notice(request, "That request has already been handled.", "error")
+            return RedirectResponse("/kid", status_code=302)
+        responder = session.exec(select(Child).where(Child.kid_id == kid_id)).first()
+        requester = session.exec(select(Child).where(Child.kid_id == money_request.from_kid_id)).first()
+        if not responder or not requester:
+            set_kid_notice(request, "Could not process that request right now.", "error")
+            return RedirectResponse("/kid", status_code=302)
+        detail_suffix = f" — {money_request.reason}" if money_request.reason else ""
+        amount_text = usd(money_request.amount_cents)
+        now = datetime.utcnow()
+        if decision_value == "decline":
+            money_request.status = "declined"
+            money_request.resolved_at = now
+            responder.updated_at = now
+            requester.updated_at = now
+            session.add(money_request)
+            session.add(responder)
+            session.add(requester)
+            session.add(
+                Event(
+                    child_id=responder.kid_id,
+                    change_cents=0,
+                    reason=f"Declined request from {requester.name}: {amount_text}{detail_suffix}",
+                )
+            )
+            session.add(
+                Event(
+                    child_id=requester.kid_id,
+                    change_cents=0,
+                    reason=f"Request declined by {responder.name}: {amount_text}{detail_suffix}",
+                )
+            )
+            session.commit()
+            set_kid_notice(request, f"Declined {requester.name}'s request.", "success")
+            return RedirectResponse("/kid", status_code=302)
+        if responder.balance_cents < money_request.amount_cents:
+            set_kid_notice(request, "Not enough funds to accept this request right now.", "error")
+            return RedirectResponse("/kid", status_code=302)
+        responder.balance_cents -= money_request.amount_cents
+        requester.balance_cents += money_request.amount_cents
+        responder.updated_at = now
+        requester.updated_at = now
+        money_request.status = "accepted"
+        money_request.resolved_at = now
+        session.add(responder)
+        session.add(requester)
+        session.add(money_request)
+        session.add(
+            Event(
+                child_id=responder.kid_id,
+                change_cents=-money_request.amount_cents,
+                reason=f"Accepted request from {requester.name}: {amount_text}{detail_suffix}",
+            )
+        )
+        session.add(
+            Event(
+                child_id=requester.kid_id,
+                change_cents=money_request.amount_cents,
+                reason=f"Request accepted by {responder.name}: {amount_text}{detail_suffix}",
+            )
+        )
+        session.commit()
+        set_kid_notice(request, f"Sent {amount_text} to {requester.name}.", "success")
     return RedirectResponse("/kid", status_code=302)
 
 
