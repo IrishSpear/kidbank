@@ -636,6 +636,9 @@ def base_styles() -> str:
         width:100%; padding:12px; border:1px solid #2b3545; border-radius:10px;
         background:transparent; color:var(--text); box-sizing:border-box; font-size:16px;
       }
+      input[type=checkbox], input[type=radio]{
+        width:auto; min-width:0; padding:0; margin:0 6px 0 0;
+      }
       input::placeholder{color:var(--muted)}
       button{
         padding:12px 14px; border-radius:10px; border:0; background:var(--accent);
@@ -710,6 +713,16 @@ def base_styles() -> str:
       .chore-item__meta{font-size:13px;}
       .chore-item__schedule{font-size:12px; margin-top:4px;}
       .chore-item__action{display:flex; align-items:center;}
+      .chore-table .chore-schedule{display:flex; flex-direction:column; gap:8px;}
+      .chore-schedule__dates{display:flex; flex-wrap:wrap; gap:8px;}
+      .chore-schedule__dates input{flex:1 1 140px; min-width:140px;}
+      .chore-schedule__weekdays{display:flex; flex-wrap:wrap; gap:8px; font-size:14px;}
+      .chore-schedule__weekday{display:inline-flex; align-items:center; gap:6px; padding:4px 8px; border-radius:8px; background:rgba(148,163,184,0.12);}
+      .chore-schedule__weekday input{width:auto; margin:0;}
+      .chore-row__actions{display:flex; flex-direction:column; gap:8px; align-items:flex-end;}
+      .chore-row__actions form{margin:0; display:flex; justify-content:flex-end; width:100%;}
+      .chore-row__actions button{width:auto;}
+      .chore-field--compact{max-width:160px;}
       .chore-empty{padding:14px; border-radius:10px; background:rgba(148,163,184,0.08);}
       .calendar-nav{display:flex; justify-content:space-between; align-items:center; gap:10px;}
       .calendar-nav__btn{padding:6px 12px; border-radius:999px; background:rgba(148,163,184,0.16); color:var(--text); text-decoration:none; font-size:13px;}
@@ -788,6 +801,8 @@ def base_styles() -> str:
         td[data-label="Actions"] form,
         td[data-label="Actions"] a{ display:block; width:100%; margin:6px 0 0 0; }
         td[data-label="Actions"] button{ width:100%; }
+        .chore-row__actions{align-items:stretch;}
+        .chore-row__actions form{justify-content:stretch;}
         button{ width:100%; }
         .kiosk{flex-direction:column; align-items:flex-start}
         .kiosk .balance{font-size:42px}
@@ -5797,9 +5812,10 @@ def admin_manage_chores(request: Request, kid_id: str = Query(...)):
             ).all()
     rows_parts: List[str] = []
     for chore in chores:
+        form_id = f"chore-form-{chore.id}"
         selected_weekdays = chore_weekdays(chore)
         weekday_controls = "".join(
-            f"<label style='margin-right:6px;'><input type='checkbox' name='weekdays' value='{day}'{' checked' if day in selected_weekdays else ''}> {label}</label>"
+            f"<label class='chore-schedule__weekday'><input type='checkbox' name='weekdays' value='{day}'{' checked' if day in selected_weekdays else ''} form='{form_id}'> {label}</label>"
             for day, label in WEEKDAY_OPTIONS
         )
         specific_value = html_escape(chore.specific_dates or "")
@@ -5808,19 +5824,17 @@ def admin_manage_chores(request: Request, kid_id: str = Query(...)):
         name_value = html_escape(chore.name)
         notes_value = html_escape(chore.notes or "")
         schedule_html = (
-            f"<div><input name='start_date' type='date' value='{start_value}' style='max-width:140px;'>"
-            f"<input name='end_date' type='date' value='{end_value}' style='max-width:140px; margin-left:6px;'></div>"
-            f"<div style='margin-top:6px;'>{weekday_controls}</div>"
-            f"<input name='specific_dates' placeholder='YYYY-MM-DD,YYYY-MM-DD' value='{specific_value}' style='margin-top:6px;'>"
+            "<div class='chore-schedule'>"
+            "<div class='chore-schedule__dates'>"
+            f"<input name='start_date' type='date' value='{start_value}' form='{form_id}'>"
+            f"<input name='end_date' type='date' value='{end_value}' form='{form_id}'>"
+            "</div>"
+            f"<div class='chore-schedule__weekdays'>{weekday_controls}</div>"
+            f"<input name='specific_dates' placeholder='YYYY-MM-DD,YYYY-MM-DD' value='{specific_value}' form='{form_id}'>"
+            "</div>"
         )
         is_global_chore = chore.kid_id == GLOBAL_CHORE_KID_ID
         chore_type = normalize_chore_type(chore.type, is_global=is_global_chore)
-        action_html = "<button type='submit'>Save</button></form> "
-        if not is_global_chore:
-            action_html += (
-                "<form class='inline' method='post' action='/admin/chore_make_available_now' style='margin-left:6px;'>"
-                f"<input type='hidden' name='chore_id' value='{chore.id}'><button type='submit'>Make Available Now</button></form> "
-            )
         if is_global_chore:
             type_options = ["daily", "weekly", "monthly"]
         else:
@@ -5829,24 +5843,37 @@ def admin_manage_chores(request: Request, kid_id: str = Query(...)):
             f"<option value='{opt}' {'selected' if chore_type == opt else ''}>{opt}</option>"
             for opt in type_options
         )
-        action_html += (
-            "<form class='inline' method='post' action='/admin/chores/deactivate' style='margin-left:6px;'>"
-            f"<input type='hidden' name='chore_id' value='{chore.id}'><button type='submit' class='danger'>Deactivate</button></form>"
+        action_items = [f"<button type='submit' form='{form_id}'>Save</button>"]
+        if not is_global_chore:
+            action_items.append(
+                "<form method='post' action='/admin/chore_make_available_now' class='chore-row__action-form'>"
+                f"<input type='hidden' name='chore_id' value='{chore.id}'>"
+                "<button type='submit'>Make Available Now</button>"
+                "</form>"
+            )
+        action_items.append(
+            (
+                "<form method='post' action='/admin/chores/deactivate' class='chore-row__action-form'>"
+                f"<input type='hidden' name='chore_id' value='{chore.id}'><button type='submit' class='danger'>Deactivate</button></form>"
+            )
             if chore.active
             else
-            "<form class='inline' method='post' action='/admin/chores/activate' style='margin-left:6px;'>"
-            f"<input type='hidden' name='chore_id' value='{chore.id}'><button type='submit'>Activate</button></form>"
+            (
+                "<form method='post' action='/admin/chores/activate' class='chore-row__action-form'>"
+                f"<input type='hidden' name='chore_id' value='{chore.id}'><button type='submit'>Activate</button></form>"
+            )
         )
+        action_html = "<div class='chore-row__actions'>" + "".join(action_items) + "</div>"
         rows_parts.append(
             "<tr>"
-            f"<td data-label='Name'><form class='inline' method='post' action='/admin/chores/update'>"
-            f"<input type='hidden' name='chore_id' value='{chore.id}'>"
-            f"<input name='name' value='{name_value}'></td>"
-            f"<td data-label='Type'><select name='type'>{type_select}</select></td>"
-            f"<td data-label='Award ($)' class='right'><input name='award' type='text' data-money value='{dollars_value(chore.award_cents)}' style='max-width:120px'></td>"
-            f"<td data-label='Max Spots'><input name='max_claimants' type='number' min='1' value='{max(1, chore.max_claimants)}' style='max-width:120px'></td>"
+            f"<td data-label='Name'><form id='{form_id}' method='post' action='/admin/chores/update'></form>"
+            f"<input type='hidden' name='chore_id' value='{chore.id}' form='{form_id}'>"
+            f"<input name='name' value='{name_value}' form='{form_id}'></td>"
+            f"<td data-label='Type'><select name='type' form='{form_id}'>{type_select}</select></td>"
+            f"<td data-label='Award ($)' class='right'><input name='award' type='text' data-money value='{dollars_value(chore.award_cents)}' form='{form_id}' class='chore-field--compact'></td>"
+            f"<td data-label='Max Spots'><input name='max_claimants' type='number' min='1' value='{max(1, chore.max_claimants)}' form='{form_id}' class='chore-field--compact'></td>"
             f"<td data-label='Schedule'>{schedule_html}</td>"
-            f"<td data-label='Notes'><input name='notes' value='{notes_value}'></td>"
+            f"<td data-label='Notes'><input name='notes' value='{notes_value}' form='{form_id}'></td>"
             f"<td data-label='Status'><span class='pill'>{'Active' if chore.active else 'Inactive'}</span></td>"
             f"<td data-label='Actions' class='right'>{action_html}</td>"
             "</tr>"
@@ -5862,7 +5889,7 @@ def admin_manage_chores(request: Request, kid_id: str = Query(...)):
         note_html = "<p class='muted' style='margin-top:6px;'>“Make Available Now” republishes the chore for the current period (within its active window).</p>"
     chores_table = f"""
     <div class='card'>
-      <table>
+      <table class='chore-table'>
         <tr><th>Name</th><th>Type</th><th>Award ($)</th><th>Max Spots</th><th>Schedule</th><th>Notes</th><th>Status</th><th>Actions</th></tr>
         {rows}
       </table>
