@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from decimal import Decimal, ROUND_UP
@@ -47,13 +48,18 @@ class CertificateOfDeposit:
         """Return the accrued value as of ``at`` using simple interest."""
 
         moment = at or datetime.utcnow()
-        total_days = self.term.days
-        if total_days == 0:
+        total_seconds = self.term.total_seconds()
+        if total_seconds <= 0:
             return self.payout_amount()
-        elapsed_days = max(0, min((moment - self.opened_on).days, total_days))
-        progress = Decimal(elapsed_days) / Decimal(total_days)
-        interest = (self.principal * self.rate * progress).quantize(Decimal("0.01"))
-        return self.principal + interest
+        elapsed_seconds = (moment - self.opened_on).total_seconds()
+        elapsed_seconds = max(0.0, min(elapsed_seconds, total_seconds))
+        progress = 0.0 if total_seconds == 0 else elapsed_seconds / total_seconds
+        rate_float = float(self.rate)
+        if progress <= 0.0 or rate_float <= 0.0:
+            return self.principal
+        factor = math.exp(progress * math.log1p(rate_float))
+        value = (self.principal * Decimal(str(factor))).quantize(Decimal("0.01"))
+        return value
 
     def payout_amount(self) -> Decimal:
         """Return the amount released upon maturity."""

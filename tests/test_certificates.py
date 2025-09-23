@@ -1,6 +1,8 @@
+import math
 import sys
 import types
 from datetime import datetime, timedelta
+from decimal import Decimal, ROUND_HALF_UP
 
 dotenv_stub = types.ModuleType("dotenv")
 dotenv_stub.load_dotenv = lambda: None  # type: ignore[attr-defined]
@@ -14,6 +16,7 @@ from kidbank.webapp import (  # noqa: E402
     certificate_maturity_date,
     certificate_value_cents,
     certificate_maturity_value_cents,
+    certificate_progress_percent,
 )
 
 
@@ -32,10 +35,10 @@ def test_certificate_penalty_caps_at_accrued_interest() -> None:
 
     penalty = certificate_penalty_cents(certificate, at=moment)
     gross, _, net = certificate_sale_breakdown_cents(certificate, at=moment)
+    accrued = gross - certificate.principal_cents
 
-    assert penalty == 100
-    assert gross == 10_100
-    assert net == 10_000
+    assert penalty == accrued
+    assert net == certificate.principal_cents
 
 
 def test_certificate_penalty_ignored_after_maturity() -> None:
@@ -75,3 +78,41 @@ def test_certificate_one_week_term_uses_days() -> None:
     mature_value = certificate_maturity_value_cents(certificate)
 
     assert certificate.principal_cents < mid_value < mature_value
+
+
+def test_certificate_value_uses_compound_interest() -> None:
+    opened_at = datetime.utcnow() - timedelta(days=15)
+    certificate = Certificate(
+        id=4,
+        kid_id="dana",
+        principal_cents=10_000,
+        rate_bps=600,
+        term_months=0,
+        term_days=30,
+        opened_at=opened_at,
+    )
+    moment = opened_at + timedelta(days=15)
+    value_cents = certificate_value_cents(certificate, at=moment)
+    principal = Decimal(certificate.principal_cents)
+    rate = Decimal(certificate.rate_bps) / Decimal(10000)
+    factor = Decimal(str(math.exp(0.5 * math.log1p(float(rate)))))
+    expected = (principal * factor).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+
+    assert value_cents == int(expected)
+
+
+def test_certificate_progress_uses_fractional_days() -> None:
+    opened_at = datetime.utcnow() - timedelta(hours=12)
+    certificate = Certificate(
+        id=5,
+        kid_id="elsa",
+        principal_cents=5_000,
+        rate_bps=400,
+        term_months=0,
+        term_days=1,
+        opened_at=opened_at,
+    )
+
+    pct = certificate_progress_percent(certificate, at=datetime.utcnow())
+
+    assert 40.0 < pct < 60.0

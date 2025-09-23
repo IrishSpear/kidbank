@@ -18,7 +18,9 @@ from __future__ import annotations
 import csv
 import io
 import json
+import math
 import os
+import re
 import sqlite3
 from decimal import Decimal, ROUND_HALF_UP
 from datetime import date, datetime, timedelta
@@ -43,7 +45,11 @@ MOM_PIN = os.environ.get("MOM_PIN", "1022")
 DAD_PIN = os.environ.get("DAD_PIN", "2097")
 SESSION_SECRET = os.environ.get("SESSION_SECRET", "change-this-session-secret")
 SQLITE_FILE_NAME = os.environ.get("KIDBANK_SQLITE", "kidbank.db")
-PARENT_ROLES: Tuple[str, ...] = ("mom", "dad")
+DEFAULT_PARENT_ROLES: Tuple[str, ...] = ("mom", "dad")
+DEFAULT_PARENT_LABELS: Dict[str, str] = {"mom": "Mom", "dad": "Dad"}
+EXTRA_PARENT_ADMINS_KEY = "parent_admins"
+GLOBAL_CHORE_TYPES: Tuple[str, ...] = ("daily", "weekly", "monthly")
+DEFAULT_GLOBAL_CHORE_TYPE = "daily"
 
 
 _time_provider: Callable[[], datetime] = datetime.now
@@ -715,6 +721,16 @@ def format_weekdays(days: Set[int]) -> str:
     return ", ".join(labels)
 
 
+def normalize_chore_type(value: str, *, is_global: bool = False) -> str:
+    normalized = (value or "").lower()
+    if normalized == "global":
+        normalized = DEFAULT_GLOBAL_CHORE_TYPE
+    if is_global:
+        return normalized if normalized in GLOBAL_CHORE_TYPES else DEFAULT_GLOBAL_CHORE_TYPE
+    valid = {"daily", "weekly", "monthly", "special"}
+    return normalized if normalized in valid else "daily"
+
+
 def period_key_for(chore_type: str, moment: datetime) -> str:
     if chore_type == "daily":
         return moment.strftime("%Y-%m-%d")
@@ -722,6 +738,8 @@ def period_key_for(chore_type: str, moment: datetime) -> str:
         days_since_sunday = (moment.weekday() + 1) % 7
         sunday = (moment - timedelta(days=days_since_sunday)).date()
         return f"{sunday.isoformat()}-WEEK"
+    if chore_type == "monthly":
+        return moment.strftime("%Y-%m")
     return "SPECIAL"
 
 
@@ -743,12 +761,9 @@ def is_chore_in_window(chore: Chore, today: date) -> bool:
 
 def global_chore_period_key(moment: datetime, chore: Optional[Chore] = None) -> str:
     if chore is not None:
-        if chore.type == "weekly":
-            return period_key_for("weekly", moment)
-        if chore.type == "daily":
-            return period_key_for("daily", moment)
-        if chore.type == "special":
-            return "SPECIAL"
+        chore_type = normalize_chore_type(chore.type, is_global=True)
+        if chore_type in {"weekly", "daily", "monthly"}:
+            return period_key_for(chore_type, moment)
     return moment.strftime("%Y-%m-%d")
 
 
@@ -795,9 +810,10 @@ def ensure_instances_for_kid(kid_id: str) -> None:
         for chore in chores:
             if not is_chore_in_window(chore, today):
                 continue
-            if chore.type == "special":
+            chore_type = normalize_chore_type(chore.type)
+            if chore_type == "special":
                 continue
-            pk = period_key_for(chore.type, moment)
+            pk = period_key_for(chore_type, moment)
             exists = session.exec(
                 select(ChoreInstance)
                 .where(ChoreInstance.chore_id == chore.id)
@@ -814,6 +830,7 @@ def list_chore_instances_for_kid(kid_id: str) -> List[Tuple[Chore, Optional[Chor
     today = moment.date()
     pk_daily = period_key_for("daily", moment)
     pk_weekly = period_key_for("weekly", moment)
+    pk_monthly = period_key_for("monthly", moment)
     with Session(engine) as session:
         chores = session.exec(select(Chore).where(Chore.kid_id == kid_id, Chore.active == True)).all()  # noqa: E712
         output: List[Tuple[Chore, Optional[ChoreInstance]]] = []
@@ -826,10 +843,13 @@ def list_chore_instances_for_kid(kid_id: str) -> List[Tuple[Chore, Optional[Chor
                 .order_by(desc(ChoreInstance.id))
             ).all()
             current: Optional[ChoreInstance]
-            if chore.type == "daily":
+            chore_type = normalize_chore_type(chore.type)
+            if chore_type == "daily":
                 current = next((i for i in insts if i.period_key == pk_daily), None)
-            elif chore.type == "weekly":
+            elif chore_type == "weekly":
                 current = next((i for i in insts if i.period_key == pk_weekly), None)
+            elif chore_type == "monthly":
+                current = next((i for i in insts if i.period_key == pk_monthly), None)
             else:
                 current = next((i for i in insts if i.status in {"available", "pending"}), None)
             output.append((chore, current))
@@ -957,19 +977,80 @@ def _parent_pin_default(role: str) -> str:
         return MOM_PIN
     if role == "dad":
         return DAD_PIN
-    raise ValueError(f"Unknown parent role: {role}")
+    return ""
 
 
 def _parent_pin_meta_key(role: str) -> str:
     return f"parent_pin_{role}"
 
 
+def _normalize_parent_role_key(label: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "", (label or "").lower())
+    return slug or "admin"
+
+
+def _load_extra_parent_admins(session: Session) -> List[Dict[str, str]]:
+    raw = MetaDAO.get(session, EXTRA_PARENT_ADMINS_KEY) or "[]"
+    try:
+        data = json.loads(raw)
+    except Exception:
+        data = []
+    cleaned: List[Dict[str, str]] = []
+    for entry in data:
+        role = str(entry.get("role") or "").strip().lower()
+        label = str(entry.get("label") or "").strip()
+        if not role:
+            continue
+        cleaned.append({"role": role, "label": label or role.title()})
+    return cleaned
+
+
+def all_parent_admins(session: Session | None = None) -> List[Dict[str, str]]:
+    def load(active: Session) -> List[Dict[str, str]]:
+        base = [
+            {"role": role, "label": DEFAULT_PARENT_LABELS.get(role, role.title())}
+            for role in DEFAULT_PARENT_ROLES
+        ]
+        extras = _load_extra_parent_admins(active)
+        seen: Set[str] = {item["role"] for item in base}
+        unique_extras: List[Dict[str, str]] = []
+        for entry in extras:
+            role = entry["role"]
+            if role in seen:
+                continue
+            seen.add(role)
+            unique_extras.append(entry)
+        return base + unique_extras
+
+    if session is not None:
+        return load(session)
+    with Session(engine) as new_session:
+        return load(new_session)
+
+
+def parent_role_label(role: str, session: Session | None = None) -> str:
+    normalized = (role or "").lower()
+    if not normalized:
+        return ""
+    admins = all_parent_admins(session)
+    for admin in admins:
+        if admin["role"] == normalized:
+            return admin["label"]
+    return normalized.title()
+
+
 def get_parent_pins(session: Session | None = None) -> Dict[str, str]:
     def load(active_session: Session) -> Dict[str, str]:
         pins: Dict[str, str] = {}
-        for role in PARENT_ROLES:
+        for admin in all_parent_admins(active_session):
+            role = admin["role"]
             override = MetaDAO.get(active_session, _parent_pin_meta_key(role))
-            pins[role] = override or _parent_pin_default(role)
+            if override:
+                pins[role] = override
+            else:
+                default_pin = _parent_pin_default(role)
+                if default_pin:
+                    pins[role] = default_pin
         return pins
 
     if session is not None:
@@ -987,10 +1068,10 @@ def resolve_admin_role(pin: str, *, session: Session | None = None) -> Optional[
 
 
 def set_parent_pin(role: str, new_pin: str) -> None:
-    normalized_role = role.lower()
-    if normalized_role not in PARENT_ROLES:
-        raise ValueError(f"Unknown parent role: {role}")
+    normalized_role = (role or "").lower()
     with Session(engine) as session:
+        if normalized_role not in {admin["role"] for admin in all_parent_admins(session)}:
+            raise ValueError(f"Unknown parent role: {role}")
         MetaDAO.set(session, _parent_pin_meta_key(normalized_role), new_pin)
         session.commit()
 
@@ -1112,19 +1193,28 @@ def certificate_maturity_value_cents(certificate: Certificate) -> int:
     return int(principal + interest)
 
 
-def certificate_value_cents(certificate: Certificate, *, at: Optional[datetime] = None) -> int:
-    principal = Decimal(certificate.principal_cents)
+def _certificate_elapsed_fraction(certificate: Certificate, *, at: Optional[datetime] = None) -> float:
     total_days = certificate_term_days(certificate)
-    if total_days <= 0:
-        return int(principal)
+    total_seconds = total_days * 86400
+    if total_seconds <= 0:
+        return 1.0
     moment = at or datetime.utcnow()
     if certificate.matured_at:
         moment = max(moment, certificate.matured_at)
-    elapsed = max(0, min((moment - certificate.opened_at).days, total_days))
-    progress = Decimal(elapsed) / Decimal(total_days) if total_days else Decimal(0)
+    elapsed_seconds = (moment - certificate.opened_at).total_seconds()
+    elapsed_seconds = max(0.0, min(elapsed_seconds, total_seconds))
+    return elapsed_seconds / total_seconds if total_seconds else 1.0
+
+
+def certificate_value_cents(certificate: Certificate, *, at: Optional[datetime] = None) -> int:
+    principal = Decimal(certificate.principal_cents)
     rate = Decimal(certificate.rate_bps) / Decimal(10000)
-    interest = (principal * rate * progress).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
-    return int(principal + interest)
+    fraction = _certificate_elapsed_fraction(certificate, at=at)
+    if fraction <= 0 or rate <= 0:
+        return int(principal)
+    growth = math.exp(fraction * math.log1p(float(rate)))
+    value = (principal * Decimal(str(growth))).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+    return int(value)
 
 
 def certificate_penalty_cents(certificate: Certificate, *, at: Optional[datetime] = None) -> int:
@@ -1167,12 +1257,8 @@ def certificate_sale_breakdown_cents(
 def certificate_progress_percent(certificate: Certificate, *, at: Optional[datetime] = None) -> float:
     if certificate.matured_at:
         return 100.0
-    total_days = certificate_term_days(certificate)
-    if total_days <= 0:
-        return 100.0
-    moment = at or datetime.utcnow()
-    elapsed = max(0, min((moment - certificate.opened_at).days, total_days))
-    pct = (elapsed / total_days) * 100
+    fraction = _certificate_elapsed_fraction(certificate, at=at)
+    pct = fraction * 100
     return min(100.0, max(0.0, pct))
 
 
@@ -1336,6 +1422,54 @@ def add_market_instrument(symbol: str, name: str, kind: str) -> Optional[MarketI
         return instrument
 
 
+def search_market_symbols(query: str, *, limit: int = 6) -> List[Dict[str, str]]:
+    cleaned = (query or "").strip()
+    if not cleaned:
+        return []
+    encoded = quote(cleaned, safe="")
+    url = f"https://query1.finance.yahoo.com/v1/finance/search?q={encoded}&quotesCount={limit}&newsCount=0"
+    try:
+        req = URLRequest(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urlopen(req, timeout=6) as resp:
+            payload = resp.read().decode("utf-8")
+        data = json.loads(payload)
+    except (URLError, HTTPError, TimeoutError, ValueError, KeyError):
+        return []
+    matches: List[Dict[str, str]] = []
+    for item in data.get("quotes", [])[:limit]:
+        symbol = item.get("symbol")
+        if not symbol:
+            continue
+        name = item.get("shortname") or item.get("longname") or symbol
+        quote_type = (item.get("quoteType") or "").lower()
+        kind = INSTRUMENT_KIND_CRYPTO if "crypto" in quote_type else INSTRUMENT_KIND_STOCK
+        matches.append({"symbol": symbol, "name": name, "kind": kind})
+    return matches
+
+
+def lookup_symbol_profile(symbol: str) -> Optional[Dict[str, str]]:
+    normalized = _normalize_symbol(symbol)
+    if not normalized:
+        return None
+    encoded = quote(normalized, safe="")
+    url = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={encoded}"
+    try:
+        req = URLRequest(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urlopen(req, timeout=6) as resp:
+            payload = resp.read().decode("utf-8")
+        data = json.loads(payload)
+        result = data.get("quoteResponse", {}).get("result", [])
+        if not result:
+            return None
+        entry = result[0]
+    except (URLError, HTTPError, TimeoutError, ValueError, KeyError, IndexError):
+        return None
+    name = entry.get("longName") or entry.get("shortName") or normalized
+    quote_type = (entry.get("quoteType") or "").lower()
+    kind = INSTRUMENT_KIND_CRYPTO if "crypto" in quote_type else INSTRUMENT_KIND_STOCK
+    return {"symbol": normalized, "name": name, "kind": kind}
+
+
 def delete_market_instrument(instrument_id: int) -> None:
     with Session(engine) as session:
         instrument = session.get(MarketInstrument, instrument_id)
@@ -1366,6 +1500,27 @@ def _price_history_key(symbol: str) -> str:
     return f"market_price_hist_{_normalize_symbol(symbol)}"
 
 
+PRICE_HISTORY_RANGES: Dict[str, Dict[str, Any]] = {
+    "1d": {"label": "24hr", "range": "1d", "interval": "5m", "ttl": 15},
+    "1w": {"label": "1wk", "range": "5d", "interval": "30m", "ttl": 60},
+    "1m": {"label": "1mo", "range": "1mo", "interval": "1d", "ttl": 180},
+    "3m": {"label": "3mo", "range": "3mo", "interval": "1d", "ttl": 180},
+    "6m": {"label": "6mo", "range": "6mo", "interval": "1d", "ttl": 180},
+    "1y": {"label": "1yr", "range": "1y", "interval": "1wk", "ttl": 240},
+    "5y": {"label": "5yr", "range": "5y", "interval": "1mo", "ttl": 1440},
+}
+DEFAULT_PRICE_RANGE = "1m"
+
+
+def normalize_history_range(value: str) -> str:
+    normalized = (value or "").lower()
+    return normalized if normalized in PRICE_HISTORY_RANGES else DEFAULT_PRICE_RANGE
+
+
+def _price_history_range_cache_key(symbol: str, range_code: str) -> str:
+    return f"market_price_hist_{_normalize_symbol(symbol)}_{range_code}"
+
+
 def _cache_set_price(session: Session, symbol: str, cents: int) -> None:
     MetaDAO.set(session, _price_cache_key(symbol), str(int(cents)))
     MetaDAO.set(session, _price_ts_cache_key(symbol), datetime.utcnow().isoformat())
@@ -1389,6 +1544,78 @@ def _should_refresh(last: Optional[datetime]) -> bool:
     if not last:
         return True
     return (datetime.utcnow() - last) > timedelta(minutes=5)
+
+
+def _download_price_history(symbol: str, range_param: str, interval: str) -> List[Dict[str, Any]]:
+    yahoo_symbol = instrument_yahoo_symbol(symbol)
+    encoded = quote(yahoo_symbol, safe="")
+    url = (
+        f"https://query1.finance.yahoo.com/v8/finance/chart/{encoded}?range={range_param}&interval={interval}"
+    )
+    try:
+        req = URLRequest(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urlopen(req, timeout=6) as resp:
+            payload = resp.read().decode("utf-8")
+        data = json.loads(payload)
+        result = data.get("chart", {}).get("result")
+        if not result:
+            return []
+        chart = result[0]
+        timestamps = chart.get("timestamp") or []
+        quote_info = chart.get("indicators", {}).get("quote", [{}])[0]
+        closes = quote_info.get("close") or []
+        points: List[Dict[str, Any]] = []
+        for ts, close in zip(timestamps, closes):
+            if close is None:
+                continue
+            try:
+                price_c = int(round(float(close) * 100))
+            except (TypeError, ValueError):
+                continue
+            dt = datetime.fromtimestamp(ts)
+            points.append({"t": dt.isoformat(), "p": price_c})
+        return points
+    except (URLError, HTTPError, TimeoutError, ValueError, KeyError):
+        return []
+
+
+def fetch_price_history_range(symbol: str, range_code: str) -> List[Dict[str, Any]]:
+    normalized_range = normalize_history_range(range_code)
+    config = PRICE_HISTORY_RANGES[normalized_range]
+    cache_key = _price_history_range_cache_key(symbol, normalized_range)
+    ttl_minutes = int(config.get("ttl", 60) or 0)
+    with Session(engine) as session:
+        cached_raw = MetaDAO.get(session, cache_key)
+        if cached_raw:
+            try:
+                cached_data = json.loads(cached_raw)
+                updated_raw = cached_data.get("updated")
+                cached_points = cached_data.get("points", [])
+            except Exception:
+                cached_data = None
+            else:
+                try:
+                    updated_ts = datetime.fromisoformat(updated_raw) if updated_raw else None
+                except Exception:
+                    updated_ts = None
+                if updated_ts and (datetime.utcnow() - updated_ts) <= timedelta(minutes=ttl_minutes):
+                    return cached_points
+        points = _download_price_history(symbol, config["range"], config["interval"])
+        if points:
+            MetaDAO.set(
+                session,
+                cache_key,
+                json.dumps({"updated": datetime.utcnow().isoformat(), "points": points}),
+            )
+            session.commit()
+            return points
+        if cached_raw:
+            try:
+                cached_data = json.loads(cached_raw)
+                return cached_data.get("points", [])
+            except Exception:
+                return []
+        return []
 
 
 def _fetch_price_from_yahoo(symbol: str) -> Optional[int]:
@@ -1734,6 +1961,7 @@ def kid_home(request: Request) -> HTMLResponse:
         kid_lookup: Dict[str, Child] = {child.kid_id: child}
         for other in others:
             kid_lookup[other.kid_id] = other
+        lookup_results = search_market_symbols(lookup_query) if lookup_query else []
         event_rows = "".join(
             f"<tr><td data-label='When'>{event.timestamp.strftime('%Y-%m-%d %H:%M')}</td>"
             f"<td data-label='Δ Amount' class='right'>{'+' if event.change_cents>=0 else ''}{usd(event.change_cents)}</td>"
@@ -2140,9 +2368,10 @@ def kid_checkoff(request: Request, chore_id: int = Form(...)):
             return RedirectResponse("/kid", status_code=302)
         if not is_chore_in_window(chore, today):
             return RedirectResponse("/kid", status_code=302)
-        pk = "SPECIAL" if chore.type == "special" else period_key_for(chore.type, moment)
+        chore_type = normalize_chore_type(chore.type)
+        pk = "SPECIAL" if chore_type == "special" else period_key_for(chore_type, moment)
         query = select(ChoreInstance).where(ChoreInstance.chore_id == chore.id)
-        if chore.type != "special":
+        if chore_type != "special":
             query = query.where(ChoreInstance.period_key == pk)
         inst = session.exec(query.where(ChoreInstance.status == "available").order_by(desc(ChoreInstance.id))).first()
         if not inst:
@@ -2178,11 +2407,8 @@ def kid_global_chore_apply(request: Request, chore_id: int = Form(...)):
             return RedirectResponse("/kid", status_code=302)
         period_key = global_chore_period_key(moment, chore)
         existing_claim = get_global_claim(session, chore.id, kid_id, period_key)
-        if existing_claim and existing_claim.status in {
-            GLOBAL_CHORE_STATUS_PENDING,
-            GLOBAL_CHORE_STATUS_APPROVED,
-        }:
-            set_kid_notice(request, "You've already submitted this chore.", "error")
+        if existing_claim:
+            set_kid_notice(request, "You already submitted this Free-for-all chore for this period.", "error")
             return RedirectResponse("/kid", status_code=302)
         total_claims = count_global_claims(session, chore.id, period_key, include_pending=True)
         if total_claims >= chore.max_claimants:
@@ -2489,7 +2715,12 @@ def kid_goal_delete(request: Request, goal_id: int = Form(...)):
 
 
 @app.get("/kid/invest", response_class=HTMLResponse)
-def kid_invest_home(request: Request, symbol: Optional[str] = Query(None)) -> HTMLResponse:
+def kid_invest_home(
+    request: Request,
+    symbol: Optional[str] = Query(None),
+    range_code: str = Query(DEFAULT_PRICE_RANGE, alias="range"),
+    lookup: str = Query(""),
+) -> HTMLResponse:
     if (redirect := require_kid(request)) is not None:
         return redirect
     kid_id = kid_authed(request)
@@ -2500,13 +2731,15 @@ def kid_invest_home(request: Request, symbol: Optional[str] = Query(None)) -> HT
             raise RuntimeError("No market instruments available.")
         instrument_map = {_normalize_symbol(inst.symbol): inst for inst in instruments}
         requested_symbol = _normalize_symbol(symbol) if symbol else ""
+        lookup_query = (lookup or "").strip()
         default_symbol = _normalize_symbol(DEFAULT_MARKET_SYMBOL)
         selected_symbol = requested_symbol or default_symbol
         if selected_symbol not in instrument_map:
             selected_symbol = default_symbol if default_symbol in instrument_map else next(iter(instrument_map.keys()))
         active_instrument = instrument_map[selected_symbol]
+        selected_range = normalize_history_range(range_code)
         metrics = compute_holdings_metrics(kid_id, selected_symbol)
-        history = get_price_history(selected_symbol)
+        history = fetch_price_history_range(selected_symbol, selected_range)
         svg = sparkline_svg_from_history(history)
         cd_rates_bps = {code: DEFAULT_CD_RATE_BPS for code, _, _ in CD_TERM_OPTIONS}
         with Session(engine) as session:
@@ -2603,18 +2836,74 @@ def kid_invest_home(request: Request, symbol: Optional[str] = Query(None)) -> HT
             for inst in instruments:
                 normalized = _normalize_symbol(inst.symbol)
                 active_style = "background:var(--accent); color:#fff;" if normalized == selected_symbol else ""
+                link_url = f"/kid/invest?symbol={inst.symbol}&range={selected_range}"
                 links.append(
-                    f"<a href='/kid/invest?symbol={inst.symbol}' class='pill' style='margin-right:6px;{active_style}'>"
+                    f"<a href='{link_url}' class='pill' style='margin-right:6px;{active_style}'>"
                     f"{html_escape(inst.name or inst.symbol)}</a>"
                 )
             tabs_html = "<div class='muted' style='margin-bottom:8px;'>Markets: " + "".join(links) + "</div>"
 
-        instrument_label = html_escape(active_instrument.name or active_instrument.symbol)
-        instrument_symbol = html_escape(active_instrument.symbol)
+        range_links: List[str] = []
+        for code, cfg in PRICE_HISTORY_RANGES.items():
+            label = cfg.get("label", code)
+            active_style = "background:var(--accent); color:#fff;" if code == selected_range else ""
+            link_url = f"/kid/invest?symbol={active_instrument.symbol}&range={code}"
+            range_links.append(
+                f"<a href='{link_url}' class='pill' style='margin-right:6px;{active_style}'>{label}</a>"
+            )
+        range_selector_html = "<div class='muted' style='margin-top:8px;'>View: " + "".join(range_links) + "</div>"
+        instrument_symbol_raw = active_instrument.symbol
+        lookup_value = html_escape(lookup_query)
+        if lookup_query and lookup_results:
+            suggestion_items = []
+            for match in lookup_results:
+                symbol_val = match.get("symbol") or ""
+                name_val = match.get("name") or symbol_val
+                kind_val = match.get("kind") or INSTRUMENT_KIND_STOCK
+                kind_label = "Crypto" if kind_val == INSTRUMENT_KIND_CRYPTO else "Stock"
+                suggestion_items.append(
+                    "<li><b>"
+                    + html_escape(symbol_val)
+                    + "</b> — "
+                    + html_escape(name_val)
+                    + f" <span class='muted'>({kind_label})</span>"
+                    + "<form method='post' action='/kid/invest/track' class='inline' style='margin-top:6px;'>"
+                    + f"<input type='hidden' name='symbol' value='{html_escape(symbol_val)}'>"
+                    + f"<input type='hidden' name='name' value='{html_escape(name_val)}'>"
+                    + f"<input type='hidden' name='kind' value='{html_escape(kind_val)}'>"
+                    + f"<input type='hidden' name='range' value='{selected_range}'>"
+                    + "<button type='submit'>Track</button></form></li>"
+                )
+            search_results_html = (
+                "<ul style='margin:10px 0 0 18px; padding:0; list-style:disc;'>"
+                + "".join(suggestion_items)
+                + "</ul>"
+            )
+        elif lookup_query:
+            search_results_html = "<div class='muted' style='margin-top:6px;'>No matches found.</div>"
+        else:
+            search_results_html = "<div class='muted' style='margin-top:6px;'>Try symbols like AAPL, VTI, or BTC-USD.</div>"
+        search_card_html = f"""
+        <div class='card'>
+          <h3>Add a ticker</h3>
+          <p class='muted'>Search by ticker or name to add a new stock, fund, or crypto.</p>
+          <form method='get' action='/kid/invest' class='inline'>
+            <input type='hidden' name='symbol' value='{html_escape(instrument_symbol_raw)}'>
+            <input type='hidden' name='range' value='{selected_range}'>
+            <input name='lookup' placeholder='Search ticker or name' value='{lookup_value}'>
+            <button type='submit'>Search</button>
+          </form>
+          {search_results_html}
+        </div>
+        """
+
+        instrument_label = html_escape(active_instrument.name or instrument_symbol_raw)
+        instrument_symbol = html_escape(instrument_symbol_raw)
         kind_label = "Crypto" if active_instrument.kind == INSTRUMENT_KIND_CRYPTO else "Stock"
         unit_label = "per coin" if active_instrument.kind == INSTRUMENT_KIND_CRYPTO else "per share"
 
         inner = f"""
+        {search_card_html}
         {tabs_html}
         <div class='card'>
           <h3>Investing — {instrument_label}</h3>
@@ -2626,6 +2915,7 @@ def kid_invest_home(request: Request, symbol: Optional[str] = Query(None)) -> HT
               <div style='font-size:28px; font-weight:800; margin-top:6px;'>{usd(metrics['price_c'])}</div>
               <div class='muted'>{unit_label}</div>
               <div style='margin-top:8px;'>{svg}</div>
+              {range_selector_html}
             </div>
             <div class='card'>
               <div><b>Your Holdings</b></div>
@@ -2640,12 +2930,14 @@ def kid_invest_home(request: Request, symbol: Optional[str] = Query(None)) -> HT
           <h4 style='margin-top:12px;'>Buy (deposit from balance)</h4>
           <form method='post' action='/kid/invest/buy' class='inline'>
             <input type='hidden' name='symbol' value='{instrument_symbol}'>
+            <input type='hidden' name='range' value='{selected_range}'>
             <input name='amount' type='text' data-money placeholder='amount $' required>
             <button type='submit'>Buy</button>
           </form>
           <h4 style='margin-top:12px;'>Sell (withdraw to balance)</h4>
           <form method='post' action='/kid/invest/sell' class='inline'>
             <input type='hidden' name='symbol' value='{instrument_symbol}'>
+            <input type='hidden' name='range' value='{selected_range}'>
             <input name='amount' type='text' data-money placeholder='amount $' required>
             <button type='submit' class='danger'>Sell</button>
           </form>
@@ -2679,24 +2971,60 @@ def kid_invest_home(request: Request, symbol: Optional[str] = Query(None)) -> HT
         </div>
         """
         return HTMLResponse(frame("Investing — Error", body))
+@app.post("/kid/invest/track")
+def kid_invest_track(
+    request: Request,
+    symbol: str = Form(...),
+    name: str = Form(""),
+    kind: str = Form(INSTRUMENT_KIND_STOCK),
+    range_code: str = Form(DEFAULT_PRICE_RANGE),
+):
+    if (redirect := require_kid(request)) is not None:
+        return redirect
+    normalized_symbol = _normalize_symbol(symbol)
+    if not normalized_symbol:
+        set_kid_notice(request, "Enter a ticker symbol to track.", "error")
+        return RedirectResponse("/kid/invest", status_code=302)
+    resolved = lookup_symbol_profile(normalized_symbol)
+    if resolved:
+        resolved_name = resolved.get("name") or normalized_symbol
+        resolved_kind = resolved.get("kind") or kind
+    else:
+        resolved_name = name.strip() or normalized_symbol
+        resolved_kind = kind if kind in {INSTRUMENT_KIND_STOCK, INSTRUMENT_KIND_CRYPTO} else INSTRUMENT_KIND_STOCK
+    instrument = add_market_instrument(normalized_symbol, resolved_name, resolved_kind)
+    if not instrument:
+        set_kid_notice(request, "Could not add that symbol.", "error")
+        return RedirectResponse("/kid/invest", status_code=302)
+    set_kid_notice(request, f"Tracking {instrument.symbol}.", "success")
+    next_range = normalize_history_range(range_code)
+    return RedirectResponse(f"/kid/invest?symbol={instrument.symbol}&range={next_range}", status_code=302)
+
+
 @app.post("/kid/invest/buy")
-def kid_invest_buy(request: Request, amount: str = Form(...), symbol: str = Form(DEFAULT_MARKET_SYMBOL)):
+def kid_invest_buy(
+    request: Request,
+    amount: str = Form(...),
+    symbol: str = Form(DEFAULT_MARKET_SYMBOL),
+    range_code: str = Form(DEFAULT_PRICE_RANGE),
+):
     if (redirect := require_kid(request)) is not None:
         return redirect
     kid_id = kid_authed(request)
     assert kid_id
+    next_range = normalize_history_range(range_code)
     amount_c = to_cents_from_dollars_str(amount, 0)
     if amount_c <= 0:
-        return RedirectResponse(f"/kid/invest?symbol={symbol}", status_code=302)
+        return RedirectResponse(f"/kid/invest?symbol={symbol}&range={next_range}", status_code=302)
     normalized_symbol = _normalize_symbol(symbol)
     price_c = market_price_cents(normalized_symbol)
     if price_c <= 0:
-        return RedirectResponse(f"/kid/invest?symbol={symbol}", status_code=302)
+        return RedirectResponse(f"/kid/invest?symbol={symbol}&range={next_range}", status_code=302)
     price = price_c / 100.0
     with Session(engine) as session:
         child = session.exec(select(Child).where(Child.kid_id == kid_id)).first()
         if not child or amount_c > child.balance_cents:
-            return RedirectResponse(f"/kid/invest?symbol={symbol}", status_code=302)
+            return RedirectResponse(f"/kid/invest?symbol={symbol}&range={next_range}", status_code=302)
         shares = (amount_c / 100.0) / price
         holding = session.exec(
             select(Investment).where(Investment.kid_id == kid_id, Investment.fund == normalized_symbol)
@@ -2726,22 +3054,28 @@ def kid_invest_buy(request: Request, amount: str = Form(...), symbol: str = Form
             )
         )
         session.commit()
-    return RedirectResponse(f"/kid/invest?symbol={symbol}", status_code=302)
+    return RedirectResponse(f"/kid/invest?symbol={symbol}&range={next_range}", status_code=302)
 
 
 @app.post("/kid/invest/sell")
-def kid_invest_sell(request: Request, amount: str = Form(...), symbol: str = Form(DEFAULT_MARKET_SYMBOL)):
+def kid_invest_sell(
+    request: Request,
+    amount: str = Form(...),
+    symbol: str = Form(DEFAULT_MARKET_SYMBOL),
+    range_code: str = Form(DEFAULT_PRICE_RANGE),
+):
     if (redirect := require_kid(request)) is not None:
         return redirect
     kid_id = kid_authed(request)
     assert kid_id
+    next_range = normalize_history_range(range_code)
     amount_c = to_cents_from_dollars_str(amount, 0)
     if amount_c <= 0:
-        return RedirectResponse(f"/kid/invest?symbol={symbol}", status_code=302)
+        return RedirectResponse(f"/kid/invest?symbol={symbol}&range={next_range}", status_code=302)
     normalized_symbol = _normalize_symbol(symbol)
     price_c = market_price_cents(normalized_symbol)
     if price_c <= 0:
-        return RedirectResponse(f"/kid/invest?symbol={symbol}", status_code=302)
+        return RedirectResponse(f"/kid/invest?symbol={symbol}&range={next_range}", status_code=302)
     price = price_c / 100.0
     with Session(engine) as session:
         holding = session.exec(
@@ -2749,12 +3083,12 @@ def kid_invest_sell(request: Request, amount: str = Form(...), symbol: str = For
         ).first()
         child = session.exec(select(Child).where(Child.kid_id == kid_id)).first()
         if not holding or not child or holding.shares <= 0:
-            return RedirectResponse(f"/kid/invest?symbol={symbol}", status_code=302)
+            return RedirectResponse(f"/kid/invest?symbol={symbol}&range={next_range}", status_code=302)
         need_shares = (amount_c / 100.0) / price
         sell_shares = min(holding.shares, need_shares)
         proceeds_c = int(round(sell_shares * price * 100))
         if sell_shares <= 0 or proceeds_c <= 0:
-            return RedirectResponse(f"/kid/invest?symbol={symbol}", status_code=302)
+            return RedirectResponse(f"/kid/invest?symbol={symbol}&range={next_range}", status_code=302)
         txs = session.exec(
             select(InvestmentTx)
             .where(InvestmentTx.kid_id == kid_id, InvestmentTx.fund == normalized_symbol)
@@ -2798,7 +3132,7 @@ def kid_invest_sell(request: Request, amount: str = Form(...), symbol: str = For
             )
         )
         session.commit()
-    return RedirectResponse(f"/kid/invest?symbol={symbol}", status_code=302)
+    return RedirectResponse(f"/kid/invest?symbol={symbol}&range={next_range}", status_code=302)
 
 
 @app.post("/kid/invest/cd/open")
@@ -2885,6 +3219,44 @@ def kid_invest_cd_mature(request: Request):
             session.commit()
         else:
             session.rollback()
+    return RedirectResponse("/kid/invest", status_code=302)
+
+
+@app.post("/kid/invest/cd/cashout")
+def kid_invest_cd_cashout(request: Request, certificate_id: int = Form(...)):
+    if (redirect := require_kid(request)) is not None:
+        return redirect
+    kid_id = kid_authed(request)
+    assert kid_id
+    with Session(engine) as session:
+        child = session.exec(select(Child).where(Child.kid_id == kid_id)).first()
+        certificate = session.get(Certificate, certificate_id)
+        if not child or not certificate or certificate.kid_id != kid_id:
+            return RedirectResponse("/kid/invest", status_code=302)
+        if certificate.matured_at is not None:
+            session.delete(certificate)
+            session.commit()
+            set_kid_notice(request, "Removed the cashed-out certificate.", "success")
+            return RedirectResponse("/kid/invest", status_code=302)
+        moment = datetime.utcnow()
+        maturity = certificate_maturity_date(certificate)
+        if moment < maturity:
+            return RedirectResponse(f"/kid/invest/cd/sell?certificate_id={certificate.id}", status_code=302)
+        payout_c = certificate_maturity_value_cents(certificate)
+        certificate.matured_at = moment
+        child.balance_cents += payout_c
+        child.updated_at = datetime.utcnow()
+        session.add(child)
+        session.add(certificate)
+        session.add(
+            Event(
+                child_id=kid_id,
+                change_cents=payout_c,
+                reason=f"invest_cd_mature:1x",
+            )
+        )
+        session.commit()
+    set_kid_notice(request, "Cashed out your certificate!", "success")
     return RedirectResponse("/kid/invest", status_code=302)
 
 
@@ -3019,7 +3391,8 @@ def admin_logout(request: Request):
 def _role_badge(role: Optional[str]) -> str:
     if not role:
         return ""
-    return f"<span class='pill'>Signed in as {role.title()}</span>"
+    label = parent_role_label(role)
+    return f"<span class='pill'>Signed in as {html_escape(label)}</span>"
 
 
 def _kid_options(kids: Iterable[Child]) -> str:
@@ -3044,6 +3417,14 @@ def admin_home(request: Request):
             .where(Chore.kid_id == Child.kid_id)
             .order_by(desc(ChoreInstance.completed_at))
         ).all()
+        global_pending = session.exec(
+            select(GlobalChoreClaim, Child, Chore)
+            .where(GlobalChoreClaim.chore_id == Chore.id)
+            .where(Chore.kid_id == GLOBAL_CHORE_KID_ID)
+            .where(Child.kid_id == GlobalChoreClaim.kid_id)
+            .where(GlobalChoreClaim.status == GLOBAL_CHORE_STATUS_PENDING)
+            .order_by(desc(GlobalChoreClaim.submitted_at))
+        ).all()
         bonus_on_all = MetaDAO.get(session, "rule_bonus_all_complete") == "1"
         bonus_cents = int(MetaDAO.get(session, "rule_bonus_cents") or "0")
         penalty_on_miss = MetaDAO.get(session, "rule_penalty_on_miss") == "1"
@@ -3061,6 +3442,7 @@ def admin_home(request: Request):
         ).all()
         instruments = list_market_instruments(session)
         time_settings = get_time_settings(session)
+        parent_admins = all_parent_admins(session)
     kids_rows = "".join(
         f"<tr>"
         f"<td data-label='Child'><b>{child.name}</b><div class='muted'>{child.kid_id} • Level {child.level} • Streak {child.streak_days} • {_badges_html(child.badges)}</div></td>"
@@ -3095,6 +3477,14 @@ def admin_home(request: Request):
         f"</td></tr>"
         for prize in prizes
     ) or "<tr><td>(no prizes yet)</td></tr>"
+    parent_options_html = "".join(
+        f"<option value='{admin['role']}'>{html_escape(admin['label'])}</option>"
+        for admin in parent_admins
+    )
+    admin_list_html = "".join(
+        f"<li>{html_escape(admin['label'])} <span class='muted'>({admin['role']})</span></li>"
+        for admin in parent_admins
+    ) or "<li class='muted'>(none yet)</li>"
     event_rows = "".join(
         f"<tr><td data-label='When'>{event.timestamp.strftime('%Y-%m-%d %H:%M')}</td>"
         f"<td data-label='Kid'>{event.child_id}</td>"
@@ -3102,7 +3492,7 @@ def admin_home(request: Request):
         f"<td data-label='Reason'>{event.reason}</td></tr>"
         for event in events
     ) or "<tr><td>(no events yet)</td></tr>"
-    pending_rows = "".join(
+    pending_rows_parts = [
         f"<tr>"
         f"<td data-label='Kid'><b>{child.name}</b><div class='muted'>{child.kid_id}</div></td>"
         f"<td data-label='Chore'><b>{chore.name}</b><div class='muted'>{chore.type}</div></td>"
@@ -3118,7 +3508,21 @@ def admin_home(request: Request):
         f"<input type='hidden' name='instance_id' value='{inst.id}'><button type='submit' class='danger'>Deny</button></form>"
         f"</td></tr>"
         for inst, chore, child in pending
-    ) or "<tr><td>(no pending)</td></tr>"
+    ]
+    pending_rows_parts.extend(
+        [
+            f"<tr>"
+            f"<td data-label='Kid'><b>{child.name}</b><div class='muted'>{child.kid_id}</div></td>"
+            f"<td data-label='Chore'><b>{chore.name}</b><div class='muted'>Free-for-all ({claim.period_key})</div></td>"
+            f"<td data-label='Award' class='right'><b>{usd(chore.award_cents)}</b></td>"
+            f"<td data-label='Completed'>{claim.submitted_at.strftime('%Y-%m-%d %H:%M')}</td>"
+            f"<td data-label='Actions' class='right'>"
+            f"<a href='/admin/chores?kid_id={GLOBAL_CHORE_KID_ID}'><button type='button'>Review</button></a>"
+            f"</td></tr>"
+            for claim, child, chore in global_pending
+        ]
+    )
+    pending_rows = "".join(pending_rows_parts) or "<tr><td>(no pending)</td></tr>"
     goals_rows = "".join(
         f"<tr>"
         f"<td data-label='Kid'><b>{child.name}</b><div class='muted'>{child.kid_id}</div></td>"
@@ -3331,15 +3735,22 @@ def admin_home(request: Request):
       <div class='card'>
         <h3>Parent PINs</h3>
         <form method='post' action='/admin/set_parent_pin'>
-          <label>Parent</label>
-          <select name='role'>
-            <option value='mom'>Mom</option>
-            <option value='dad'>Dad</option>
-          </select>
+          <label>Admin</label>
+          <select name='role'>{parent_options_html}</select>
           <label style='margin-top:6px;'>New PIN</label><input name='new_pin' type='password' placeholder='****' autocomplete='new-password' required>
           <label style='margin-top:6px;'>Confirm PIN</label><input name='confirm_pin' type='password' placeholder='****' autocomplete='new-password' required>
           <button type='submit' style='margin-top:10px;'>Update PIN</button>
         </form>
+        <form method='post' action='/admin/add_parent_admin' style='margin-top:12px;'>
+          <label>Display name</label><input name='label' placeholder='Grandma' required>
+          <label style='margin-top:6px;'>PIN</label><input name='pin' type='password' placeholder='****' autocomplete='new-password' required>
+          <label style='margin-top:6px;'>Confirm PIN</label><input name='confirm_pin' type='password' placeholder='****' autocomplete='new-password' required>
+          <button type='submit' style='margin-top:10px;'>Add Admin</button>
+        </form>
+        <div style='margin-top:10px;'>
+          <div class='muted'>Current admins</div>
+          <ul style='margin:6px 0 0 18px; padding:0;'>{admin_list_html}</ul>
+        </div>
         <p class='muted' style='margin-top:6px;'>Updates override the default environment values immediately.</p>
       </div>
       {time_card}
@@ -3350,12 +3761,13 @@ def admin_home(request: Request):
       {investing_card}
       <div class='card'>
         <h3>Chores</h3>
+        <p style='margin-bottom:8px;'><a href='/admin/chores?kid_id={GLOBAL_CHORE_KID_ID}'><button type='button'>Manage Global Chores</button></a></p>
         <form method='post' action='/admin/chores/create'>
           <label>kid_id</label>
           <select name='kid_id' required>{_kid_options(kids)}<option value='{GLOBAL_CHORE_KID_ID}'>Global (Free-for-all)</option></select>
           <label style='margin-top:6px;'>Name</label><input name='name' placeholder='Take out trash' required>
           <div class='grid' style='grid-template-columns:repeat(auto-fit,minmax(140px,1fr)); gap:8px; margin-top:6px;'>
-            <div><label>Type</label><select name='type'><option value='daily'>Daily</option><option value='weekly'>Weekly</option><option value='special'>Special</option><option value='global'>Global</option></select></div>
+            <div><label>Type</label><select name='type'><option value='daily'>Daily</option><option value='weekly'>Weekly</option><option value='monthly'>Monthly</option><option value='special'>Special</option></select></div>
             <div><label>Award (dollars)</label><input name='award' type='text' data-money value='0.50'></div>
             <div><label>Max claimants (global)</label><input name='max_claimants' type='number' min='1' value='1'></div>
           </div>
@@ -3528,12 +3940,21 @@ def admin_manage_chores(request: Request, kid_id: str = Query(...)):
             f"<input name='specific_dates' placeholder='YYYY-MM-DD,YYYY-MM-DD' value='{specific_value}' style='margin-top:6px;'>"
         )
         is_global_chore = chore.kid_id == GLOBAL_CHORE_KID_ID
+        chore_type = normalize_chore_type(chore.type, is_global=is_global_chore)
         action_html = "<button type='submit'>Save</button></form> "
         if not is_global_chore:
             action_html += (
                 "<form class='inline' method='post' action='/admin/chore_make_available_now' style='margin-left:6px;'>"
                 f"<input type='hidden' name='chore_id' value='{chore.id}'><button type='submit'>Make Available Now</button></form> "
             )
+        if is_global_chore:
+            type_options = ["daily", "weekly", "monthly"]
+        else:
+            type_options = ["daily", "weekly", "monthly", "special"]
+        type_select = "".join(
+            f"<option value='{opt}' {'selected' if chore_type == opt else ''}>{opt}</option>"
+            for opt in type_options
+        )
         action_html += (
             "<form class='inline' method='post' action='/admin/chores/deactivate' style='margin-left:6px;'>"
             f"<input type='hidden' name='chore_id' value='{chore.id}'><button type='submit' class='danger'>Deactivate</button></form>"
@@ -3547,12 +3968,7 @@ def admin_manage_chores(request: Request, kid_id: str = Query(...)):
             f"<td data-label='Name'><form class='inline' method='post' action='/admin/chores/update'>"
             f"<input type='hidden' name='chore_id' value='{chore.id}'>"
             f"<input name='name' value='{name_value}'></td>"
-            f"<td data-label='Type'><select name='type'>"
-            f"<option value='daily' {'selected' if chore.type == 'daily' else ''}>daily</option>"
-            f"<option value='weekly' {'selected' if chore.type == 'weekly' else ''}>weekly</option>"
-            f"<option value='special' {'selected' if chore.type == 'special' else ''}>special</option>"
-            f"<option value='global' {'selected' if chore.type == 'global' else ''}>global</option>"
-            f"</select></td>"
+            f"<td data-label='Type'><select name='type'>{type_select}</select></td>"
             f"<td data-label='Award ($)' class='right'><input name='award' type='text' data-money value='{dollars_value(chore.award_cents)}' style='max-width:120px'></td>"
             f"<td data-label='Max Spots'><input name='max_claimants' type='number' min='1' value='{max(1, chore.max_claimants)}' style='max-width:120px'></td>"
             f"<td data-label='Schedule'>{schedule_html}</td>"
@@ -3690,11 +4106,13 @@ def admin_chore_create(
     max_claims_value = max(1, max_claims_value)
     weekday_csv = serialize_weekday_selection(weekdays) if weekdays else None
     dates_csv = serialize_specific_dates(specific_dates) if specific_dates else None
+    kid_value = (kid_id or "").strip()
+    normalized_type = normalize_chore_type(type, is_global=kid_value == GLOBAL_CHORE_KID_ID)
     with Session(engine) as session:
         chore = Chore(
-            kid_id=(kid_id or "").strip(),
+            kid_id=kid_value,
             name=name.strip(),
-            type=type,
+            type=normalized_type,
             award_cents=award_c,
             notes=notes.strip() or None,
             start_date=date.fromisoformat(start_date) if start_date else None,
@@ -3736,8 +4154,10 @@ def admin_chore_update(
         chore = session.get(Chore, chore_id)
         if not chore:
             return RedirectResponse("/admin", status_code=302)
+        normalized_type = normalize_chore_type(type, is_global=chore.kid_id == GLOBAL_CHORE_KID_ID)
+        target_kid = chore.kid_id
         chore.name = name.strip()
-        chore.type = type
+        chore.type = normalized_type
         chore.award_cents = award_c
         chore.notes = notes.strip() or None
         chore.start_date = date.fromisoformat(start_date) if start_date else None
@@ -3747,7 +4167,7 @@ def admin_chore_update(
         chore.specific_dates = dates_csv
         session.add(chore)
         session.commit()
-    return RedirectResponse(f"/admin/chores?kid_id={chore.kid_id}", status_code=302)
+    return RedirectResponse(f"/admin/chores?kid_id={target_kid}", status_code=302)
 
 
 @app.post("/admin/global_chore/claims")
@@ -3812,6 +4232,17 @@ async def admin_global_chore_claims(request: Request):
                 claim.approved_at = now
                 claim.approved_by = role
                 session.add(claim)
+                child = session.exec(select(Child).where(Child.kid_id == claim.kid_id)).first()
+                if child:
+                    child.updated_at = now
+                    session.add(child)
+                    session.add(
+                        Event(
+                            child_id=child.kid_id,
+                            change_cents=0,
+                            reason=f"global_chore_denied:{chore.name}:{period_key}",
+                        )
+                    )
             session.commit()
             return RedirectResponse(f"/admin/chores?kid_id={GLOBAL_CHORE_KID_ID}", status_code=302)
         if len(claims) > remaining_slots:
@@ -3853,16 +4284,16 @@ async def admin_global_chore_claims(request: Request):
             claim.approved_at = now
             claim.approved_by = role
             session.add(claim)
-            if award_cents > 0:
-                child = session.exec(select(Child).where(Child.kid_id == claim.kid_id)).first()
-                if child:
+            child = session.exec(select(Child).where(Child.kid_id == claim.kid_id)).first()
+            if child:
+                if award_cents > 0:
                     child.balance_cents += award_cents
-                    child.updated_at = now
                     _update_gamification(child, award_cents)
-                    reason = f"global_chore:{chore.name}:{period_key}"
-                    event = Event(child_id=child.kid_id, change_cents=award_cents, reason=reason)
-                    session.add(event)
-                    session.add(child)
+                child.updated_at = now
+                reason = f"global_chore:{chore.name}:{period_key}"
+                event = Event(child_id=child.kid_id, change_cents=award_cents, reason=reason)
+                session.add(event)
+                session.add(child)
         session.commit()
     return RedirectResponse(f"/admin/chores?kid_id={GLOBAL_CHORE_KID_ID}", status_code=302)
 
@@ -3875,10 +4306,11 @@ def admin_chore_activate(request: Request, chore_id: int = Form(...)):
         chore = session.get(Chore, chore_id)
         if not chore:
             return RedirectResponse("/admin", status_code=302)
+        target_kid = chore.kid_id
         chore.active = True
         session.add(chore)
         session.commit()
-    return RedirectResponse(f"/admin/chores?kid_id={chore.kid_id}", status_code=302)
+    return RedirectResponse(f"/admin/chores?kid_id={target_kid}", status_code=302)
 
 
 @app.post("/admin/chores/deactivate")
@@ -3889,10 +4321,11 @@ def admin_chore_deactivate(request: Request, chore_id: int = Form(...)):
         chore = session.get(Chore, chore_id)
         if not chore:
             return RedirectResponse("/admin", status_code=302)
+        target_kid = chore.kid_id
         chore.active = False
         session.add(chore)
         session.commit()
-    return RedirectResponse(f"/admin/chores?kid_id={chore.kid_id}", status_code=302)
+    return RedirectResponse(f"/admin/chores?kid_id={target_kid}", status_code=302)
 
 
 @app.post("/admin/chore_make_available_now")
@@ -3908,7 +4341,8 @@ def chore_make_available_now(request: Request, chore_id: int = Form(...)):
         kid_id = chore.kid_id
         if not is_chore_in_window(chore, today):
             return RedirectResponse(f"/admin/chores?kid_id={kid_id}", status_code=302)
-        pk = "SPECIAL" if chore.type == "special" else period_key_for(chore.type, moment)
+        chore_type = normalize_chore_type(chore.type)
+        pk = "SPECIAL" if chore_type == "special" else period_key_for(chore_type, moment)
         instance = ChoreInstance(chore_id=chore.id, period_key=pk, status="available")
         session.add(instance)
         session.commit()
@@ -4266,8 +4700,9 @@ def admin_set_parent_pin(
     if (redirect := require_admin(request)) is not None:
         return redirect
     normalized_role = (role or "").lower()
-    if normalized_role not in PARENT_ROLES:
-        body = "<div class='card'><p style='color:#ff6b6b;'>Choose mom or dad when updating the parent PIN.</p><p><a href='/admin'>Back</a></p></div>"
+    available_roles = {admin["role"] for admin in all_parent_admins()}
+    if normalized_role not in available_roles:
+        body = "<div class='card'><p style='color:#ff6b6b;'>Select an existing admin before updating the PIN.</p><p><a href='/admin'>Back</a></p></div>"
         return HTMLResponse(frame("Admin", body))
     pin_value = (new_pin or "").strip()
     confirmation = (confirm_pin or "").strip()
@@ -4278,6 +4713,44 @@ def admin_set_parent_pin(
         body = "<div class='card'><p style='color:#ff6b6b;'>Confirmation PIN does not match.</p><p><a href='/admin'>Back</a></p></div>"
         return HTMLResponse(frame("Admin", body))
     set_parent_pin(normalized_role, pin_value)
+    return RedirectResponse("/admin", status_code=302)
+
+
+@app.post("/admin/add_parent_admin")
+def admin_add_parent_admin(
+    request: Request,
+    label: str = Form(...),
+    pin: str = Form(...),
+    confirm_pin: str = Form(...),
+):
+    if (redirect := require_admin(request)) is not None:
+        return redirect
+    display_name = (label or "").strip()
+    pin_value = (pin or "").strip()
+    confirmation = (confirm_pin or "").strip()
+    if not display_name:
+        body = "<div class='card'><p style='color:#ff6b6b;'>Enter a name for the new admin.</p><p><a href='/admin'>Back</a></p></div>"
+        return HTMLResponse(frame("Admin", body))
+    if not pin_value:
+        body = "<div class='card'><p style='color:#ff6b6b;'>Enter a PIN for the new admin.</p><p><a href='/admin'>Back</a></p></div>"
+        return HTMLResponse(frame("Admin", body))
+    if pin_value != confirmation:
+        body = "<div class='card'><p style='color:#ff6b6b;'>Confirmation PIN does not match.</p><p><a href='/admin'>Back</a></p></div>"
+        return HTMLResponse(frame("Admin", body))
+    base_key = _normalize_parent_role_key(display_name)
+    with Session(engine) as session:
+        existing = {admin["role"] for admin in all_parent_admins(session)}
+        slug = base_key
+        suffix = 1
+        while slug in existing:
+            suffix += 1
+            slug = f"{base_key}{suffix}"
+        extras = _load_extra_parent_admins(session)
+        extras = [entry for entry in extras if entry["role"] not in DEFAULT_PARENT_ROLES]
+        extras.append({"role": slug, "label": display_name})
+        MetaDAO.set(session, EXTRA_PARENT_ADMINS_KEY, json.dumps(extras))
+        MetaDAO.set(session, _parent_pin_meta_key(slug), pin_value)
+        session.commit()
     return RedirectResponse("/admin", status_code=302)
 
 
@@ -4454,9 +4927,9 @@ def admin_chore_payout(request: Request, instance_id: int = Form(...), amount: s
             return RedirectResponse("/admin", status_code=302)
         raw_amount = (amount or "").strip()
         if not raw_amount:
-            body = "<div class='card'><p style='color:#ff6b6b;'>Enter an override amount before approving the payout.</p><p><a href='/admin'>Back to admin</a></p></div>"
-            return HTMLResponse(frame("Admin", body), status_code=400)
-        payout_c = to_cents_from_dollars_str(raw_amount, chore.award_cents)
+            payout_c = chore.award_cents
+        else:
+            payout_c = to_cents_from_dollars_str(raw_amount, chore.award_cents)
         payout_c = max(0, payout_c)
         child.balance_cents += payout_c
         child.updated_at = datetime.utcnow()
