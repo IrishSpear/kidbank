@@ -152,6 +152,7 @@ class Certificate(SQLModel, table=True):
     principal_cents: int
     rate_bps: int
     term_months: int
+    term_days: int = 0
     opened_at: datetime = Field(default_factory=datetime.utcnow)
     matured_at: Optional[datetime] = None
     penalty_days: int = 0
@@ -215,6 +216,20 @@ def run_migrations() -> None:
             raw.execute("ALTER TABLE choreinstance ADD COLUMN created_at TEXT;")
         if not _column_exists(raw, "goal", "achieved_at"):
             raw.execute("ALTER TABLE goal ADD COLUMN achieved_at TEXT;")
+        if not _column_exists(raw, "certificate", "term_days"):
+            raw.execute("ALTER TABLE certificate ADD COLUMN term_days INTEGER DEFAULT 0;")
+            raw.execute(
+                """
+                UPDATE certificate
+                SET term_days = (
+                    CASE
+                        WHEN term_months IS NULL OR term_months < 0 THEN 0
+                        ELSE term_months * 30
+                    END
+                )
+                WHERE IFNULL(term_days, 0) = 0;
+                """
+            )
         if not _column_exists(raw, "certificate", "penalty_days"):
             raw.execute("ALTER TABLE certificate ADD COLUMN penalty_days INTEGER DEFAULT 0;")
         raw.execute(
@@ -235,6 +250,7 @@ def run_migrations() -> None:
                 principal_cents INTEGER,
                 rate_bps INTEGER,
                 term_months INTEGER,
+                term_days INTEGER DEFAULT 0,
                 opened_at TEXT,
                 matured_at TEXT,
                 penalty_days INTEGER DEFAULT 0
@@ -272,6 +288,16 @@ CD_RATE_KEY = "cd_rate_bps"
 CD_PENALTY_DAYS_KEY = "cd_penalty_days"
 DEFAULT_CD_RATE_BPS = 250
 DEFAULT_CD_PENALTY_DAYS = 0
+DEFAULT_CD_TERM_CODE = "12m"
+CD_TERM_OPTIONS: List[Tuple[str, str, int]] = [
+    ("7d", "1 week", 7),
+    ("3m", "3 months", 90),
+    ("6m", "6 months", 180),
+    ("12m", "12 months", 360),
+]
+CD_TERM_LOOKUP: Dict[str, Tuple[str, int]] = {
+    code: (label, days) for code, label, days in CD_TERM_OPTIONS
+}
 
 
 def usd(cents: int) -> str:
@@ -674,8 +700,71 @@ def get_cd_penalty_days(session: Session) -> int:
     return max(0, days)
 
 
+def resolve_certificate_term(selection: str) -> Tuple[str, int, int]:
+    choice = (selection or "").strip().lower()
+    if choice in CD_TERM_LOOKUP:
+        _, days = CD_TERM_LOOKUP[choice]
+        months = days // 30 if days % 30 == 0 else 0
+        return choice, days, months
+    if choice.endswith("m") and choice[:-1].isdigit():
+        months = max(1, int(choice[:-1]))
+        days = months * 30
+        return f"{months}m", days, months
+    if choice.endswith("w") and choice[:-1].isdigit():
+        weeks = max(1, int(choice[:-1]))
+        days = weeks * 7
+        return f"{weeks}w", days, 0
+    if choice.endswith("d") and choice[:-1].isdigit():
+        days = max(1, int(choice[:-1]))
+        months = days // 30 if days % 30 == 0 else 0
+        if months and months * 30 == days:
+            return f"{months}m", days, months
+        return f"{days}d", days, months
+    if choice.isdigit():
+        months = max(1, int(choice))
+        days = months * 30
+        return f"{months}m", days, months
+    _, default_days = CD_TERM_LOOKUP[DEFAULT_CD_TERM_CODE]
+    default_months = default_days // 30 if default_days % 30 == 0 else 0
+    return DEFAULT_CD_TERM_CODE, default_days, default_months
+
+
 def certificate_term_days(certificate: Certificate) -> int:
+    if getattr(certificate, "term_days", 0):
+        return max(0, certificate.term_days)
     return max(0, certificate.term_months) * 30
+
+
+def certificate_term_label(certificate: Certificate) -> str:
+    days = certificate_term_days(certificate)
+    if days <= 0:
+        months = max(0, certificate.term_months)
+        if months > 0:
+            return f"{months} month{'s' if months != 1 else ''}"
+        return "No term"
+    if days % 30 == 0:
+        months = days // 30
+        return f"{months} month{'s' if months != 1 else ''}"
+    if days % 7 == 0:
+        weeks = days // 7
+        return f"{weeks} week{'s' if weeks != 1 else ''}"
+    return f"{days} day{'s' if days != 1 else ''}"
+
+
+def certificate_term_code(certificate: Certificate) -> str:
+    days = certificate_term_days(certificate)
+    if days <= 0:
+        months = max(0, certificate.term_months)
+        if months > 0:
+            return f"{months}m"
+        return "0d"
+    if days % 30 == 0:
+        months = days // 30
+        return f"{months}m"
+    if days % 7 == 0:
+        weeks = days // 7
+        return f"{weeks}w"
+    return f"{days}d"
 
 
 def certificate_maturity_date(certificate: Certificate) -> datetime:
@@ -1791,7 +1880,7 @@ def kid_invest_home(request: Request) -> HTMLResponse:
                 f"<tr>"
                 f"<td data-label='Principal'>{usd(certificate.principal_cents)}</td>"
                 f"<td data-label='Rate'>{rate_display:.2f}%</td>"
-                f"<td data-label='Term'>{certificate.term_months} mo</td>"
+                f"<td data-label='Term'>{certificate_term_label(certificate)}</td>"
                 f"<td data-label='Value Today' class='right'>{usd(value_c)}</td>"
                 f"<td data-label='Progress' class='right'>{progress_text}</td>"
                 f"<td data-label='Status'>{status}</td>"
@@ -1825,6 +1914,11 @@ def kid_invest_home(request: Request) -> HTMLResponse:
                 "<button type='submit'>Cash out matured</button>"
                 "</form>"
             )
+
+        term_options_html = "".join(
+            f"<option value='{code}'{' selected' if code == DEFAULT_CD_TERM_CODE else ''}>{label}</option>"
+            for code, label, _ in CD_TERM_OPTIONS
+        )
 
         inner = f"""
         <div class='card'>
@@ -1868,10 +1962,8 @@ def kid_invest_home(request: Request) -> HTMLResponse:
           <form method='post' action='/kid/invest/cd/open' class='inline'>
             <input name='amount' type='text' data-money placeholder='amount $' required>
             <label style='margin-left:6px;'>Term</label>
-            <select name='term_months'>
-              <option value='3'>3 months</option>
-              <option value='6'>6 months</option>
-              <option value='12' selected>12 months</option>
+            <select name='term_choice'>
+              {term_options_html}
             </select>
             <button type='submit' style='margin-left:6px;'>Lock Savings</button>
           </form>
@@ -1999,14 +2091,14 @@ def kid_invest_sell(request: Request, amount: str = Form(...)):
 def kid_invest_cd_open(
     request: Request,
     amount: str = Form(...),
-    term_months: int = Form(...),
+    term_choice: str = Form(...),
 ):
     if (redirect := require_kid(request)) is not None:
         return redirect
     kid_id = kid_authed(request)
     assert kid_id
     amount_c = to_cents_from_dollars_str(amount, 0)
-    term = max(1, int(term_months))
+    term_code, term_days, term_months_value = resolve_certificate_term(term_choice)
     if amount_c <= 0:
         return RedirectResponse("/kid/invest", status_code=302)
     with Session(engine) as session:
@@ -2019,7 +2111,8 @@ def kid_invest_cd_open(
             kid_id=kid_id,
             principal_cents=amount_c,
             rate_bps=rate_bps,
-            term_months=term,
+            term_months=term_months_value,
+            term_days=term_days,
             opened_at=datetime.utcnow(),
             penalty_days=penalty_days,
         )
@@ -2032,7 +2125,7 @@ def kid_invest_cd_open(
             Event(
                 child_id=kid_id,
                 change_cents=-amount_c,
-                reason=f"invest_cd_open:{term}m @ {rate_pct:.2f}%",
+                reason=f"invest_cd_open:{term_code} @ {rate_pct:.2f}%",
             )
         )
         session.commit()
@@ -2115,7 +2208,7 @@ def kid_invest_cd_sell_confirm(request: Request, certificate_id: int = Query(...
       <div style='display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:8px; margin-top:12px;'>
         <div><b>Principal</b><div>{usd(certificate.principal_cents)}</div></div>
         <div><b>Rate</b><div>{rate_display:.2f}% APR</div></div>
-        <div><b>Term</b><div>{certificate.term_months} months</div></div>
+        <div><b>Term</b><div>{certificate_term_label(certificate)}</div></div>
         <div><b>Value today</b><div>{usd(gross_c)}</div></div>
         <div><b>Penalty if sold</b><div>{usd(penalty_c)}</div></div>
         <div><b>Net to balance</b><div>{usd(net_c)}</div></div>
@@ -2157,7 +2250,7 @@ def kid_invest_cd_sell(request: Request, certificate_id: int = Form(...)):
             Event(
                 child_id=kid_id,
                 change_cents=gross_c,
-                reason=f"invest_cd_sell_{status_tag}:{certificate.term_months}m",
+                reason=f"invest_cd_sell_{status_tag}:{certificate_term_code(certificate)}",
             )
         )
         if penalty_c > 0:
@@ -2824,7 +2917,7 @@ def admin_statement(request: Request, kid_id: str = Query(...)):
             f"<tr>"
             f"<td data-label='Principal'>{usd(certificate.principal_cents)}</td>"
             f"<td data-label='Rate'>{rate_display:.2f}%</td>"
-            f"<td data-label='Term'>{certificate.term_months} mo</td>"
+            f"<td data-label='Term'>{certificate_term_label(certificate)}</td>"
             f"<td data-label='Value' class='right'>{usd(value_c)}</td>"
             f"<td data-label='Progress' class='right'>{format_percent(progress_pct)}</td>"
             f"<td data-label='Status'>{status}</td>"

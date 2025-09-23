@@ -10,6 +10,10 @@ from kidbank.webapp import (  # noqa: E402
     Certificate,
     certificate_penalty_cents,
     certificate_sale_breakdown_cents,
+    certificate_term_days,
+    certificate_maturity_date,
+    certificate_value_cents,
+    certificate_maturity_value_cents,
 )
 
 
@@ -50,3 +54,24 @@ def test_certificate_penalty_ignored_after_maturity() -> None:
     assert certificate_penalty_cents(certificate, at=moment) == 0
     certificate.matured_at = moment
     assert certificate_penalty_cents(certificate, at=moment) == 0
+
+
+def test_certificate_one_week_term_uses_days() -> None:
+    opened_at = datetime.utcnow() - timedelta(days=5)
+    certificate = Certificate(
+        id=3,
+        kid_id="cody",
+        principal_cents=10_000,
+        rate_bps=200,
+        term_months=0,
+        term_days=7,
+        opened_at=opened_at,
+        penalty_days=3,
+    )
+
+    assert certificate_term_days(certificate) == 7
+    assert certificate_maturity_date(certificate) == opened_at + timedelta(days=7)
+    mid_value = certificate_value_cents(certificate, at=opened_at + timedelta(days=3))
+    mature_value = certificate_maturity_value_cents(certificate)
+
+    assert certificate.principal_cents < mid_value < mature_value
