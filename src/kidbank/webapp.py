@@ -23,6 +23,8 @@ import math
 import os
 import re
 import sqlite3
+import statistics
+import textwrap
 from decimal import Decimal, ROUND_HALF_UP
 from datetime import date, datetime, timedelta
 from html import escape as html_escape
@@ -33,7 +35,7 @@ from urllib.request import Request as URLRequest, urlopen
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, Form, Query, Request
-from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse, JSONResponse, Response
 from sqlmodel import Field, Session, SQLModel, create_engine, desc, select
 from starlette.middleware.sessions import SessionMiddleware
 
@@ -51,6 +53,96 @@ DEFAULT_PARENT_LABELS: Dict[str, str] = {"mom": "Mom", "dad": "Dad"}
 EXTRA_PARENT_ADMINS_KEY = "parent_admins"
 GLOBAL_CHORE_TYPES: Tuple[str, ...] = ("daily", "weekly", "monthly")
 DEFAULT_GLOBAL_CHORE_TYPE = "daily"
+PWA_CACHE_NAME = "kidbank-shell-v1"
+PWA_SHELL_PATHS: Tuple[str, ...] = (
+    "/",
+    "/kid",
+    "/admin",
+    "/admin/login",
+    "/manifest.webmanifest",
+    "/pwa-icon.svg",
+    "/offline",
+)
+PWA_ICON_SVG = """
+<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 128 128'>
+  <defs>
+    <linearGradient id='grad' x1='0' x2='1' y1='0' y2='1'>
+      <stop offset='0%' stop-color='#2563eb'/>
+      <stop offset='100%' stop-color='#1d4ed8'/>
+    </linearGradient>
+  </defs>
+  <rect width='128' height='128' rx='28' ry='28' fill='url(#grad)'/>
+  <text x='64' y='82' font-size='64' font-family='Roboto, Arial, sans-serif' font-weight='700' fill='#f8fafc' text-anchor='middle'>K</text>
+</svg>
+"""
+SERVICE_WORKER_JS = (
+    textwrap.dedent(
+        """
+        const CACHE_NAME = '__CACHE_NAME__';
+        const OFFLINE_URLS = __OFFLINE_URLS__;
+
+        self.addEventListener('install', event => {
+          event.waitUntil(
+            caches.open(CACHE_NAME).then(cache => cache.addAll(OFFLINE_URLS)).then(() => self.skipWaiting())
+          );
+        });
+
+        self.addEventListener('activate', event => {
+          event.waitUntil(
+            caches.keys().then(keys => Promise.all(keys.filter(key => key !== CACHE_NAME).map(key => caches.delete(key))))
+          );
+          self.clients.claim();
+        });
+
+        async function fetchAndCache(request) {
+          try {
+            const response = await fetch(request);
+            if (!response || response.status !== 200 || response.type !== 'basic') {
+              return response;
+            }
+            const clone = response.clone();
+            caches.open(CACHE_NAME).then(cache => cache.put(request, clone));
+            return response;
+          } catch (error) {
+            throw error;
+          }
+        }
+
+        self.addEventListener('fetch', event => {
+          if (event.request.method !== 'GET') {
+            return;
+          }
+          const request = event.request;
+          const url = new URL(request.url);
+          if (request.mode === 'navigate') {
+            event.respondWith(
+              fetchAndCache(request).catch(() => caches.match(request).then(resp => resp || caches.match('/offline')))
+            );
+            return;
+          }
+          if (OFFLINE_URLS.includes(url.pathname)) {
+            event.respondWith(
+              caches.match(request).then(resp => resp || fetchAndCache(request))
+            );
+            return;
+          }
+          event.respondWith(
+            fetchAndCache(request).catch(() => caches.match(request))
+          );
+        });
+        """
+    )
+    .strip()
+    .replace("__CACHE_NAME__", PWA_CACHE_NAME)
+    .replace("__OFFLINE_URLS__", json.dumps(list(PWA_SHELL_PATHS)))
+)
+
+
+# ---------------------------------------------------------------------------
+# FastAPI application setup
+# ---------------------------------------------------------------------------
+app = FastAPI(title="Kid Bank")
+app.add_middleware(SessionMiddleware, secret_key=SESSION_SECRET, same_site="lax")
 
 
 _time_provider: Callable[[], datetime] = datetime.now
@@ -70,6 +162,20 @@ engine = create_engine(
     echo=False,
     connect_args={"check_same_thread": False},
 )
+
+# Ensure fresh metadata when re-importing in test contexts.
+SQLModel.metadata.clear()
+
+
+if getattr(Session.__init__, "__name__", "") != "_session_init_no_expire":
+    _SESSION_INIT = Session.__init__
+
+    def _session_init_no_expire(self, *args: Any, **kwargs: Any) -> None:  # pragma: no cover - simple wrapper
+        if "expire_on_commit" not in kwargs:
+            kwargs["expire_on_commit"] = False
+        _SESSION_INIT(self, *args, **kwargs)
+
+    Session.__init__ = _session_init_no_expire  # type: ignore[assignment]
 
 
 class Child(SQLModel, table=True):
@@ -217,6 +323,32 @@ class GlobalChoreClaim(SQLModel, table=True):
     approved_at: Optional[datetime] = None
     approved_by: Optional[str] = None
     notes: Optional[str] = None
+
+
+class Lesson(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    title: str
+    content_md: str
+    summary: Optional[str] = None
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+class Quiz(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    lesson_id: int
+    payload: str
+    reward_cents: int = 0
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+class QuizAttempt(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    child_id: str
+    quiz_id: int
+    score: int = 0
+    max_score: int = 0
+    responses: Optional[str] = None
+    created_at: datetime = Field(default_factory=datetime.utcnow)
 
 
 GLOBAL_CHORE_KID_ID = "__GLOBAL__"
@@ -385,6 +517,41 @@ def run_migrations() -> None:
                 approved_at TEXT,
                 approved_by TEXT,
                 notes TEXT
+            );
+            """
+        )
+        raw.execute(
+            """
+            CREATE TABLE IF NOT EXISTS lesson (
+                id INTEGER PRIMARY KEY,
+                title TEXT,
+                content_md TEXT,
+                summary TEXT,
+                created_at TEXT
+            );
+            """
+        )
+        raw.execute(
+            """
+            CREATE TABLE IF NOT EXISTS quiz (
+                id INTEGER PRIMARY KEY,
+                lesson_id INTEGER,
+                payload TEXT,
+                reward_cents INTEGER DEFAULT 0,
+                created_at TEXT
+            );
+            """
+        )
+        raw.execute(
+            """
+            CREATE TABLE IF NOT EXISTS quizattempt (
+                id INTEGER PRIMARY KEY,
+                child_id TEXT,
+                quiz_id INTEGER,
+                score INTEGER,
+                max_score INTEGER,
+                responses TEXT,
+                created_at TEXT
             );
             """
         )
@@ -588,9 +755,92 @@ def pop_kid_notice(request: Request) -> Tuple[Optional[str], str]:
     return message, kind
 
 
+def current_route_with_query(request: Request) -> str:
+    query = request.url.query
+    return f"{request.url.path}?{query}" if query else request.url.path
+
+
+@app.post("/ui/preferences")
+def set_ui_preferences(
+    request: Request,
+    font: str = Form("default"),
+    contrast: str = Form("standard"),
+    redirect_to: str = Form("/"),
+) -> RedirectResponse:
+    font_pref = font if font in {"default", "dyslexic"} else "default"
+    contrast_pref = contrast if contrast in {"standard", "high"} else "standard"
+    request.session["ui_font"] = font_pref
+    request.session["ui_contrast"] = contrast_pref
+    target = redirect_to if redirect_to.startswith("/") else "/"
+    return RedirectResponse(target, status_code=302)
+
+
 # ---------------------------------------------------------------------------
 # Styling helpers
 # ---------------------------------------------------------------------------
+def body_pref_attrs(request: Optional[Request] = None) -> str:
+    classes = ["touch-friendly"]
+    font_pref = "default"
+    contrast_pref = "standard"
+    if request is not None:
+        font_pref = (request.session.get("ui_font") or "default").strip().lower()
+        contrast_pref = (request.session.get("ui_contrast") or "standard").strip().lower()
+    if font_pref == "dyslexic":
+        classes.append("font-dyslexic")
+    if contrast_pref == "high":
+        classes.append("theme-high-contrast")
+    attrs = [f"class='{' '.join(classes)}'", f"data-font='{font_pref}'", f"data-contrast='{contrast_pref}'", "data-shell='kidbank'"]
+    return " ".join(attrs)
+
+
+def preference_controls_html(request: Request) -> str:
+    font_pref = (request.session.get("ui_font") or "default").strip().lower()
+    contrast_pref = (request.session.get("ui_contrast") or "standard").strip().lower()
+    redirect_target = html_escape(current_route_with_query(request))
+
+    def pref_form(font_value: str, contrast_value: str, label: str, active: bool) -> str:
+        return (
+            "<form method='post' action='/ui/preferences' class='ui-pref-form'>"
+            + f"<input type='hidden' name='redirect_to' value='{redirect_target}'>"
+            + f"<input type='hidden' name='font' value='{font_value}'>"
+            + f"<input type='hidden' name='contrast' value='{contrast_value}'>"
+            + f"<button type='submit' aria-pressed='{str(active).lower()}'>{label}</button>"
+            + "</form>"
+        )
+
+    controls = ["<div class='ui-pref-group' role='group' aria-label='Display preferences'>"]
+    controls.append("<span class='muted' style='font-size:13px;'>Font:</span>")
+    controls.append(
+        pref_form("default", contrast_pref, "Standard", active=font_pref != "dyslexic")
+    )
+    controls.append(
+        pref_form("dyslexic", contrast_pref, "Dyslexic", active=font_pref == "dyslexic")
+    )
+    controls.append("<span class='muted' style='font-size:13px;'>Contrast:</span>")
+    controls.append(
+        pref_form(font_pref, "standard", "Standard", active=contrast_pref != "high")
+    )
+    controls.append(
+        pref_form(font_pref, "high", "High contrast", active=contrast_pref == "high")
+    )
+    controls.append("</div>")
+    return "".join(controls)
+
+
+def service_worker_registration() -> str:
+    return """
+    <script>
+      if ('serviceWorker' in navigator) {
+        window.addEventListener('load', function() {
+          navigator.serviceWorker.register('/service-worker.js').catch(function() {
+            console.warn('Service worker registration failed.');
+          });
+        });
+      }
+    </script>
+    """
+
+
 def base_styles() -> str:
     return """
     <style>
@@ -808,6 +1058,53 @@ def base_styles() -> str:
         .kiosk .balance{font-size:42px}
         .modal-card{padding:16px; border-radius:10px; max-height:96vh;}
       }
+      body.touch-friendly button,
+      body.touch-friendly .button-link,
+      body.touch-friendly .sidebar a{min-height:52px; padding-top:12px; padding-bottom:12px;}
+      body.touch-friendly input,
+      body.touch-friendly select,
+      body.touch-friendly textarea{min-height:48px;}
+      body.font-dyslexic{font-family:'OpenDyslexic','Comic Sans MS','Trebuchet MS',Verdana,sans-serif; letter-spacing:0.03em;}
+      body.theme-high-contrast{--bg:#000814; --card:#001d3d; --muted:#e2e8f0; --accent:#ffd60a; --text:#f8fafc; --good:#4ade80; --bad:#f87171;}
+      body.theme-high-contrast .card{box-shadow:none; border:2px solid rgba(248,250,252,0.18);}
+      .help-icon{display:inline-flex; align-items:center; justify-content:center; width:22px; height:22px; border-radius:999px; background:rgba(148,163,184,0.24); color:var(--text); font-size:12px; text-decoration:none; margin-left:6px;}
+      .help-icon:hover{filter:brightness(1.12);}
+      .ui-pref-group{display:flex; gap:6px; align-items:center; flex-wrap:wrap;}
+      .ui-pref-form{display:inline;}
+      .ui-pref-form button{padding:6px 10px; min-height:36px;}
+      .ui-pref-form button[aria-pressed='true']{background:var(--accent); color:#fff;}
+      .analytics-grid{display:grid; grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); gap:16px; margin-top:16px;}
+      .trend-bars{display:flex; align-items:flex-end; gap:6px; height:120px; margin-top:12px;}
+      .trend-bars__bar{flex:1; position:relative; border-radius:8px 8px 0 0; background:rgba(59,130,246,0.32); min-height:6px;}
+      .trend-bars__bar--completed{background:rgba(16,185,129,0.38);}
+      .trend-bars__bar--approval{background:rgba(249,115,22,0.38);}
+      .trend-bars__bar--interest{background:rgba(217,70,239,0.38);}
+      .trend-bars__value{position:absolute; top:-22px; left:50%; transform:translateX(-50%); font-size:11px; color:var(--muted); white-space:nowrap;}
+      .trend-bars__label{position:absolute; bottom:-18px; left:50%; transform:translateX(-50%); font-size:11px; color:var(--muted);}
+      .jar-bar{display:flex; height:16px; border-radius:999px; overflow:hidden; background:rgba(148,163,184,0.16); margin-top:12px;}
+      .jar-bar__segment{height:100%; position:relative;}
+      .jar-bar__segment--cash{background:#38bdf8;}
+      .jar-bar__segment--goals{background:#f97316;}
+      .jar-bar__segment--market{background:#22c55e;}
+      .jar-bar__segment--cd{background:#a855f7;}
+      .jar-legend{display:flex; flex-wrap:wrap; gap:10px; margin-top:10px; font-size:12px; color:var(--muted);}
+      .jar-legend__item{display:flex; align-items:center; gap:6px;}
+      .jar-legend__swatch{width:12px; height:12px; border-radius:3px;}
+      .lesson-list{display:grid; grid-template-columns:repeat(auto-fit,minmax(260px,1fr)); gap:12px; margin-top:12px;}
+      .lesson-card{padding:14px; border-radius:12px; background:rgba(37,99,235,0.12); display:flex; flex-direction:column; gap:8px;}
+      .lesson-card__header{display:flex; justify-content:space-between; align-items:flex-start; gap:8px;}
+      .lesson-card__summary{color:var(--muted); font-size:14px;}
+      .lesson-card__meta{font-size:13px; color:var(--muted);}
+      .quiz-question{margin-top:12px; padding:12px; border-radius:10px; background:rgba(148,163,184,0.12);}
+      .quiz-question legend{font-weight:600;}
+      .quiz-question label{display:block; margin-top:6px;}
+      .goal-projection{margin-top:18px; padding:16px; border-radius:12px; background:rgba(148,163,184,0.12);}
+      .goal-projection__metrics{margin-top:8px; font-size:14px;}
+      .goal-projection__eta{font-weight:600;}
+      input[type=range]{width:100%;}
+      .tutorial-list{margin:0; padding-left:20px;}
+      .tutorial-list li{margin:6px 0;}
+      .badge-earned{background:#22c55e; color:#0b1220;}
     </style>
     """
 
@@ -874,12 +1171,54 @@ def money_mask_js() -> str:
     """
 
 
-def frame(title: str, inner: str, head_extra: str = "") -> str:
-    return (
-        f"<html><head><meta charset='utf-8'><meta name='viewport' "
-        f"content='width=device-width,initial-scale=1'>{head_extra}<title>{title}</title>"
-        f"{base_styles()}{money_mask_js()}</head><body>{inner}</body></html>"
+def frame(title: str, inner: str, head_extra: str = "", body_attrs: str = "") -> str:
+    manifest_head = (
+        "<link rel='manifest' href='/manifest.webmanifest'>"
+        "<link rel='apple-touch-icon' href='/pwa-icon.svg'>"
+        "<meta name='theme-color' content='#2563eb'>"
     )
+    body_attr = f" {body_attrs.strip()}" if body_attrs else ""
+    return (
+        "<html><head><meta charset='utf-8'><meta name='viewport' "
+        f"content='width=device-width,initial-scale=1'>{manifest_head}{head_extra}<title>{title}</title>"
+        f"{base_styles()}{money_mask_js()}</head><body{body_attr}>{inner}{service_worker_registration()}</body></html>"
+    )
+
+
+def render_page(
+    request: Optional[Request],
+    title: str,
+    inner: str,
+    *,
+    head_extra: str = "",
+    status_code: int = 200,
+) -> HTMLResponse:
+    html = frame(title, inner, head_extra=head_extra, body_attrs=body_pref_attrs(request))
+    return HTMLResponse(html, status_code=status_code)
+
+
+def simple_markdown_to_html(md: str) -> str:
+    blocks: List[str] = []
+    for raw_block in md.split("\n\n"):
+        block = raw_block.strip()
+        if not block:
+            continue
+        if block.startswith("## "):
+            blocks.append(f"<h3>{html_escape(block[3:].strip())}</h3>")
+            continue
+        if block.startswith("* "):
+            items = []
+            for line in block.splitlines():
+                line = line.strip()
+                if line.startswith("* "):
+                    items.append(f"<li>{html_escape(line[2:].strip())}</li>")
+            blocks.append("<ul>" + "".join(items) + "</ul>")
+            continue
+        safe = html_escape(block)
+        safe = re.sub(r"\*\*(.+?)\*\*", r"<strong>\\1</strong>", safe)
+        safe = re.sub(r"\*(.+?)\*", r"<em>\\1</em>", safe)
+        blocks.append(f"<p>{safe}</p>")
+    return "".join(blocks)
 
 
 # ---------------------------------------------------------------------------
@@ -1694,6 +2033,121 @@ def ensure_default_instrument() -> None:
             session.commit()
 
 
+def ensure_default_learning_content() -> None:
+    sample_lessons = [
+        {
+            "title": "Why saving matters",
+            "summary": "Set goals, save steadily, and watch your money grow.",
+            "content": textwrap.dedent(
+                """
+                ## Saving builds choices
+
+                Every dollar you set aside gives you more options later. Goals help
+                you stay focused and track your progress.
+
+                * Pick something you care about.
+                * Break the goal into weekly mini-targets.
+                * Celebrate each deposit!
+
+                ## Smart habits
+
+                Try the 50/40/10 idea: 50% for saving goals, 40% for fun spending,
+                and 10% for sharing or gifts. Adjust the mix to fit your family rules.
+                """
+            ).strip(),
+            "quiz": {
+                "questions": [
+                    {
+                        "prompt": "What is the first step when saving for something big?",
+                        "options": [
+                            "Spend money right away",
+                            "Choose a goal you care about",
+                            "Wait for someone to buy it",
+                        ],
+                        "answer": 1,
+                    },
+                    {
+                        "prompt": "How can mini-targets help you?",
+                        "options": [
+                            "They make progress easier to see",
+                            "They cost more money",
+                            "They replace your goal",
+                        ],
+                        "answer": 0,
+                    },
+                ],
+                "passing_score": 2,
+                "reward_cents": 50,
+            },
+        },
+        {
+            "title": "Understanding interest",
+            "summary": "Interest is a small thank-you for letting money rest.",
+            "content": textwrap.dedent(
+                """
+                ## What is interest?
+
+                Banks and parents sometimes pay extra money when you leave your
+                savings alone. This extra is called *interest*.
+
+                ## How to earn it
+
+                * Deposit money into a savings jar or certificate.
+                * Wait for the agreed time.
+                * Collect the bonus interest on top of your savings.
+
+                The longer your money stays put, the more interest you may earn.
+                """
+            ).strip(),
+            "quiz": {
+                "questions": [
+                    {
+                        "prompt": "What do you call extra money paid for saving?",
+                        "options": ["Allowance", "Interest", "Debt"],
+                        "answer": 1,
+                    },
+                    {
+                        "prompt": "How do you earn more interest?",
+                        "options": [
+                            "Spend the money quickly",
+                            "Leave the money saved longer",
+                            "Hide it under a pillow",
+                        ],
+                        "answer": 1,
+                    },
+                ],
+                "passing_score": 2,
+                "reward_cents": 75,
+            },
+        },
+    ]
+    with Session(engine) as session:
+        exists = session.exec(select(Lesson.id).limit(1)).first()
+        if exists:
+            return
+        for entry in sample_lessons:
+            lesson = Lesson(
+                title=entry["title"],
+                content_md=entry["content"],
+                summary=entry["summary"],
+            )
+            session.add(lesson)
+            session.commit()
+            session.refresh(lesson)
+            quiz_payload = entry.get("quiz")
+            if quiz_payload:
+                reward = int(quiz_payload.get("reward_cents", 0))
+                payload = json.dumps(quiz_payload)
+                session.add(
+                    Quiz(
+                        lesson_id=lesson.id,
+                        payload=payload,
+                        reward_cents=reward,
+                    )
+                )
+                session.commit()
+
+
 def list_market_instruments(session: Session | None = None) -> List[MarketInstrument]:
     def _load(active: Session) -> List[MarketInstrument]:
         return (
@@ -2317,6 +2771,7 @@ def detailed_history_chart_svg(
 
 # Ensure core market instruments exist after migrations
 ensure_default_instrument()
+ensure_default_learning_content()
 
 
 # ---------------------------------------------------------------------------
@@ -2350,18 +2805,53 @@ def _badges_html(badges_csv: Optional[str]) -> str:
         return "<span class='muted'>(none)</span>"
     return " ".join(f"<span class='pill'>{badge}</span>" for badge in badges)
 
-# ---------------------------------------------------------------------------
-# FastAPI application setup
-# ---------------------------------------------------------------------------
-app = FastAPI(title="Kid Bank")
-app.add_middleware(SessionMiddleware, secret_key=SESSION_SECRET, same_site="lax")
+@app.get("/manifest.webmanifest", include_in_schema=False)
+def manifest_webmanifest() -> JSONResponse:
+    return JSONResponse(
+        {
+            "name": "KidBank",
+            "short_name": "KidBank",
+            "start_url": "/",
+            "display": "standalone",
+            "background_color": "#0b1220",
+            "theme_color": "#2563eb",
+            "scope": "/",
+            "description": "Kid-friendly banking for chores, goals, and investing.",
+            "icons": [
+                {"src": "/pwa-icon.svg", "sizes": "192x192", "type": "image/svg+xml"},
+                {"src": "/pwa-icon.svg", "sizes": "512x512", "type": "image/svg+xml"},
+            ],
+        }
+    )
+
+
+@app.get("/service-worker.js", include_in_schema=False)
+def service_worker_js() -> Response:
+    return Response(SERVICE_WORKER_JS, media_type="application/javascript", headers={"Cache-Control": "no-cache"})
+
+
+@app.get("/pwa-icon.svg", include_in_schema=False)
+def pwa_icon() -> Response:
+    return Response(PWA_ICON_SVG, media_type="image/svg+xml")
+
+
+@app.get("/offline", response_class=HTMLResponse)
+def offline_page(request: Request) -> HTMLResponse:
+    inner = """
+    <div class='card'>
+      <h3>Offline mode</h3>
+      <p class='muted'>You're viewing the cached KidBank shell. Actions like payouts or transfers need a connection.</p>
+      <p class='muted'>Reconnect to sync progress.</p>
+    </div>
+    """
+    return render_page(request, "KidBank — Offline", inner)
 
 
 # ---------------------------------------------------------------------------
 # Kid-facing routes
 # ---------------------------------------------------------------------------
 @app.get("/", response_class=HTMLResponse)
-def landing() -> HTMLResponse:
+def landing(request: Request) -> HTMLResponse:
     inner = """
     <div class='grid'>
       <div class='card'>
@@ -2379,7 +2869,7 @@ def landing() -> HTMLResponse:
       </div>
     </div>
     """
-    return HTMLResponse(frame("Kid Bank — Sign In", inner))
+    return render_page(request, "Kid Bank — Sign In", inner)
 
 
 @app.post("/kid/login", response_class=HTMLResponse)
@@ -2388,7 +2878,7 @@ def kid_login(request: Request, kid_id: str = Form(...), kid_pin: str = Form(...
         child = session.exec(select(Child).where(Child.kid_id == kid_id)).first()
         if not child or (child.kid_pin or "") != (kid_pin or ""):
             body = "<div class='card'><p style='color:#ff6b6b;'>Invalid kid_id or PIN.</p><p><a href='/'>Back</a></p></div>"
-            return HTMLResponse(frame("Kid Login", body))
+            return render_page(request, "Kid Login", body)
     request.session["kid_authed"] = kid_id
     return RedirectResponse("/kid", status_code=302)
 
@@ -2421,6 +2911,10 @@ def kid_home(
     activity_direction = (activity_dir or "all").strip().lower()
     if activity_direction not in {"all", "credit", "debit", "zero"}:
         activity_direction = "all"
+    lessons: List[Lesson] = []
+    quiz_by_lesson: Dict[int, Quiz] = {}
+    latest_attempt_by_quiz: Dict[int, QuizAttempt] = {}
+    goal_interest_bps = 0
     try:
         others: List[Child] = []
         incoming_requests: List[MoneyRequest] = []
@@ -2462,6 +2956,22 @@ def kid_home(
                 .order_by(desc(MoneyRequest.created_at))
                 .limit(12)
             ).all()
+            ensure_default_learning_content()
+            lessons = session.exec(select(Lesson).order_by(Lesson.id)).all()
+            quizzes = session.exec(select(Quiz).order_by(Quiz.lesson_id)).all()
+            attempts = session.exec(
+                select(QuizAttempt)
+                .where(QuizAttempt.child_id == kid_id)
+                .order_by(desc(QuizAttempt.created_at))
+            ).all()
+            quiz_by_lesson = {quiz.lesson_id: quiz for quiz in quizzes}
+            for attempt in attempts:
+                if attempt.quiz_id not in latest_attempt_by_quiz:
+                    latest_attempt_by_quiz[attempt.quiz_id] = attempt
+            try:
+                goal_interest_bps = int(MetaDAO.get(session, "goal_interest_rate_bps") or "0")
+            except (TypeError, ValueError):
+                goal_interest_bps = 0
             global_chores = session.exec(
                 select(Chore)
                 .where(Chore.kid_id == GLOBAL_CHORE_KID_ID)
@@ -2655,7 +3165,7 @@ def kid_home(
           <div class='card chore-dashboard'>
             <div class='chore-header'>
               <div>
-                <h3>Chore Overview</h3>
+                <h3>Chore Overview <a href='#modal-chores-help' class='help-icon' aria-label='Learn how chores work'>?</a></h3>
                 <div class='muted'>Click any calendar date to review that day's chores.</div>
               </div>
               <div class='chore-header__date'>
@@ -2806,6 +3316,148 @@ def kid_home(
             "<button type='submit' class='danger'>Delete</button></form></td></tr>"
             for goal in goals
         ) or "<tr><td>(no goals)</td></tr>"
+        goal_projection_html = ""
+        if goals:
+            goal_payload = [
+                {
+                    "id": goal.id,
+                    "name": goal.name,
+                    "saved_cents": goal.saved_cents,
+                    "target_cents": goal.target_cents,
+                }
+                for goal in goals
+            ]
+            try:
+                max_weekly = max(
+                    5.0,
+                    min(
+                        100.0,
+                        max((goal.target_cents - goal.saved_cents) / 100 for goal in goals) / 4 or 5.0,
+                    ),
+                )
+            except ValueError:
+                max_weekly = 50.0
+            interest_note = ""
+            if goal_interest_bps:
+                interest_note = f"<div class='muted' style='margin-top:4px;'>Includes interest at {goal_interest_bps / 100:.2f}% APR.</div>"
+            goal_options = "".join(
+                f"<option value='{goal.id}'>{html_escape(goal.name)}</option>" for goal in goals
+            )
+            goal_projection_html = textwrap.dedent(
+                """
+                  <div class='goal-projection'>
+                    <h4>Goal projection <a href='#modal-goal-tips' class='help-icon' aria-label='How projections work'>?</a></h4>
+                    <div class='stacked-form'>
+                      <label for='goal-projection-select'>Choose a goal</label>
+                      <select id='goal-projection-select'>
+                        __GOAL_OPTIONS__
+                      </select>
+                      <label for='goal-projection-weekly'>Weekly contribution: <span id='goal-projection-amount'>$0.00</span></label>
+                      <input id='goal-projection-weekly' type='range' min='0' max='__MAX_WEEKLY__' step='0.50' value='5'>
+                      <div class='goal-projection__metrics'>Estimated completion: <span class='goal-projection__eta' id='goal-projection-eta'>Add a weekly amount to see your ETA.</span></div>
+                      __INTEREST_NOTE__
+                    </div>
+                  </div>
+                  <script>
+                    (function(){
+                      const data = __GOAL_DATA__;
+                      const rate = __GOAL_RATE__ / 10000;
+                      const select = document.getElementById('goal-projection-select');
+                      const slider = document.getElementById('goal-projection-weekly');
+                      const amountEl = document.getElementById('goal-projection-amount');
+                      const etaEl = document.getElementById('goal-projection-eta');
+                      function compute(goal, weekly){
+                        let saved = goal.saved_cents / 100;
+                        const target = goal.target_cents / 100;
+                        if (saved >= target) {
+                          return 'Goal already reached!';
+                        }
+                        if (weekly <= 0) {
+                          return 'Add a weekly amount to see your projection.';
+                        }
+                        let weeks = 0;
+                        const maxWeeks = 520;
+                        while (saved < target && weeks < maxWeeks){
+                          saved += weekly;
+                          if (rate > 0){
+                            saved += saved * (rate / 52);
+                          }
+                          weeks += 1;
+                        }
+                        if (weeks >= maxWeeks){
+                          return 'More than 10 years — try adding more each week.';
+                        }
+                        const etaDate = new Date();
+                        etaDate.setDate(etaDate.getDate() + weeks * 7);
+                        return weeks + ' week' + (weeks === 1 ? '' : 's') + ' (' + etaDate.toLocaleDateString() + ')';
+                      }
+                      function update(){
+                        const selectedId = parseInt(select.value || data[0].id, 10);
+                        const weekly = parseFloat(slider.value || '0');
+                        const goal = data.find(item => item.id === selectedId) || data[0];
+                        amountEl.textContent = '$' + weekly.toFixed(2);
+                        etaEl.textContent = compute(goal, weekly);
+                      }
+                      select.addEventListener('change', update);
+                      slider.addEventListener('input', update);
+                      update();
+                    })();
+                  </script>
+                """
+            )
+            goal_projection_html = (
+                goal_projection_html
+                .replace("__GOAL_OPTIONS__", goal_options)
+                .replace("__MAX_WEEKLY__", f"{max_weekly:.2f}")
+                .replace("__INTEREST_NOTE__", interest_note)
+                .replace("__GOAL_DATA__", json.dumps(goal_payload))
+                .replace("__GOAL_RATE__", str(goal_interest_bps))
+            )
+        lesson_cards: List[str] = []
+        lesson_pass_count = 0
+        for lesson in lessons:
+            quiz = quiz_by_lesson.get(lesson.id)
+            quiz_info: Dict[str, Any] = {}
+            if quiz:
+                try:
+                    quiz_info = json.loads(quiz.payload)
+                except json.JSONDecodeError:
+                    quiz_info = {}
+            attempt = latest_attempt_by_quiz.get(quiz.id if quiz else -1)
+            summary_text = html_escape((lesson.summary or lesson.content_md.splitlines()[0]).strip())
+            if len(summary_text) > 140:
+                summary_text = summary_text[:137] + "…"
+            status_bits: List[str] = []
+            badge = ""
+            if attempt and quiz:
+                passing = int(quiz_info.get("passing_score", attempt.max_score))
+                passed = attempt.score >= max(passing, 0)
+                status_bits.append(f"Last score {attempt.score}/{attempt.max_score}")
+                if passed:
+                    badge = "<span class='badge-earned pill'>Passed</span>"
+                    lesson_pass_count += 1
+            reward_line = ""
+            if quiz and quiz.reward_cents:
+                reward_line = f"<div class='lesson-card__meta'>Reward: {usd(quiz.reward_cents)}</div>"
+            action_label = "Review lesson" if attempt else "Start lesson"
+            lesson_cards.append(
+                "<div class='lesson-card'>"
+                + f"<div class='lesson-card__header'><div><b>{html_escape(lesson.title)}</b> {badge}</div>"
+                + f"<a class='button-link secondary' href='/kid/lesson/{lesson.id}'>{action_label}</a></div>"
+                + f"<div class='lesson-card__summary'>{summary_text}</div>"
+                + (f"<div class='lesson-card__meta'>{' • '.join(status_bits)}</div>" if status_bits else "")
+                + reward_line
+                + "</div>"
+            )
+        if not lesson_cards:
+            lesson_cards.append("<div class='muted'>No lessons published yet.</div>")
+        learning_content = f"""
+          <div class='card'>
+            <h3>Learning Lab <a href='#modal-learning-help' class='help-icon' aria-label='Learn about lessons'>?</a></h3>
+            <div class='muted'>Quick lessons and quizzes that build your money skills.</div>
+            <div class='lesson-list'>{''.join(lesson_cards)}</div>
+          </div>
+        """
         investing_snapshot = _kid_investing_snapshot(kid_id)
         investing_card = _safe_investing_card(kid_id, snapshot=investing_snapshot)
         notice_msg, notice_kind = pop_kid_notice(request)
@@ -2907,7 +3559,7 @@ def kid_home(
         """
         money_card = f"""
           <div class='card'>
-            <h3>Send/Request</h3>
+            <h3>Send/Request <a href='#modal-money-help' class='help-icon' aria-label='How sending and requesting works'>?</a></h3>
             <div class='muted'>Share allowance or ask for help from siblings.</div>
             <div style='font-weight:600; margin-top:8px;'>Request Money</div>
             {request_form}
@@ -2962,6 +3614,7 @@ def kid_home(
             </div>
           </div>
         """
+        lessons_total = len(lessons)
         quick_cards: List[str] = [
             (
                 "<div class='stat-card'>"
@@ -2983,6 +3636,13 @@ def kid_home(
                 f"<div class='stat-card__value'>{len(goals)} active</div>"
                 f"<div class='stat-card__meta'>Reached {achieved_goals}</div>"
                 "<a href='/kid?section=goals' class='stat-card__action'>Manage goals</a></div>"
+            ),
+            (
+                "<div class='stat-card'>"
+                "<div class='stat-card__label'>Learning</div>"
+                f"<div class='stat-card__value'>{lesson_pass_count}/{lessons_total or 0} passed</div>"
+                f"<div class='stat-card__meta'>Lessons available {lessons_total}</div>"
+                "<a href='/kid?section=learning' class='stat-card__action'>Open lab</a></div>"
             ),
             (
                 "<div class='stat-card'>"
@@ -3177,7 +3837,7 @@ def kid_home(
         overview_content = hero_html + overview_quick_html + money_insights_html + investing_overview_html + highlights_card
         goals_content = f"""
           <div class='card'>
-            <h3>My Goals</h3>
+            <h3>My Goals <a href='#modal-goal-tips' class='help-icon' aria-label='Goal tips'>?</a></h3>
             <form method='post' action='/kid/goal_create' class='inline'>
               <input name='name' placeholder='e.g. Lego set' required>
               <input name='target' type='text' data-money placeholder='target $' required>
@@ -3185,6 +3845,7 @@ def kid_home(
             </form>
             <table style='margin-top:8px;'><tr><th>Goal</th><th>Saved</th><th>Actions</th></tr>{goal_rows}</table>
           </div>
+          {goal_projection_html}
         """
         activity_content = f"""
           <div class='card'>
@@ -3208,6 +3869,7 @@ def kid_home(
             ("chores", "My Chores", chores_content),
             ("freeforall", "Free-for-all", global_card),
             ("goals", "Goals", goals_content),
+            ("learning", "Learning Lab", learning_content),
             ("money", "Send/Request", money_content),
             ("investing", "Investing", investing_card),
             ("activity", "Activity", activity_content),
@@ -3225,11 +3887,15 @@ def kid_home(
             requests_badge = (
                 f"<span class='pill' style='background:#f59e0b; color:#78350f;'>Requests: {incoming_count}</span>"
             )
+        pref_controls = preference_controls_html(request)
         topbar = (
-            "<div class='topbar'><h3>Kid Kiosk</h3><div style='display:flex; gap:8px; align-items:center; flex-wrap:wrap;'>"
+            "<div class='topbar'><h3>Kid Kiosk</h3><div style='display:flex; flex-direction:column; gap:6px; align-items:flex-end;'>"
+            "<div style='display:flex; gap:8px; align-items:center; flex-wrap:wrap;'>"
             f"<span class='pill'>{kid_name_html} ({kid_id_html})</span>"
             + requests_badge
             + "<form method='post' action='/kid/logout' style='display:inline-block;'><button type='submit' class='pill'>Logout</button></form>"
+            + "</div>"
+            + pref_controls
             + "</div></div>"
         )
         inner = (
@@ -3240,7 +3906,80 @@ def kid_home(
             + content_html
             + "</div></div>"
         )
-        return HTMLResponse(frame(f"{child.name} — Kid", inner))
+        max_quiz_reward_cents = 0
+        if quiz_by_lesson:
+            max_quiz_reward_cents = max(quiz.reward_cents for quiz in quiz_by_lesson.values())
+        if goal_interest_bps:
+            goal_interest_tip = (
+                f"<p class='muted'>Projections include goal interest at about {goal_interest_bps / 100:.2f}% APR when enabled by parents.</p>"
+            )
+        else:
+            goal_interest_tip = (
+                "<p class='muted'>Weekly deposits add up fast. Parents can enable goal interest for extra growth.</p>"
+            )
+        reward_note = (
+            f"Earn up to {usd(max_quiz_reward_cents)} per passing quiz."
+            if max_quiz_reward_cents
+            else "Quizzes help you practice new skills."
+        )
+        modals = [
+            f"""
+        <div id='modal-goal-tips' class='modal-overlay'>
+          <div class='modal-card'>
+            <div class='modal-head'><h3>Goal tips</h3><a href='#' class='pill'>Close</a></div>
+            <p>Savings goals grow when you plan a steady rhythm.</p>
+            <ul class='tutorial-list'>
+              <li>Pick a weekly amount on the slider to see how long the goal will take.</li>
+              <li>Mix in chore rewards, allowance, or money gifts to finish sooner.</li>
+              <li>Reached goals can be celebrated or reset for the next dream.</li>
+            </ul>
+            {goal_interest_tip}
+          </div>
+        </div>
+        """,
+            f"""
+        <div id='modal-learning-help' class='modal-overlay'>
+          <div class='modal-card'>
+            <div class='modal-head'><h3>Learning Lab</h3><a href='#' class='pill'>Close</a></div>
+            <p>Short lessons explain how money, goals, and interest work.</p>
+            <ul class='tutorial-list'>
+              <li>Read the lesson, then answer the quick quiz to check your understanding.</li>
+              <li>{reward_note}</li>
+              <li>Your latest score shows on each card so you know what to revisit.</li>
+            </ul>
+          </div>
+        </div>
+        """,
+            """
+        <div id='modal-chores-help' class='modal-overlay'>
+          <div class='modal-card'>
+            <div class='modal-head'><h3>Chores primer</h3><a href='#' class='pill'>Close</a></div>
+            <p>Daily chores show on today's calendar. Tap a chore to send it for approval.</p>
+            <ul class='tutorial-list'>
+              <li><b>Available</b> chores are ready to complete.</li>
+              <li><b>Pending</b> chores await a parent's review.</li>
+              <li><b>Completed</b> chores are paid and count toward streaks.</li>
+              <li>Free-for-all chores are extra challenges that multiple kids can try.</li>
+            </ul>
+          </div>
+        </div>
+        """,
+            """
+        <div id='modal-money-help' class='modal-overlay'>
+          <div class='modal-card'>
+            <div class='modal-head'><h3>Send &amp; request</h3><a href='#' class='pill'>Close</a></div>
+            <p>Share allowance or ask for help in a friendly way.</p>
+            <ul class='tutorial-list'>
+              <li>Requests wait for approval and show up in the notifications card.</li>
+              <li>Sending money moves funds instantly between balances.</li>
+              <li>Remember to explain <em>why</em> in the note so everyone knows the story.</li>
+            </ul>
+          </div>
+        </div>
+        """,
+        ]
+        inner += "".join(modals)
+        return render_page(request, f"{child.name} — Kid", inner)
     except Exception:
         body = """
         <div class='card'>
@@ -3249,7 +3988,240 @@ def kid_home(
           <a href='/'><button>Back to Sign In</button></a>
         </div>
         """
-        return HTMLResponse(frame("Kid — Error", body))
+        return render_page(request, "Kid — Error", body)
+
+
+@app.get("/kid/lesson/{lesson_id}", response_class=HTMLResponse)
+def kid_lesson_page(request: Request, lesson_id: int) -> HTMLResponse:
+    if (redirect := require_kid(request)) is not None:
+        return redirect
+    kid_id = kid_authed(request)
+    assert kid_id
+    notice_msg, notice_kind = pop_kid_notice(request)
+    notice_html = ""
+    if notice_msg:
+        notice_style = "background:#dcfce7; border-left:4px solid #86efac; color:#166534;"
+        if notice_kind == "error":
+            notice_style = "background:#fee2e2; border-left:4px solid #fca5a5; color:#b91c1c;"
+        notice_html = (
+            f"<div class='card' style='margin-bottom:12px; {notice_style}'><div>{notice_msg}</div></div>"
+        )
+    ensure_default_learning_content()
+    kid_display_name = ""
+    kid_identifier = kid_id
+    lesson_title = "Lesson"
+    lesson_content_md = ""
+    has_quiz = False
+    quiz_payload_text = ""
+    quiz_reward_cents = 0
+    latest_attempt_info: Optional[Dict[str, Any]] = None
+    with Session(engine) as session:
+        child = session.exec(select(Child).where(Child.kid_id == kid_id)).first()
+        lesson = session.get(Lesson, lesson_id)
+        if not child or not lesson:
+            body = "<div class='card'><p style='color:#f87171;'>Lesson not found.</p><p><a href='/kid?section=learning'>Back</a></p></div>"
+            return render_page(request, "Lesson", body, status_code=404)
+        kid_display_name = child.name
+        kid_identifier = child.kid_id
+        lesson_title = lesson.title
+        lesson_content_md = lesson.content_md
+        quiz_row = session.exec(select(Quiz).where(Quiz.lesson_id == lesson_id)).first()
+        if quiz_row:
+            has_quiz = True
+            quiz_payload_text = quiz_row.payload or ""
+            quiz_reward_cents = int(quiz_row.reward_cents or 0)
+            latest_attempt_row = session.exec(
+                select(QuizAttempt)
+                .where(QuizAttempt.child_id == kid_id)
+                .where(QuizAttempt.quiz_id == quiz_row.id)
+                .order_by(desc(QuizAttempt.created_at))
+            ).first()
+            if latest_attempt_row:
+                latest_attempt_info = {
+                    "score": latest_attempt_row.score,
+                    "max_score": latest_attempt_row.max_score,
+                    "created_at": latest_attempt_row.created_at,
+                }
+    quiz_data: Dict[str, Any] = {}
+    if has_quiz and quiz_payload_text:
+        try:
+            parsed = json.loads(quiz_payload_text)
+            if isinstance(parsed, dict):
+                quiz_data = parsed
+        except json.JSONDecodeError:
+            quiz_data = {}
+    questions = quiz_data.get("questions", []) if isinstance(quiz_data.get("questions"), list) else []
+    passing_score = int(quiz_data.get("passing_score", len(questions) if questions else 0)) if has_quiz else 0
+    lesson_body_html = simple_markdown_to_html(lesson_content_md)
+    reward_line = ""
+    if has_quiz and quiz_reward_cents:
+        reward_line = f"<div class='muted' style='margin-top:10px;'>Passing earns {usd(quiz_reward_cents)}.</div>"
+    attempt_summary = ""
+    if latest_attempt_info and latest_attempt_info["max_score"]:
+        passed = latest_attempt_info["score"] >= max(passing_score, 0)
+        status_text = "Passed" if passed else "Keep practicing"
+        when = latest_attempt_info["created_at"].strftime("%Y-%m-%d %H:%M")
+        attempt_summary = (
+            f"<div class='muted' style='margin-top:10px;'>Last attempt {latest_attempt_info['score']}/{latest_attempt_info['max_score']} — {status_text} ({when}).</div>"
+        )
+    if has_quiz and not questions:
+        quiz_form_html = "<div class='muted' style='margin-top:16px;'>Quiz coming soon.</div>"
+    elif has_quiz:
+        invalid_question = any(
+            not isinstance(question.get("options"), list) or not question.get("options")
+            for question in questions
+        )
+        if invalid_question:
+            quiz_form_html = "<div class='muted' style='margin-top:16px;'>Quiz setup is incomplete. Try again soon.</div>"
+        else:
+            question_blocks: List[str] = []
+            for idx, question in enumerate(questions):
+                prompt = html_escape(str(question.get("prompt", f"Question {idx + 1}")))
+                options = question.get("options", [])
+                option_html_parts: List[str] = []
+                for opt_idx, option in enumerate(options):
+                    label = html_escape(str(option))
+                    required_attr = " required" if opt_idx == 0 else ""
+                    option_html_parts.append(
+                        f"<label><input type='radio' name='q{idx}' value='{opt_idx}'{required_attr}> {label}</label>"
+                    )
+                question_blocks.append(
+                    "<fieldset class='quiz-question'>"
+                    + f"<legend>{prompt}</legend>"
+                    + "".join(option_html_parts)
+                    + "</fieldset>"
+                )
+            quiz_form_html = (
+                f"<form method='post' action='/kid/lesson/{lesson_id}' class='stacked-form' style='margin-top:16px;'>"
+                + "".join(question_blocks)
+                + "<button type='submit'>Submit answers</button>"
+                + "</form>"
+            )
+    else:
+        quiz_form_html = "<div class='muted' style='margin-top:16px;'>This lesson is read-only right now.</div>"
+    kid_name_html = html_escape(kid_display_name)
+    kid_id_html = html_escape(kid_identifier)
+    pref_controls = preference_controls_html(request)
+    topbar = (
+        "<div class='topbar'><h3>Learning Lab</h3><div style='display:flex; flex-direction:column; gap:6px; align-items:flex-end;'>"
+        + "<div style='display:flex; gap:8px; align-items:center; flex-wrap:wrap;'>"
+        + f"<span class='pill'>{kid_name_html} ({kid_id_html})</span>"
+        + "<a href='/kid?section=learning' class='button-link secondary'>← Back to lessons</a>"
+        + "<form method='post' action='/kid/logout' style='display:inline-block;'><button type='submit' class='pill'>Logout</button></form>"
+        + "</div>"
+        + pref_controls
+        + "</div></div>"
+    )
+    lesson_card = (
+        "<div class='card'>"
+        + f"<h3>{html_escape(lesson_title)}</h3>"
+        + reward_line
+        + attempt_summary
+        + f"<div style='margin-top:12px;'>{lesson_body_html}</div>"
+        + quiz_form_html
+        + "</div>"
+    )
+    inner = topbar + notice_html + lesson_card
+    return render_page(request, f"{lesson_title} — Lesson", inner)
+
+
+@app.post("/kid/lesson/{lesson_id}")
+async def kid_lesson_submit(request: Request, lesson_id: int) -> Response:
+    if (redirect := require_kid(request)) is not None:
+        return redirect
+    kid_id = kid_authed(request)
+    assert kid_id
+    ensure_default_learning_content()
+    form = await request.form()
+    with Session(engine) as session:
+        child = session.exec(select(Child).where(Child.kid_id == kid_id)).first()
+        lesson = session.get(Lesson, lesson_id)
+        if not child or not lesson:
+            body = "<div class='card'><p style='color:#f87171;'>Lesson not found.</p><p><a href='/kid?section=learning'>Back</a></p></div>"
+            return render_page(request, "Lesson", body, status_code=404)
+        quiz = session.exec(select(Quiz).where(Quiz.lesson_id == lesson_id)).first()
+        if not quiz:
+            set_kid_notice(request, "This lesson doesn't have a quiz yet.", "error")
+            return RedirectResponse(f"/kid/lesson/{lesson_id}", status_code=302)
+        try:
+            quiz_data = json.loads(quiz.payload)
+        except json.JSONDecodeError:
+            quiz_data = {}
+        questions = quiz_data.get("questions", []) if isinstance(quiz_data.get("questions"), list) else []
+        if not questions:
+            set_kid_notice(request, "Quiz setup is incomplete. Try again later.", "error")
+            return RedirectResponse(f"/kid/lesson/{lesson_id}", status_code=302)
+        invalid_question = any(
+            not isinstance(question.get("options"), list) or not question.get("options")
+            for question in questions
+        )
+        if invalid_question:
+            set_kid_notice(request, "Quiz setup is incomplete. Try again later.", "error")
+            return RedirectResponse(f"/kid/lesson/{lesson_id}", status_code=302)
+        passing_score = int(quiz_data.get("passing_score", len(questions))) if questions else 0
+        answers: List[int] = []
+        score = 0
+        for idx, question in enumerate(questions):
+            raw_answer = form.get(f"q{idx}")
+            try:
+                choice = int(str(raw_answer))
+            except (TypeError, ValueError):
+                choice = -1
+            answers.append(choice)
+            correct = question.get("answer")
+            if isinstance(correct, int) and choice == correct:
+                score += 1
+        max_score = len(questions)
+        prior_pass = session.exec(
+            select(QuizAttempt)
+            .where(QuizAttempt.child_id == kid_id)
+            .where(QuizAttempt.quiz_id == quiz.id)
+            .where(QuizAttempt.score >= max(passing_score, 0))
+        ).first()
+        attempt = QuizAttempt(
+            child_id=kid_id,
+            quiz_id=quiz.id,
+            score=score,
+            max_score=max_score,
+            responses=json.dumps({"answers": answers}),
+        )
+        session.add(attempt)
+        passed_now = score >= max(passing_score, 0)
+        reward_cents = 0
+        if passed_now and not prior_pass and quiz.reward_cents > 0:
+            reward_cents = quiz.reward_cents
+            child.balance_cents += reward_cents
+            child.updated_at = datetime.utcnow()
+            _update_gamification(child, reward_cents)
+            session.add(child)
+            session.add(
+                Event(
+                    child_id=kid_id,
+                    change_cents=reward_cents,
+                    reason=f"lesson_reward:{lesson_id}",
+                )
+            )
+        session.commit()
+    if passed_now:
+        if reward_cents:
+            set_kid_notice(
+                request,
+                f"Great job! You scored {score}/{max_score} and earned {usd(reward_cents)}.",
+                "success",
+            )
+        else:
+            set_kid_notice(
+                request,
+                f"You scored {score}/{max_score}! Keep it up.",
+                "success",
+            )
+    else:
+        set_kid_notice(
+            request,
+            f"You scored {score}/{max_score}. Review the lesson and try again.",
+            "info",
+        )
+    return RedirectResponse(f"/kid/lesson/{lesson_id}", status_code=302)
 
 
 def _kid_investing_snapshot(kid_id: str) -> Dict[str, Any]:
@@ -4082,7 +5054,7 @@ def kid_invest_home(
         <p class='muted' style='margin-top:10px;'><a href='/kid'>← Back to My Account</a></p>
         {chart_modal_html}
         """
-        return HTMLResponse(frame(f"Investing — {instrument_label}", inner))
+        return render_page(request, f"Investing — {instrument_label}", inner)
     except Exception:
         body = """
         <div class='card'>
@@ -4091,7 +5063,7 @@ def kid_invest_home(
           <a href='/kid'><button>Back</button></a>
         </div>
         """
-        return HTMLResponse(frame("Investing — Error", body))
+        return render_page(request, "Investing — Error", body)
 @app.post("/kid/invest/track")
 def kid_invest_track(
     request: Request,
@@ -4558,7 +5530,7 @@ def kid_invest_cd_sell_confirm(
       <p class='muted' style='margin-top:12px;'><a href='/kid/invest?symbol={symbol_safe}&range={next_range}&chart={chart_mode}'>No, keep it growing</a></p>
     </div>
     """
-    return HTMLResponse(frame("Sell Certificate", inner))
+    return render_page(request, "Sell Certificate", inner)
 
 
 @app.post("/kid/invest/cd/sell")
@@ -4703,7 +5675,7 @@ def admin_login_page(request: Request):
       <p class='muted' style='margin-top:6px;'><a href='/'>← Back</a></p>
     </div>
     """
-    return HTMLResponse(frame("Parent Login", inner))
+    return render_page(request, "Parent Login", inner)
 
 
 @app.post("/admin/login")
@@ -4712,7 +5684,7 @@ def admin_login(request: Request, pin: str = Form(...)):
         role = resolve_admin_role(pin, session=session)
     if not role:
         body = "<div class='card'><p style='color:#ff6b6b;'>Incorrect PIN.</p><p><a href='/admin/login'>Try again</a></p></div>"
-        return HTMLResponse(frame("Parent Login", body))
+        return render_page(request, "Parent Login", body)
     request.session["admin_role"] = role
     return RedirectResponse("/admin", status_code=302)
 
@@ -4763,12 +5735,22 @@ def admin_home(
         events = session.exec(
             select(Event).order_by(desc(Event.timestamp)).limit(events_limit)
         ).all()
+        analytics_events = session.exec(
+            select(Event).order_by(desc(Event.timestamp)).limit(240)
+        ).all()
         pending = session.exec(
             select(ChoreInstance, Chore, Child)
             .where(ChoreInstance.status == "pending")
             .where(ChoreInstance.chore_id == Chore.id)
             .where(Chore.kid_id == Child.kid_id)
             .order_by(desc(ChoreInstance.completed_at))
+        ).all()
+        approval_pairs = session.exec(
+            select(ChoreInstance, Event)
+            .where(ChoreInstance.status == "paid")
+            .where(ChoreInstance.paid_event_id == Event.id)
+            .order_by(desc(Event.timestamp))
+            .limit(120)
         ).all()
         global_pending = session.exec(
             select(GlobalChoreClaim, Child, Chore)
@@ -4802,6 +5784,7 @@ def admin_home(
         pending_money_requests = session.exec(
             select(MoneyRequest).where(MoneyRequest.status == "pending")
         ).all()
+        goals_all = session.exec(select(Goal)).all()
     approved_lookup: Dict[Tuple[int, str], List[GlobalChoreClaim]] = {}
     for approved in approved_global_claims:
         approved_lookup.setdefault((approved.chore_id, approved.period_key), []).append(approved)
@@ -5104,6 +6087,137 @@ def admin_home(
         )
     overview_quick_html = "<div class='overview-stats-grid'>" + "".join(quick_cards) + "</div>"
 
+    analytics_days = 7
+    today_admin = moment_admin.date()
+
+    def admin_day_range(days: int) -> List[date]:
+        start = today_admin - timedelta(days=days - 1)
+        return [start + timedelta(days=offset) for offset in range(days)]
+
+    def admin_series(series_map: Dict[date, float]) -> List[Tuple[date, float]]:
+        return [(day, float(series_map.get(day, 0))) for day in admin_day_range(analytics_days)]
+
+    def admin_trend(series: Sequence[Tuple[date, float]], formatter: Callable[[float], str], bar_class: str) -> str:
+        if not series:
+            return "<div class='muted' style='margin-top:12px;'>No data yet.</div>"
+        max_value = max((value for _, value in series), default=0.0)
+        bars: List[str] = []
+        for day, value in series:
+            height_pct = 8.0 if max_value <= 0 else max(8.0, (value / max_value) * 100)
+            label = day.strftime("%a")
+            bars.append(
+                f"<div class='trend-bars__bar {bar_class}' style='height:{height_pct:.0f}%;'>"
+                + f"<span class='trend-bars__value'>{formatter(value)}</span>"
+                + f"<span class='trend-bars__label'>{label}</span>"
+                + "</div>"
+            )
+        return "<div class='trend-bars'>" + "".join(bars) + "</div>"
+
+    payout_map: Dict[date, int] = {}
+    chore_count_map: Dict[date, int] = {}
+    interest_map: Dict[date, int] = {}
+    for event in analytics_events:
+        if not event.timestamp:
+            continue
+        day = event.timestamp.date()
+        reason = (event.reason or "").lower()
+        amount = event.change_cents or 0
+        if reason.startswith("chore:") or reason.startswith("global_chore:"):
+            payout_map[day] = payout_map.get(day, 0) + max(0, amount)
+            if amount >= 0:
+                chore_count_map[day] = chore_count_map.get(day, 0) + 1
+        if "interest" in reason or reason.startswith("invest_cd_mature"):
+            interest_map[day] = interest_map.get(day, 0) + max(0, amount)
+
+    payout_series = admin_series(payout_map)
+    chore_series = admin_series(chore_count_map)
+    interest_series = admin_series(interest_map)
+    payout_total_amount = int(sum(value for _, value in payout_series))
+    chore_total = int(sum(value for _, value in chore_series))
+    interest_total_amount = int(sum(value for _, value in interest_series))
+
+    approval_hours: List[float] = []
+    approval_by_day: Dict[date, List[float]] = {}
+    for instance, event in approval_pairs:
+        if not instance.completed_at or not event.timestamp:
+            continue
+        delta_hours = (event.timestamp - instance.completed_at).total_seconds() / 3600.0
+        if delta_hours < 0:
+            continue
+        approval_hours.append(delta_hours)
+        approval_by_day.setdefault(event.timestamp.date(), []).append(delta_hours)
+    for claim in approved_global_claims:
+        if not claim.submitted_at or not claim.approved_at:
+            continue
+        delta_hours = (claim.approved_at - claim.submitted_at).total_seconds() / 3600.0
+        if delta_hours < 0:
+            continue
+        approval_hours.append(delta_hours)
+        approval_by_day.setdefault(claim.approved_at.date(), []).append(delta_hours)
+
+    approval_series = [
+        (day, sum(values) / len(values) if values else 0.0)
+        for day, values in ((d, approval_by_day.get(d, [])) for d in admin_day_range(analytics_days))
+    ]
+    overall_avg_hours = sum(approval_hours) / len(approval_hours) if approval_hours else 0.0
+    overall_avg_display = f"{overall_avg_hours:.1f} hrs" if approval_hours else "—"
+
+    goal_saved_total = sum(goal.saved_cents for goal in goals_all)
+    jar_segments = [
+        ("cash", "Spending", total_cash_c),
+        ("goals", "Goals", goal_saved_total),
+        ("market", "Investments", total_market_value_c),
+        ("cd", "Certificates", total_cd_value_c),
+    ]
+    jar_total = sum(segment[2] for segment in jar_segments)
+    if jar_total > 0:
+        jar_bar_segments: List[str] = []
+        jar_legend_items: List[str] = []
+        for key, label, value in jar_segments:
+            pct = (value / jar_total) * 100 if jar_total else 0
+            jar_bar_segments.append(
+                f"<div class='jar-bar__segment jar-bar__segment--{key}' style='width:{pct:.2f}%;' title='{label}: {usd(value)} ({pct:.1f}%)'></div>"
+            )
+            jar_legend_items.append(
+                f"<div class='jar-legend__item'><span class='jar-legend__swatch jar-bar__segment--{key}'></span>{label}: {usd(value)} ({pct:.1f}%)</div>"
+            )
+        jar_bar_html = "<div class='jar-bar'>" + "".join(jar_bar_segments) + "</div>" + "<div class='jar-legend'>" + "".join(jar_legend_items) + "</div>"
+    else:
+        jar_bar_html = "<div class='muted' style='margin-top:12px;'>No balances tracked yet.</div>"
+
+    analytics_card = (
+        "<div class='card analytics-card'>"
+        "<h3>Operations analytics</h3>"
+        "<div class='muted'>Last 7 days of payouts, approvals, and interest.</div>"
+        "<div class='analytics-grid'>"
+        "<div>"
+        "<div class='insight-label'>Total payouts</div>"
+        f"<div class='insight-value'>{usd(payout_total_amount)}</div>"
+        f"{admin_trend(payout_series, lambda v: usd(int(v)), 'trend-bars__bar--payout')}"
+        "</div>"
+        "<div>"
+        "<div class='insight-label'>Chores completed</div>"
+        f"<div class='insight-value'>{chore_total}</div>"
+        f"{admin_trend(chore_series, lambda v: f'{int(v)}', 'trend-bars__bar--completed')}"
+        "</div>"
+        "<div>"
+        "<div class='insight-label'>Avg approval time</div>"
+        f"<div class='insight-value'>{overall_avg_display}</div>"
+        f"{admin_trend(approval_series, lambda v: f'{v:.1f}h', 'trend-bars__bar--approval')}"
+        "</div>"
+        "<div>"
+        "<div class='insight-label'>Interest posted</div>"
+        f"<div class='insight-value'>{usd(interest_total_amount)}</div>"
+        f"{admin_trend(interest_series, lambda v: usd(int(v)), 'trend-bars__bar--interest')}"
+        "</div>"
+        "<div>"
+        "<div class='insight-label'>Jar distribution</div>"
+        f"{jar_bar_html}"
+        "</div>"
+        "</div>"
+        "</div>"
+    )
+
     payout_preview_items: List[str] = []
     for inst, chore, child in pending[:4]:
         payout_preview_items.append(
@@ -5244,7 +6358,7 @@ def admin_home(
         f"{overview_quick_html}"
         "</div>"
     )
-    overview_content = overview_summary_card + overview_actions_card + portfolio_preview_card
+    overview_content = overview_summary_card + analytics_card + overview_actions_card + portfolio_preview_card
     children_overview_rows = "".join(
         (
             "<tr>"
@@ -5684,10 +6798,14 @@ def admin_home(
     )
     selected_content = sections_map[selected_section]["content"]
     extra_html = sections_map[selected_section].get("extra", "")
+    admin_pref_controls = preference_controls_html(request)
     inner = (
-        "<div class='topbar'><h3>Admin Portal</h3><div>"
+        "<div class='topbar'><h3>Admin Portal</h3><div style='display:flex; flex-direction:column; gap:6px; align-items:flex-end;'>"
+        + "<div>"
         + _role_badge(role)
         + "<form method='post' action='/admin/logout' style='display:inline-block; margin-left:8px;'><button type='submit' class='pill'>Logout</button></form>"
+        + "</div>"
+        + admin_pref_controls
         + "</div></div>"
         + "<div class='layout'><nav class='sidebar'>"
         + sidebar_links
@@ -5695,7 +6813,7 @@ def admin_home(
         + selected_content
         + "</div></div>"
     )
-    return HTMLResponse(frame("Admin", inner + extra_html))
+    return render_page(request, "Admin", inner + extra_html)
 @app.get("/admin/kiosk", response_class=HTMLResponse)
 def admin_kiosk(request: Request, kid_id: str = Query(...)):
     if (redirect := require_admin(request)) is not None:
@@ -5703,7 +6821,7 @@ def admin_kiosk(request: Request, kid_id: str = Query(...)):
     with Session(engine) as session:
         child = session.exec(select(Child).where(Child.kid_id == kid_id)).first()
         if not child:
-            return HTMLResponse(frame("Kiosk", "<div class='card'>Kid not found.</div>"))
+            return render_page(request, "Kiosk", "<div class='card'>Kid not found.</div>")
         chores = list_chore_instances_for_kid(kid_id)
         events = session.exec(
             select(Event)
@@ -5733,7 +6851,7 @@ def admin_kiosk(request: Request, kid_id: str = Query(...)):
       <div class='card'><h3>Recent Activity</h3><table><tr><th>When</th><th>Δ Amount</th><th>Reason</th></tr>{event_rows}</table></div>
     </div>
     """
-    return HTMLResponse(frame(f"Kiosk — {child.name}", inner))
+    return render_page(request, f"Kiosk — {child.name}", inner)
 
 
 @app.get("/admin/kiosk_full", response_class=HTMLResponse)
@@ -5743,7 +6861,7 @@ def admin_kiosk_full(request: Request, kid_id: str = Query(...)):
     with Session(engine) as session:
         child = session.exec(select(Child).where(Child.kid_id == kid_id)).first()
         if not child:
-            return HTMLResponse(frame("Kiosk", "<div class='card'>Kid not found.</div>"))
+            return render_page(request, "Kiosk", "<div class='card'>Kid not found.</div>")
         chores = list_chore_instances_for_kid(kid_id)
     head = "<meta http-equiv='refresh' content='10'>"
     chore_cards = "".join(
@@ -5758,7 +6876,7 @@ def admin_kiosk_full(request: Request, kid_id: str = Query(...)):
     </div>
     <div class='card'><h3>Chores</h3>{chore_cards}<p class='muted' style='margin-top:6px;'>Auto-refresh every 10 seconds.</p></div>
     """
-    return HTMLResponse(frame(f"Kiosk — {child.name}", inner, head_extra=head))
+    return render_page(request, f"Kiosk — {child.name}", inner, head_extra=head)
 
 @app.get("/admin/chores", response_class=HTMLResponse)
 def admin_manage_chores(request: Request, kid_id: str = Query(...)):
@@ -5804,7 +6922,7 @@ def admin_manage_chores(request: Request, kid_id: str = Query(...)):
         else:
             child = session.exec(select(Child).where(Child.kid_id == kid_id)).first()
             if not child:
-                return HTMLResponse(frame("Chores", "<div class='card'>Kid not found.</div>"))
+                return render_page(request, "Chores", "<div class='card'>Kid not found.</div>")
             chores = session.exec(
                 select(Chore)
                 .where(Chore.kid_id == kid_id)
@@ -5981,7 +7099,7 @@ def admin_manage_chores(request: Request, kid_id: str = Query(...)):
     {pending_html}
     {history_html}
     """
-    return HTMLResponse(frame("Manage Chores", inner))
+    return render_page(request, "Manage Chores", inner)
 
 
 @app.post("/admin/chores/create")
@@ -6097,7 +7215,7 @@ async def admin_global_chore_claims(request: Request):
             continue
     if not selected_ids:
         body = "<div class='card'><p style='color:#f87171;'>Select at least one submission first.</p><p><a href='/admin/chores?kid_id=" + GLOBAL_CHORE_KID_ID + "'>Back</a></p></div>"
-        return HTMLResponse(frame("Approve Global Chores", body), status_code=400)
+        return render_page(request, "Approve Global Chores", body, status_code=400)
     with Session(engine) as session:
         chore = session.get(Chore, chore_id)
         if (
@@ -6106,22 +7224,22 @@ async def admin_global_chore_claims(request: Request):
             or not period_key
         ):
             body = "<div class='card'><p style='color:#f87171;'>Could not find that Free-for-all chore.</p><p><a href='/admin/chores?kid_id=" + GLOBAL_CHORE_KID_ID + "'>Back</a></p></div>"
-            return HTMLResponse(frame("Approve Global Chores", body), status_code=404)
+            return render_page(request, "Approve Global Chores", body, status_code=404)
         claims = session.exec(
             select(GlobalChoreClaim)
             .where(GlobalChoreClaim.id.in_(selected_ids))
         ).all()
         if len(claims) != len(selected_ids):
             body = "<div class='card'><p style='color:#f87171;'>Some submissions could not be loaded.</p><p><a href='/admin/chores?kid_id=" + GLOBAL_CHORE_KID_ID + "'>Back</a></p></div>"
-            return HTMLResponse(frame("Approve Global Chores", body), status_code=400)
+            return render_page(request, "Approve Global Chores", body, status_code=400)
         claims.sort(key=lambda c: selected_ids.index(c.id))
         for claim in claims:
             if claim.chore_id != chore.id or claim.period_key != period_key:
                 body = "<div class='card'><p style='color:#f87171;'>Selected claims do not match this chore/period.</p><p><a href='/admin/chores?kid_id=" + GLOBAL_CHORE_KID_ID + "'>Back</a></p></div>"
-                return HTMLResponse(frame("Approve Global Chores", body), status_code=400)
+                return render_page(request, "Approve Global Chores", body, status_code=400)
             if claim.status != GLOBAL_CHORE_STATUS_PENDING:
                 body = "<div class='card'><p style='color:#f87171;'>Only pending submissions can be processed.</p><p><a href='/admin/chores?kid_id=" + GLOBAL_CHORE_KID_ID + "'>Back</a></p></div>"
-                return HTMLResponse(frame("Approve Global Chores", body), status_code=400)
+                return render_page(request, "Approve Global Chores", body, status_code=400)
         approved_existing = session.exec(
             select(GlobalChoreClaim)
             .where(GlobalChoreClaim.chore_id == chore.id)
@@ -6158,7 +7276,7 @@ async def admin_global_chore_claims(request: Request):
             return RedirectResponse(f"/admin/chores?kid_id={GLOBAL_CHORE_KID_ID}", status_code=302)
         if len(claims) > remaining_slots:
             body = "<div class='card'><p style='color:#f87171;'>Not enough spots remain to approve that many kids.</p><p><a href='/admin/chores?kid_id=" + GLOBAL_CHORE_KID_ID + "'>Back</a></p></div>"
-            return HTMLResponse(frame("Approve Global Chores", body), status_code=400)
+            return render_page(request, "Approve Global Chores", body, status_code=400)
         remaining_award = max(0, chore.award_cents - approved_total)
         overrides: Dict[int, int] = {}
         override_total = 0
@@ -6172,7 +7290,7 @@ async def admin_global_chore_claims(request: Request):
             override_total += cents
         if override_total > remaining_award:
             body = "<div class='card'><p style='color:#f87171;'>Override amounts exceed the remaining reward.</p><p><a href='/admin/chores?kid_id=" + GLOBAL_CHORE_KID_ID + "'>Back</a></p></div>"
-            return HTMLResponse(frame("Approve Global Chores", body), status_code=400)
+            return render_page(request, "Approve Global Chores", body, status_code=400)
         auto_claims = [claim for claim in claims if claim.id not in overrides]
         auto_award_pool = remaining_award - override_total
         share_map: Dict[int, int] = dict(overrides)
@@ -6187,7 +7305,7 @@ async def admin_global_chore_claims(request: Request):
         payout_total = sum(share_map.values())
         if payout_total > remaining_award:
             body = "<div class='card'><p style='color:#f87171;'>Calculated rewards exceed the remaining amount.</p><p><a href='/admin/chores?kid_id=" + GLOBAL_CHORE_KID_ID + "'>Back</a></p></div>"
-            return HTMLResponse(frame("Approve Global Chores", body), status_code=400)
+            return render_page(request, "Approve Global Chores", body, status_code=400)
         for claim in claims:
             award_cents = share_map.get(claim.id, 0)
             claim.status = GLOBAL_CHORE_STATUS_APPROVED
@@ -6252,7 +7370,7 @@ def chore_make_available_now(request: Request, chore_id: int = Form(...)):
     with Session(engine) as session:
         chore = session.get(Chore, chore_id)
         if not chore:
-            return HTMLResponse(frame("Admin", "<div class='card danger'>Chore not found.</div>"))
+            return render_page(request, "Admin", "<div class='card danger'>Chore not found.</div>")
         kid_id = chore.kid_id
         if not is_chore_in_window(chore, today):
             return RedirectResponse(f"/admin/chores?kid_id={kid_id}", status_code=302)
@@ -6270,7 +7388,7 @@ def admin_goals(request: Request, kid_id: str = Query(...)):
     with Session(engine) as session:
         child = session.exec(select(Child).where(Child.kid_id == kid_id)).first()
         if not child:
-            return HTMLResponse(frame("Goals", "<div class='card'>Kid not found.</div>"))
+            return render_page(request, "Goals", "<div class='card'>Kid not found.</div>")
         goals = session.exec(select(Goal).where(Goal.kid_id == kid_id).order_by(desc(Goal.created_at))).all()
     rows = "".join(
         f"<tr>"
@@ -6309,7 +7427,7 @@ def admin_goals(request: Request, kid_id: str = Query(...)):
       <table style='margin-top:8px;'><tr><th>Goal</th><th>Saved</th><th>Actions</th></tr>{rows}</table>
     </div>
     """
-    return HTMLResponse(frame("Goals", inner))
+    return render_page(request, "Goals", inner)
 
 
 @app.get("/admin/statement", response_class=HTMLResponse)
@@ -6320,7 +7438,7 @@ def admin_statement(request: Request, kid_id: str = Query(...)):
     with Session(engine) as session:
         child = session.exec(select(Child).where(Child.kid_id == kid_id)).first()
         if not child:
-            return HTMLResponse(frame("Statement", "<div class='card'>Kid not found.</div>"))
+            return render_page(request, "Statement", "<div class='card'>Kid not found.</div>")
         events = session.exec(
             select(Event)
             .where(Event.child_id == kid_id)
@@ -6512,7 +7630,7 @@ def admin_statement(request: Request, kid_id: str = Query(...)):
     </div>
     {activity_card}
     """
-    return HTMLResponse(frame("Account Statement", inner))
+    return render_page(request, "Account Statement", inner)
 
 
 @app.post("/admin/goal_create")
@@ -6613,7 +7731,7 @@ def create_kid(request: Request, kid_id: str = Form(...), name: str = Form(...),
     with Session(engine) as session:
         if session.exec(select(Child).where(Child.kid_id == kid_id)).first():
             body = "<div class='card'><p style='color:#ff6b6b;'>kid_id exists.</p><p><a href='/admin'>Back</a></p></div>"
-            return HTMLResponse(frame("Admin", body))
+            return render_page(request, "Admin", body)
         child = Child(
             kid_id=kid_id.strip(),
             name=name.strip(),
@@ -6635,7 +7753,7 @@ def delete_kid(request: Request, kid_id: str = Form(...), pin: str = Form(...)):
     with Session(engine) as session:
         if resolve_admin_role(pin, session=session) is None:
             body = "<div class='card'><p style='color:#ff6b6b;'>Incorrect parent PIN.</p><p><a href='/admin'>Back</a></p></div>"
-            return HTMLResponse(frame("Admin", body))
+            return render_page(request, "Admin", body)
         child = session.exec(select(Child).where(Child.kid_id == kid_id)).first()
         if not child:
             return RedirectResponse("/admin", status_code=302)
@@ -6676,15 +7794,15 @@ def admin_set_parent_pin(
     available_roles = {admin["role"] for admin in all_parent_admins()}
     if normalized_role not in available_roles:
         body = "<div class='card'><p style='color:#ff6b6b;'>Select an existing admin before updating the PIN.</p><p><a href='/admin'>Back</a></p></div>"
-        return HTMLResponse(frame("Admin", body))
+        return render_page(request, "Admin", body)
     pin_value = (new_pin or "").strip()
     confirmation = (confirm_pin or "").strip()
     if not pin_value:
         body = "<div class='card'><p style='color:#ff6b6b;'>Enter a new PIN before saving.</p><p><a href='/admin'>Back</a></p></div>"
-        return HTMLResponse(frame("Admin", body))
+        return render_page(request, "Admin", body)
     if pin_value != confirmation:
         body = "<div class='card'><p style='color:#ff6b6b;'>Confirmation PIN does not match.</p><p><a href='/admin'>Back</a></p></div>"
-        return HTMLResponse(frame("Admin", body))
+        return render_page(request, "Admin", body)
     set_parent_pin(normalized_role, pin_value)
     return RedirectResponse("/admin", status_code=302)
 
@@ -6703,13 +7821,13 @@ def admin_add_parent_admin(
     confirmation = (confirm_pin or "").strip()
     if not display_name:
         body = "<div class='card'><p style='color:#ff6b6b;'>Enter a name for the new admin.</p><p><a href='/admin'>Back</a></p></div>"
-        return HTMLResponse(frame("Admin", body))
+        return render_page(request, "Admin", body)
     if not pin_value:
         body = "<div class='card'><p style='color:#ff6b6b;'>Enter a PIN for the new admin.</p><p><a href='/admin'>Back</a></p></div>"
-        return HTMLResponse(frame("Admin", body))
+        return render_page(request, "Admin", body)
     if pin_value != confirmation:
         body = "<div class='card'><p style='color:#ff6b6b;'>Confirmation PIN does not match.</p><p><a href='/admin'>Back</a></p></div>"
-        return HTMLResponse(frame("Admin", body))
+        return render_page(request, "Admin", body)
     base_key = _normalize_parent_role_key(display_name)
     with Session(engine) as session:
         existing = {admin["role"] for admin in all_parent_admins(session)}
@@ -6734,16 +7852,16 @@ def admin_delete_parent_admin(request: Request, role: str = Form(...)):
     normalized_role = (role or "").strip().lower()
     if not normalized_role:
         body = "<div class='card'><p style='color:#ff6b6b;'>Select an admin to delete first.</p><p><a href='/admin'>Back</a></p></div>"
-        return HTMLResponse(frame("Admin", body), status_code=400)
+        return render_page(request, "Admin", body, status_code=400)
     if normalized_role in DEFAULT_PARENT_ROLES:
         body = "<div class='card'><p style='color:#ff6b6b;'>Default admins cannot be removed.</p><p><a href='/admin'>Back</a></p></div>"
-        return HTMLResponse(frame("Admin", body), status_code=400)
+        return render_page(request, "Admin", body, status_code=400)
     with Session(engine) as session:
         extras = _load_extra_parent_admins(session)
         filtered = [entry for entry in extras if entry["role"] != normalized_role]
         if len(filtered) == len(extras):
             body = "<div class='card'><p style='color:#ff6b6b;'>Could not find that admin account.</p><p><a href='/admin'>Back</a></p></div>"
-            return HTMLResponse(frame("Admin", body), status_code=404)
+            return render_page(request, "Admin", body, status_code=404)
         MetaDAO.set(session, EXTRA_PARENT_ADMINS_KEY, json.dumps(filtered))
         pin_key = _parent_pin_meta_key(normalized_role)
         existing_pin = session.get(MetaKV, pin_key)
@@ -6761,7 +7879,7 @@ def admin_set_allowance(request: Request, kid_id: str = Form(...), allowance: st
     with Session(engine) as session:
         child = session.exec(select(Child).where(Child.kid_id == kid_id)).first()
         if not child:
-            return HTMLResponse(frame("Admin", "<div class='card'>Child not found.</div>"))
+            return render_page(request, "Admin", "<div class='card'>Child not found.</div>")
         child.allowance_cents = allowance_c
         child.updated_at = datetime.utcnow()
         session.add(child)
@@ -6776,7 +7894,7 @@ def set_kid_pin(request: Request, kid_id: str = Form(...), new_pin: str = Form(.
     with Session(engine) as session:
         child = session.exec(select(Child).where(Child.kid_id == kid_id)).first()
         if not child:
-            return HTMLResponse(frame("Admin", "<div class='card'>Child not found.</div>"))
+            return render_page(request, "Admin", "<div class='card'>Child not found.</div>")
         child.kid_pin = (new_pin or "").strip()
         child.updated_at = datetime.utcnow()
         session.add(child)
@@ -6791,17 +7909,17 @@ def adjust_balance(request: Request, kid_id: str = Form(...), amount: str = Form
     amount_c = to_cents_from_dollars_str(amount, 0)
     kind = (kind or "").lower()
     if kind not in {"credit", "debit"}:
-        return HTMLResponse(frame("Admin", "<div class='card'>Invalid type.</div>"))
+        return render_page(request, "Admin", "<div class='card'>Invalid type.</div>")
     with Session(engine) as session:
         child = session.exec(select(Child).where(Child.kid_id == kid_id)).first()
         if not child:
-            return HTMLResponse(frame("Admin", "<div class='card'>Child not found.</div>"))
+            return render_page(request, "Admin", "<div class='card'>Child not found.</div>")
         if kind == "credit":
             child.balance_cents += amount_c
             session.add(Event(child_id=kid_id, change_cents=amount_c, reason=reason or "credit"))
         else:
             if amount_c > child.balance_cents:
-                return HTMLResponse(frame("Admin", "<div class='card'>Insufficient funds.</div>"))
+                return render_page(request, "Admin", "<div class='card'>Insufficient funds.</div>")
             child.balance_cents -= amount_c
             session.add(Event(child_id=kid_id, change_cents=-amount_c, reason=reason or "debit"))
         child.updated_at = datetime.utcnow()
@@ -6824,7 +7942,7 @@ def admin_transfer(
     to_kid = (to_kid or "").strip()
     if not from_kid or not to_kid or from_kid == to_kid:
         body = "<div class='card'><p style='color:#ff6b6b;'>Choose two different kids for a transfer.</p><p><a href='/admin'>Back</a></p></div>"
-        return HTMLResponse(frame("Admin", body), status_code=400)
+        return render_page(request, "Admin", body, status_code=400)
     amount_c = to_cents_from_dollars_str(amount, 0)
     if amount_c <= 0:
         return RedirectResponse("/admin", status_code=302)
@@ -6833,10 +7951,10 @@ def admin_transfer(
         recipient = session.exec(select(Child).where(Child.kid_id == to_kid)).first()
         if not sender or not recipient:
             body = "<div class='card'><p style='color:#ff6b6b;'>Child not found.</p><p><a href='/admin'>Back</a></p></div>"
-            return HTMLResponse(frame("Admin", body), status_code=404)
+            return render_page(request, "Admin", body, status_code=404)
         if amount_c > sender.balance_cents:
             body = "<div class='card'><p style='color:#ff6b6b;'>Insufficient funds for this transfer.</p><p><a href='/admin'>Back</a></p></div>"
-            return HTMLResponse(frame("Admin", body), status_code=400)
+            return render_page(request, "Admin", body, status_code=400)
         sender.balance_cents -= amount_c
         recipient.balance_cents += amount_c
         sender.updated_at = datetime.utcnow()
@@ -6872,9 +7990,9 @@ def redeem_prize(request: Request, kid_id: str = Form(...), prize_id: int = Form
         child = session.exec(select(Child).where(Child.kid_id == kid_id)).first()
         prize = session.get(Prize, prize_id)
         if not child or not prize:
-            return HTMLResponse(frame("Admin", "<div class='card'>Child or prize not found.</div>"))
+            return render_page(request, "Admin", "<div class='card'>Child or prize not found.</div>")
         if prize.cost_cents > child.balance_cents:
-            return HTMLResponse(frame("Admin", "<div class='card'>Insufficient funds for prize.</div>"))
+            return render_page(request, "Admin", "<div class='card'>Insufficient funds for prize.</div>")
         child.balance_cents -= prize.cost_cents
         child.updated_at = datetime.utcnow()
         session.add(Event(child_id=kid_id, change_cents=-prize.cost_cents, reason=f"prize:{prize.name}"))
@@ -6890,7 +8008,7 @@ def delete_prize(request: Request, prize_id: int = Form(...)):
     with Session(engine) as session:
         prize = session.get(Prize, prize_id)
         if not prize:
-            return HTMLResponse(frame("Admin", "<div class='card'>Prize not found.</div>"))
+            return render_page(request, "Admin", "<div class='card'>Prize not found.</div>")
         session.delete(prize)
         session.commit()
     return RedirectResponse("/admin", status_code=302)
@@ -7002,7 +8120,7 @@ async def admin_set_certificate_rate(request: Request):
             "<div class='card'><p style='color:#ff6b6b;'>Enter numeric rates for: "
             f"{details}.</p><p><a href='/admin'>Back</a></p></div>"
         )
-        return HTMLResponse(frame("Admin", body), status_code=400)
+        return render_page(request, "Admin", body, status_code=400)
     if not updates:
         return RedirectResponse("/admin", status_code=302)
     with Session(engine) as session:
@@ -7042,7 +8160,7 @@ async def admin_set_certificate_penalty(request: Request):
             "<div class='card'><p style='color:#ff6b6b;'>Enter whole number penalties for: "
             f"{details}.</p><p><a href='/admin'>Back</a></p></div>"
         )
-        return HTMLResponse(frame("Admin", body), status_code=400)
+        return render_page(request, "Admin", body, status_code=400)
     with Session(engine) as session:
         for code, days in updates.items():
             MetaDAO.set(session, _cd_penalty_meta_key(code), str(days))
@@ -7127,7 +8245,7 @@ def admin_audit(request: Request):
       <div class='card'><h3>Recently Paid</h3><table><tr><th>Kid</th><th>Chore</th><th>Award</th><th>Completed</th></tr>{paid_rows}</table></div>
     </div>
     """
-    return HTMLResponse(frame("Chore Audit", inner))
+    return render_page(request, "Chore Audit", inner)
 
 
 @app.get("/admin/ledger.csv")

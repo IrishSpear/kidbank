@@ -1,9 +1,13 @@
+import json
 import sys
 import types
 from datetime import datetime, timedelta
 
 import pytest
-from fastapi.testclient import TestClient
+try:  # pragma: no cover - allow running without FastAPI installed
+    from fastapi.testclient import TestClient
+except ModuleNotFoundError:  # pragma: no cover
+    from starlette.testclient import TestClient
 from sqlmodel import Session, delete, select, desc
 
 # Ensure the web app can import without the optional dotenv package during tests.
@@ -19,11 +23,25 @@ from kidbank.webapp import (  # noqa: E402
     MoneyRequest,
     app,
     engine,
+    ensure_default_learning_content,
     filter_events,
     list_kid_market_symbols,
     run_migrations,
 )
-from kidbank.webapp import Child, Goal, Event, Chore, ChoreInstance, GlobalChoreClaim, Certificate, Investment, InvestmentTx
+from kidbank.webapp import (
+    Certificate,
+    Child,
+    Chore,
+    ChoreInstance,
+    Event,
+    Goal,
+    GlobalChoreClaim,
+    Investment,
+    InvestmentTx,
+    Lesson,
+    Quiz,
+    QuizAttempt,
+)
 
 
 run_migrations()
@@ -41,12 +59,16 @@ def clean_database() -> None:
             Chore,
             Certificate,
             MoneyRequest,
+            QuizAttempt,
+            Quiz,
+            Lesson,
             Goal,
             Event,
             Child,
         ):
             session.exec(delete(model))
         session.commit()
+    ensure_default_learning_content()
 
 
 def test_goal_deposit_defaults_to_goal_name_without_error() -> None:
@@ -213,3 +235,68 @@ def test_global_chore_claims_respect_redirect_and_pay_award() -> None:
     assert updated_claim is not None and updated_claim.status == GLOBAL_CHORE_STATUS_APPROVED
     assert updated_child is not None and updated_child.balance_cents == 600
     assert payout_event is not None and payout_event.change_cents == 600
+
+
+def test_ui_preferences_toggle_applies_to_body() -> None:
+    client = TestClient(app)
+    response = client.post(
+        "/ui/preferences",
+        data={"font": "dyslexic", "contrast": "high", "redirect_to": "/"},
+        follow_redirects=False,
+    )
+    assert response.status_code == 302
+    home = client.get("/")
+    assert "data-font='dyslexic'" in home.text
+    assert "data-contrast='high'" in home.text
+
+
+def test_kid_lesson_quiz_awards_bonus_once() -> None:
+    client = TestClient(app)
+    with Session(engine) as session:
+        child = Child(kid_id="learner", name="Learner", balance_cents=0, kid_pin="1234")
+        session.add(child)
+        session.commit()
+        session.refresh(child)
+        lesson = Lesson(title="Saving basics", content_md="Be kind to your future self.")
+        session.add(lesson)
+        session.commit()
+        session.refresh(lesson)
+        quiz_payload = {
+            "questions": [
+                {"prompt": "What grows when you save?", "options": ["Choices", "Dust"], "answer": 0},
+            ],
+            "passing_score": 1,
+            "reward_cents": 150,
+        }
+        quiz = Quiz(lesson_id=lesson.id, payload=json.dumps(quiz_payload), reward_cents=150)
+        session.add(quiz)
+        session.commit()
+    login = client.post(
+        "/kid/login", data={"kid_id": "learner", "kid_pin": "1234"}, follow_redirects=False
+    )
+    assert login.status_code == 302
+    lesson_page = client.get(f"/kid/lesson/{lesson.id}")
+    assert lesson_page.status_code == 200
+    assert "Submit answers" in lesson_page.text
+    submit = client.post(
+        f"/kid/lesson/{lesson.id}", data={"q0": "0"}, follow_redirects=False
+    )
+    assert submit.status_code == 302
+    with Session(engine) as session:
+        updated_child = session.exec(select(Child).where(Child.kid_id == "learner")).first()
+        attempts = session.exec(select(QuizAttempt).where(QuizAttempt.child_id == "learner")).all()
+        events = session.exec(select(Event).where(Event.child_id == "learner").order_by(desc(Event.timestamp))).all()
+    assert updated_child is not None and updated_child.balance_cents == 150
+    assert len(attempts) == 1 and attempts[0].score == 1
+    assert any(evt.reason.startswith("lesson_reward:") for evt in events)
+    submit_again = client.post(
+        f"/kid/lesson/{lesson.id}", data={"q0": "0"}, follow_redirects=False
+    )
+    assert submit_again.status_code == 302
+    with Session(engine) as session:
+        child_after = session.exec(select(Child).where(Child.kid_id == "learner")).first()
+        attempts_after = session.exec(
+            select(QuizAttempt).where(QuizAttempt.child_id == "learner").order_by(desc(QuizAttempt.created_at))
+        ).all()
+    assert child_after is not None and child_after.balance_cents == 150
+    assert len(attempts_after) == 2
