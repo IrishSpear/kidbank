@@ -299,7 +299,6 @@ class ChoreListingStatus(str, Enum):
 
     OPEN = "open"
     CLAIMED = "claimed"
-    SUBMITTED = "submitted"
     COMPLETED = "completed"
     CANCELLED = "cancelled"
 
@@ -333,20 +332,13 @@ class ChoreListing:
         self.claimed_by = child_name
         self.claimed_at = when or datetime.utcnow()
 
-    def submit(self, child_name: str, *, when: datetime | None = None) -> None:
+    def complete(self, child_name: str, *, when: datetime | None = None) -> None:
         if self.status is not ChoreListingStatus.CLAIMED:
-            raise ValueError("Listing must be claimed before submission.")
+            raise ValueError("Listing must be claimed before completion.")
         if child_name != self.claimed_by:
-            raise ValueError("Only the child who claimed the listing can submit it.")
-        self.status = ChoreListingStatus.SUBMITTED
-        self.completed_at = when or datetime.utcnow()
-
-    def finalize(self, *, when: datetime | None = None) -> None:
-        if self.status is not ChoreListingStatus.SUBMITTED:
-            raise ValueError("Listing must be submitted before completion.")
+            raise ValueError("Only the child who claimed the listing can complete it.")
         self.status = ChoreListingStatus.COMPLETED
-        if when:
-            self.completed_at = when
+        self.completed_at = when or datetime.utcnow()
 
     def cancel(self, child_name: str, *, when: datetime | None = None) -> None:
         if child_name != self.owner:
@@ -395,14 +387,9 @@ class ChoreMarketplace:
         listing.claim(child_name, when=when)
         return listing
 
-    def submit(self, listing_id: str, child_name: str, *, when: datetime | None = None) -> ChoreListing:
+    def complete(self, listing_id: str, child_name: str, *, when: datetime | None = None) -> ChoreListing:
         listing = self.listing(listing_id)
-        listing.submit(child_name, when=when)
-        return listing
-
-    def finalize(self, listing_id: str, *, when: datetime | None = None) -> ChoreListing:
-        listing = self.listing(listing_id)
-        listing.finalize(when=when)
+        listing.complete(child_name, when=when)
         return listing
 
     def cancel(self, listing_id: str, owner: str, *, when: datetime | None = None) -> ChoreListing:
@@ -419,62 +406,6 @@ class ChoreMarketplace:
             ):
                 return listing
         return None
-
-
-class MarketplacePayoutStatus(str, Enum):
-    """Lifecycle for marketplace payouts awaiting approval."""
-
-    PENDING = "pending"
-    APPROVED = "approved"
-    REJECTED = "rejected"
-
-
-@dataclass(slots=True)
-class MarketplacePayout:
-    """Represents a marketplace payout awaiting administrator action."""
-
-    payout_id: str
-    listing_id: str
-    owner: str
-    worker: str
-    chore_name: str
-    award: Decimal
-    offer: Decimal
-    submitted_at: datetime
-    status: MarketplacePayoutStatus = MarketplacePayoutStatus.PENDING
-    resolved_at: datetime | None = None
-    resolved_by: str | None = None
-    approved_amount: Decimal | None = None
-    reason: str | None = None
-
-    def total(self) -> Decimal:
-        return (self.award + self.offer).quantize(Decimal("0.01"))
-
-    def approve(
-        self,
-        *,
-        actor: str,
-        amount: Decimal,
-        reason: str | None = None,
-        when: datetime | None = None,
-    ) -> None:
-        self.status = MarketplacePayoutStatus.APPROVED
-        self.resolved_by = actor
-        self.resolved_at = when or datetime.utcnow()
-        self.approved_amount = amount
-        self.reason = reason
-
-    def reject(
-        self,
-        *,
-        actor: str,
-        reason: str | None = None,
-        when: datetime | None = None,
-    ) -> None:
-        self.status = MarketplacePayoutStatus.REJECTED
-        self.resolved_by = actor
-        self.resolved_at = when or datetime.utcnow()
-        self.reason = reason
 
 
 class ChoreBoard:

@@ -219,17 +219,11 @@ def test_chore_marketplace_flow() -> None:
     assert bank.get_account("Ava").balance == Decimal("7.50")
 
     bank.claim_marketplace_chore("Ben", listing.listing_id)
-    payout = bank.complete_marketplace_chore("Ben", listing.listing_id)
+    total = bank.complete_marketplace_chore("Ben", listing.listing_id)
 
-    assert payout.total() == Decimal("5.50")
-    assert bank.get_account("Ben").balance == Decimal("0")
-    pending = bank.pending_marketplace_payouts()
-    assert len(pending) == 1 and pending[0].payout_id == payout.payout_id
-    assert bank.marketplace_listings() == ()
-
-    bank.approve_marketplace_payout(payout.payout_id, approver="guardian")
-
+    assert total == Decimal("5.50")
     assert bank.get_account("Ben").balance == Decimal("5.50")
+    assert bank.marketplace_listings() == ()
 
     closed = bank.marketplace_listings(include_closed=True)
     assert len(closed) == 1 and closed[0].status is ChoreListingStatus.COMPLETED
@@ -252,7 +246,7 @@ def test_marketplace_cancellation_refunds_offer() -> None:
     assert cancelled[0].status is ChoreListingStatus.CANCELLED
 
 
-def test_marketplace_payout_override_returns_offer() -> None:
+def test_marketplace_completion_pays_offer_and_award() -> None:
     bank = KidBank()
     bank.create_account("Ava", starting_balance=Decimal("5.00"))
     bank.create_account("Ben")
@@ -260,15 +254,9 @@ def test_marketplace_payout_override_returns_offer() -> None:
 
     listing = bank.list_marketplace_chore("Ava", "Trash", offer=Decimal("2.00"))
     bank.claim_marketplace_chore("Ben", listing.listing_id)
-    payout = bank.complete_marketplace_chore("Ben", listing.listing_id)
+    total = bank.complete_marketplace_chore("Ben", listing.listing_id)
 
-    bank.approve_marketplace_payout(
-        payout.payout_id,
-        approver="guardian",
-        amount=Decimal("4.00"),
-        reason="Missed a few spots",
-    )
-
-    assert bank.get_account("Ben").balance == Decimal("4.00")
-    # Owner should have 5 start - 2 offer hold + 1 refund = 4.00
-    assert bank.get_account("Ava").balance == Decimal("4.00")
+    assert total == Decimal("5.00")
+    assert bank.get_account("Ben").balance == Decimal("5.00")
+    # Owner started with $5, escrowed $2 for the offer and does not receive it back.
+    assert bank.get_account("Ava").balance == Decimal("3.00")
