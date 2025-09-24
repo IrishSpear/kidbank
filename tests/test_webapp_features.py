@@ -16,16 +16,20 @@ dotenv_stub.load_dotenv = lambda: None  # type: ignore[attr-defined]
 sys.modules.setdefault("dotenv", dotenv_stub)
 
 from kidbank.webapp import (  # noqa: E402
+    DAD_PIN,
     GLOBAL_CHORE_KID_ID,
     GLOBAL_CHORE_STATUS_APPROVED,
     GLOBAL_CHORE_STATUS_PENDING,
     KidMarketInstrument,
     MoneyRequest,
+    REMEMBER_NAME_COOKIE,
     app,
+    detailed_history_chart_svg,
     engine,
     ensure_default_learning_content,
     filter_events,
     list_kid_market_symbols,
+    load_admin_privileges,
     run_migrations,
 )
 from kidbank.webapp import (
@@ -39,6 +43,7 @@ from kidbank.webapp import (
     Investment,
     InvestmentTx,
     Lesson,
+    MetaKV,
     Quiz,
     QuizAttempt,
 )
@@ -51,6 +56,7 @@ run_migrations()
 def clean_database() -> None:
     with Session(engine) as session:
         for model in (
+            MetaKV,
             InvestmentTx,
             Investment,
             KidMarketInstrument,
@@ -182,6 +188,214 @@ def test_admin_chore_payout_zero_override_uses_default_award() -> None:
     assert updated_child is not None and updated_child.balance_cents == 150
     assert updated_instance is not None and updated_instance.status == "paid"
     assert payout_event is not None and payout_event.change_cents == 150
+
+
+def test_remember_me_cookie_prefills_username() -> None:
+    client = TestClient(app)
+    with Session(engine) as session:
+        child = Child(kid_id="alex", name="Alex", balance_cents=0, kid_pin="1234")
+        session.add(child)
+        session.commit()
+    login = client.post(
+        "/kid/login",
+        data={"kid_id": "alex", "kid_pin": "1234", "remember_me": "1"},
+        follow_redirects=False,
+    )
+    assert login.status_code == 302
+    assert client.cookies.get(REMEMBER_NAME_COOKIE) == "alex"
+    logout = client.post("/kid/logout", follow_redirects=False)
+    assert logout.status_code == 302
+    landing = client.get("/")
+    assert "value='alex'" in landing.text
+    login_without_remember = client.post(
+        "/kid/login",
+        data={"kid_id": "alex", "kid_pin": "1234"},
+        follow_redirects=False,
+    )
+    assert login_without_remember.status_code == 302
+    assert not client.cookies.get(REMEMBER_NAME_COOKIE)
+    client.post("/kid/logout", follow_redirects=False)
+    landing_after_clear = client.get("/")
+    assert "value='alex'" not in landing_after_clear.text
+
+
+def test_kid_investing_section_alias() -> None:
+    client = TestClient(app)
+    with Session(engine) as session:
+        child = Child(kid_id="ivy", name="Ivy", balance_cents=0, kid_pin="2468")
+        session.add(child)
+        session.commit()
+    login = client.post(
+        "/kid/login", data={"kid_id": "ivy", "kid_pin": "2468"}, follow_redirects=False
+    )
+    assert login.status_code == 302
+    alias_page = client.get("/kid?section=invest")
+    canonical_page = client.get("/kid?section=investing")
+    assert alias_page.status_code == 200
+    assert canonical_page.status_code == 200
+    assert "Investing" in alias_page.text
+    assert "section=investing" in alias_page.text
+    assert "Investing" in canonical_page.text
+
+
+def test_detailed_history_chart_has_no_marker_circles() -> None:
+    now = datetime.utcnow()
+    history = [
+        {"p": 1000, "t": (now - timedelta(days=1)).isoformat()},
+        {"p": 1500, "t": now.isoformat()},
+        {"p": 1400, "t": (now + timedelta(days=1)).isoformat()},
+    ]
+    svg = detailed_history_chart_svg(history, width=300, height=180)
+    assert "<circle" not in svg
+
+
+def test_dad_updates_privileges_and_restricted_admin_blocked() -> None:
+    client = TestClient(app)
+    login = client.post(
+        "/admin/login", data={"pin": DAD_PIN}, follow_redirects=False
+    )
+    assert login.status_code == 302
+    add_admin = client.post(
+        "/admin/add_parent_admin",
+        data={"label": "Grandma", "pin": "4444", "confirm_pin": "4444"},
+        follow_redirects=False,
+    )
+    assert add_admin.status_code == 302
+    update = client.post(
+        "/admin/update_privileges",
+        data={"role": "grandma", "kid_scope": "all", "perm_payouts": "on"},
+        follow_redirects=False,
+    )
+    assert update.status_code == 302
+    assert update.headers["location"] == "/admin?section=admins"
+    with Session(engine) as session:
+        saved_privs = load_admin_privileges(session, "grandma")
+    assert not saved_privs.can_create_accounts
+    logout = client.post("/admin/logout", follow_redirects=False)
+    assert logout.status_code == 302
+    limited_login = client.post(
+        "/admin/login", data={"pin": "4444"}, follow_redirects=False
+    )
+    assert limited_login.status_code == 302
+    attempt_create = client.post(
+        "/create_kid",
+        data={
+            "kid_id": "newkid",
+            "name": "New Kid",
+            "starting": "5.00",
+            "allowance": "1.00",
+            "kid_pin": "0000",
+        },
+        follow_redirects=False,
+    )
+    assert attempt_create.status_code == 302
+    assert attempt_create.headers["location"].startswith("/admin?section=accounts")
+    with Session(engine) as session:
+        assert session.exec(select(Child)).first() is None
+
+
+def test_only_dad_can_update_privileges() -> None:
+    client = TestClient(app)
+    login = client.post(
+        "/admin/login", data={"pin": DAD_PIN}, follow_redirects=False
+    )
+    assert login.status_code == 302
+    add_admin = client.post(
+        "/admin/add_parent_admin",
+        data={"label": "Helper", "pin": "5555", "confirm_pin": "5555"},
+        follow_redirects=False,
+    )
+    assert add_admin.status_code == 302
+    client.post("/admin/logout", follow_redirects=False)
+    helper_login = client.post(
+        "/admin/login", data={"pin": "5555"}, follow_redirects=False
+    )
+    assert helper_login.status_code == 302
+    attempt = client.post(
+        "/admin/update_privileges",
+        data={"role": "helper", "kid_scope": "all"},
+        follow_redirects=False,
+    )
+    assert attempt.status_code == 302
+    assert attempt.headers["location"] == "/admin?section=admins"
+    with Session(engine) as session:
+        privs = load_admin_privileges(session, "helper")
+    assert privs.can_create_accounts
+    assert privs.can_manage_payouts
+
+
+def test_global_chore_multiple_claims_split_evenly() -> None:
+    client = TestClient(app)
+    period_key = "2024-W02"
+    with Session(engine) as session:
+        kids = [
+            Child(kid_id="avery", name="Avery", balance_cents=0),
+            Child(kid_id="blake", name="Blake", balance_cents=0),
+            Child(kid_id="cameron", name="Cameron", balance_cents=0),
+        ]
+        session.add_all(kids)
+        session.commit()
+        for kid in kids:
+            session.refresh(kid)
+        chore = Chore(
+            kid_id=GLOBAL_CHORE_KID_ID,
+            name="Community Cleanup",
+            type="global",
+            award_cents=500,
+            max_claimants=3,
+        )
+        session.add(chore)
+        session.commit()
+        session.refresh(chore)
+        claims: list[GlobalChoreClaim] = []
+        for kid in kids:
+            claim = GlobalChoreClaim(
+                chore_id=chore.id,
+                kid_id=kid.kid_id,
+                period_key=period_key,
+                status=GLOBAL_CHORE_STATUS_PENDING,
+                submitted_at=datetime.utcnow(),
+            )
+            session.add(claim)
+            claims.append(claim)
+        session.commit()
+        for claim in claims:
+            session.refresh(claim)
+        claim_ids = [claim.id for claim in claims]
+        chore_id = chore.id
+    login = client.post(
+        "/admin/login", data={"pin": DAD_PIN}, follow_redirects=False
+    )
+    assert login.status_code == 302
+    form_data = {
+        "decision": "approve",
+        "chore_id": str(chore_id),
+        "period_key": period_key,
+        "redirect": "/admin?section=payouts",
+        "claim_ids": [str(claim_id) for claim_id in claim_ids],
+    }
+    approve = client.post(
+        "/admin/global_chore/claims", data=form_data, follow_redirects=False
+    )
+    assert approve.status_code == 302
+    assert approve.headers["location"] == "/admin?section=payouts"
+    with Session(engine) as session:
+        awards = []
+        balances = []
+        for kid_id in ["avery", "blake", "cameron"]:
+            claim = session.exec(
+                select(GlobalChoreClaim).where(
+                    GlobalChoreClaim.kid_id == kid_id,
+                    GlobalChoreClaim.period_key == period_key,
+                )
+            ).first()
+            child = session.exec(select(Child).where(Child.kid_id == kid_id)).first()
+            assert claim is not None and claim.status == GLOBAL_CHORE_STATUS_APPROVED
+            assert child is not None
+            awards.append(claim.award_cents)
+            balances.append(child.balance_cents)
+    assert sorted(awards) == [166, 167, 167]
+    assert sorted(balances) == [166, 167, 167]
 
 
 def test_global_chore_claims_respect_redirect_and_pay_award() -> None:
