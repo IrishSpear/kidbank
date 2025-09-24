@@ -611,8 +611,13 @@ def run_migrations() -> None:
                 claimed_by TEXT,
                 created_at TEXT,
                 claimed_at TEXT,
+                submitted_at TEXT,
                 completed_at TEXT,
-                cancelled_at TEXT
+                cancelled_at TEXT,
+                final_payout_cents INTEGER,
+                payout_note TEXT,
+                resolved_by TEXT,
+                payout_event_id INTEGER
             );
             """
         )
@@ -628,6 +633,26 @@ def run_migrations() -> None:
             ON marketplacelisting(status);
             """
         )
+        if not _column_exists(raw, "marketplacelisting", "submitted_at"):
+            raw.execute(
+                "ALTER TABLE marketplacelisting ADD COLUMN submitted_at TEXT;"
+            )
+        if not _column_exists(raw, "marketplacelisting", "final_payout_cents"):
+            raw.execute(
+                "ALTER TABLE marketplacelisting ADD COLUMN final_payout_cents INTEGER;"
+            )
+        if not _column_exists(raw, "marketplacelisting", "payout_note"):
+            raw.execute(
+                "ALTER TABLE marketplacelisting ADD COLUMN payout_note TEXT;"
+            )
+        if not _column_exists(raw, "marketplacelisting", "resolved_by"):
+            raw.execute(
+                "ALTER TABLE marketplacelisting ADD COLUMN resolved_by TEXT;"
+            )
+        if not _column_exists(raw, "marketplacelisting", "payout_event_id"):
+            raw.execute(
+                "ALTER TABLE marketplacelisting ADD COLUMN payout_event_id INTEGER;"
+            )
         raw.commit()
     finally:
         raw.close()
