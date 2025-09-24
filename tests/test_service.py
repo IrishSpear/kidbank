@@ -3,7 +3,7 @@ from decimal import Decimal
 
 import pytest
 
-from kidbank.chores import Weekday
+from kidbank.chores import ChoreListingStatus, Weekday
 from kidbank.exceptions import AccountNotFoundError, DuplicateAccountError, InsufficientFundsError
 from kidbank.models import EventCategory, TransactionType, TransferRequestStatus
 from kidbank.service import KidBank
@@ -204,3 +204,71 @@ def test_money_request_flow() -> None:
     bank.respond_money_request(second.request_id, responder="Ben", approve=False)
     assert second.status is TransferRequestStatus.DECLINED
     assert bank.get_account("Ava").balance == Decimal("5.00")
+
+
+def test_chore_marketplace_flow() -> None:
+    bank = KidBank()
+    bank.create_account("Ava")
+    bank.create_account("Ben")
+    bank.deposit("Ava", Decimal("10.00"))
+    bank.schedule_chore("Ava", name="Laundry", value=Decimal("3.00"))
+
+    listing = bank.list_marketplace_chore("Ava", "Laundry", offer=Decimal("2.50"))
+
+    assert listing.offer == Decimal("2.50")
+    assert bank.get_account("Ava").balance == Decimal("7.50")
+
+    bank.claim_marketplace_chore("Ben", listing.listing_id)
+    payout = bank.complete_marketplace_chore("Ben", listing.listing_id)
+
+    assert payout.total() == Decimal("5.50")
+    assert bank.get_account("Ben").balance == Decimal("0")
+    pending = bank.pending_marketplace_payouts()
+    assert len(pending) == 1 and pending[0].payout_id == payout.payout_id
+    assert bank.marketplace_listings() == ()
+
+    bank.approve_marketplace_payout(payout.payout_id, approver="guardian")
+
+    assert bank.get_account("Ben").balance == Decimal("5.50")
+
+    closed = bank.marketplace_listings(include_closed=True)
+    assert len(closed) == 1 and closed[0].status is ChoreListingStatus.COMPLETED
+    assert bank._chores["Ava"].get("Laundry").last_completed is not None
+
+
+def test_marketplace_cancellation_refunds_offer() -> None:
+    bank = KidBank()
+    bank.create_account("Ava", starting_balance=Decimal("5.00"))
+    bank.schedule_chore("Ava", name="Dishes", value=Decimal("1.00"))
+
+    listing = bank.list_marketplace_chore("Ava", "Dishes", offer=Decimal("1.20"))
+    assert bank.get_account("Ava").balance == Decimal("3.80")
+
+    bank.cancel_marketplace_listing("Ava", listing.listing_id)
+
+    assert bank.get_account("Ava").balance == Decimal("5.00")
+    assert bank.marketplace_listings() == ()
+    cancelled = bank.marketplace_listings(include_closed=True)
+    assert cancelled[0].status is ChoreListingStatus.CANCELLED
+
+
+def test_marketplace_payout_override_returns_offer() -> None:
+    bank = KidBank()
+    bank.create_account("Ava", starting_balance=Decimal("5.00"))
+    bank.create_account("Ben")
+    bank.schedule_chore("Ava", name="Trash", value=Decimal("3.00"))
+
+    listing = bank.list_marketplace_chore("Ava", "Trash", offer=Decimal("2.00"))
+    bank.claim_marketplace_chore("Ben", listing.listing_id)
+    payout = bank.complete_marketplace_chore("Ben", listing.listing_id)
+
+    bank.approve_marketplace_payout(
+        payout.payout_id,
+        approver="guardian",
+        amount=Decimal("4.00"),
+        reason="Missed a few spots",
+    )
+
+    assert bank.get_account("Ben").balance == Decimal("4.00")
+    # Owner should have 5 start - 2 offer hold + 1 refund = 4.00
+    assert bank.get_account("Ava").balance == Decimal("4.00")

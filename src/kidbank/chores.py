@@ -5,8 +5,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
-from enum import IntEnum
+from enum import Enum, IntEnum
 from typing import Dict, List, Mapping, Optional, Sequence
+from uuid import uuid4
 
 
 class Weekday(IntEnum):
@@ -293,6 +294,189 @@ class GlobalChore:
         return payout
 
 
+class ChoreListingStatus(str, Enum):
+    """Lifecycle states for marketplace listings."""
+
+    OPEN = "open"
+    CLAIMED = "claimed"
+    SUBMITTED = "submitted"
+    COMPLETED = "completed"
+    CANCELLED = "cancelled"
+
+
+@dataclass(slots=True)
+class ChoreListing:
+    """A listing advertising a chore available for pickup by another child."""
+
+    listing_id: str
+    owner: str
+    chore_name: str
+    offer: Decimal
+    created_at: datetime = field(default_factory=datetime.utcnow)
+    status: ChoreListingStatus = field(default=ChoreListingStatus.OPEN)
+    claimed_by: str | None = None
+    claimed_at: datetime | None = None
+    completed_at: datetime | None = None
+
+    def __post_init__(self) -> None:
+        offer = Decimal(self.offer).quantize(Decimal("0.01"))
+        if offer <= Decimal("0.00"):
+            raise ValueError("Offer must be positive for a marketplace listing.")
+        object.__setattr__(self, "offer", offer)
+
+    def claim(self, child_name: str, *, when: datetime | None = None) -> None:
+        if self.status is not ChoreListingStatus.OPEN:
+            raise ValueError("Listing is not available to claim.")
+        if child_name == self.owner:
+            raise ValueError("Owner cannot claim their own chore listing.")
+        self.status = ChoreListingStatus.CLAIMED
+        self.claimed_by = child_name
+        self.claimed_at = when or datetime.utcnow()
+
+    def submit(self, child_name: str, *, when: datetime | None = None) -> None:
+        if self.status is not ChoreListingStatus.CLAIMED:
+            raise ValueError("Listing must be claimed before submission.")
+        if child_name != self.claimed_by:
+            raise ValueError("Only the child who claimed the listing can submit it.")
+        self.status = ChoreListingStatus.SUBMITTED
+        self.completed_at = when or datetime.utcnow()
+
+    def finalize(self, *, when: datetime | None = None) -> None:
+        if self.status is not ChoreListingStatus.SUBMITTED:
+            raise ValueError("Listing must be submitted before completion.")
+        self.status = ChoreListingStatus.COMPLETED
+        if when:
+            self.completed_at = when
+
+    def cancel(self, child_name: str, *, when: datetime | None = None) -> None:
+        if child_name != self.owner:
+            raise ValueError("Only the owner can cancel the listing.")
+        if self.status is not ChoreListingStatus.OPEN:
+            raise ValueError("Only open listings can be cancelled.")
+        self.status = ChoreListingStatus.CANCELLED
+        self.completed_at = when or datetime.utcnow()
+
+    @property
+    def is_active(self) -> bool:
+        return self.status in (ChoreListingStatus.OPEN, ChoreListingStatus.CLAIMED)
+
+
+class ChoreMarketplace:
+    """Manage marketplace listings for chores."""
+
+    def __init__(self) -> None:
+        self._listings: Dict[str, ChoreListing] = {}
+
+    def create_listing(self, owner: str, chore_name: str, offer: Decimal) -> ChoreListing:
+        if self.active_listing_for(owner, chore_name):
+            raise ValueError(f"Chore '{chore_name}' already has an active listing.")
+        listing = ChoreListing(
+            listing_id=str(uuid4()),
+            owner=owner,
+            chore_name=chore_name,
+            offer=offer,
+        )
+        self._listings[listing.listing_id] = listing
+        return listing
+
+    def listing(self, listing_id: str) -> ChoreListing:
+        try:
+            return self._listings[listing_id]
+        except KeyError as exc:  # pragma: no cover - defensive guard
+            raise KeyError(f"Marketplace listing '{listing_id}' does not exist.") from exc
+
+    def listings(self, *, include_closed: bool = False) -> Sequence[ChoreListing]:
+        if include_closed:
+            return tuple(self._listings.values())
+        return tuple(listing for listing in self._listings.values() if listing.is_active)
+
+    def claim(self, listing_id: str, child_name: str, *, when: datetime | None = None) -> ChoreListing:
+        listing = self.listing(listing_id)
+        listing.claim(child_name, when=when)
+        return listing
+
+    def submit(self, listing_id: str, child_name: str, *, when: datetime | None = None) -> ChoreListing:
+        listing = self.listing(listing_id)
+        listing.submit(child_name, when=when)
+        return listing
+
+    def finalize(self, listing_id: str, *, when: datetime | None = None) -> ChoreListing:
+        listing = self.listing(listing_id)
+        listing.finalize(when=when)
+        return listing
+
+    def cancel(self, listing_id: str, owner: str, *, when: datetime | None = None) -> ChoreListing:
+        listing = self.listing(listing_id)
+        listing.cancel(owner, when=when)
+        return listing
+
+    def active_listing_for(self, owner: str, chore_name: str) -> Optional[ChoreListing]:
+        for listing in self._listings.values():
+            if (
+                listing.owner == owner
+                and listing.chore_name == chore_name
+                and listing.is_active
+            ):
+                return listing
+        return None
+
+
+class MarketplacePayoutStatus(str, Enum):
+    """Lifecycle for marketplace payouts awaiting approval."""
+
+    PENDING = "pending"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+
+
+@dataclass(slots=True)
+class MarketplacePayout:
+    """Represents a marketplace payout awaiting administrator action."""
+
+    payout_id: str
+    listing_id: str
+    owner: str
+    worker: str
+    chore_name: str
+    award: Decimal
+    offer: Decimal
+    submitted_at: datetime
+    status: MarketplacePayoutStatus = MarketplacePayoutStatus.PENDING
+    resolved_at: datetime | None = None
+    resolved_by: str | None = None
+    approved_amount: Decimal | None = None
+    reason: str | None = None
+
+    def total(self) -> Decimal:
+        return (self.award + self.offer).quantize(Decimal("0.01"))
+
+    def approve(
+        self,
+        *,
+        actor: str,
+        amount: Decimal,
+        reason: str | None = None,
+        when: datetime | None = None,
+    ) -> None:
+        self.status = MarketplacePayoutStatus.APPROVED
+        self.resolved_by = actor
+        self.resolved_at = when or datetime.utcnow()
+        self.approved_amount = amount
+        self.reason = reason
+
+    def reject(
+        self,
+        *,
+        actor: str,
+        reason: str | None = None,
+        when: datetime | None = None,
+    ) -> None:
+        self.status = MarketplacePayoutStatus.REJECTED
+        self.resolved_by = actor
+        self.resolved_at = when or datetime.utcnow()
+        self.reason = reason
+
+
 class ChoreBoard:
     """Manage chores and completions for a single child."""
 
@@ -431,4 +615,7 @@ __all__ = [
     "Weekday",
     "GlobalChore",
     "GlobalChoreSubmission",
+    "ChoreListing",
+    "ChoreListingStatus",
+    "ChoreMarketplace",
 ]

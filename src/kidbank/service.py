@@ -14,8 +14,13 @@ from .api import ApiExporter, WebhookDispatcher
 from .chores import (
     Chore,
     ChoreBoard,
+    ChoreMarketplace,
     ChorePack,
     ChoreSchedule,
+    ChoreListing,
+    ChoreListingStatus,
+    MarketplacePayout,
+    MarketplacePayoutStatus,
     GlobalChore,
     GlobalChoreSubmission,
     TimeWindow,
@@ -76,6 +81,8 @@ class KidBank:
         "_next_allowance_eta",
         "_default_soft_limit",
         "_transfer_requests",
+        "_marketplace",
+        "_marketplace_payouts",
     )
 
     def __init__(self, *, soft_limit: AmountLike = Decimal("20")) -> None:
@@ -116,6 +123,8 @@ class KidBank:
         self._next_allowance_eta: Dict[str, Optional[datetime]] = {}
         self._default_soft_limit = to_decimal(soft_limit)
         self._transfer_requests: Dict[str, TransferRequest] = {}
+        self._marketplace = ChoreMarketplace()
+        self._marketplace_payouts: Dict[str, MarketplacePayout] = {}
 
     # ------------------------------------------------------------------
     # Core account operations
@@ -534,6 +543,223 @@ class KidBank:
             )
         self._audit_log.record(approved_by, "approve_global_chore", chore_name)
         return payouts
+
+    def marketplace_listings(self, *, include_closed: bool = False) -> Sequence[ChoreListing]:
+        """Return marketplace listings, optionally including closed ones."""
+
+        return self._marketplace.listings(include_closed=include_closed)
+
+    def list_marketplace_chore(
+        self,
+        owner: str,
+        chore_name: str,
+        *,
+        offer: AmountLike,
+    ) -> ChoreListing:
+        """Publish one of the owner's chores to the marketplace."""
+
+        self.get_account(owner)
+        board = self._chores[owner]
+        board.get(chore_name)
+        if self._marketplace.active_listing_for(owner, chore_name):
+            raise ValueError(f"Chore '{chore_name}' already has an active marketplace listing.")
+        offer_value = to_decimal(offer)
+        if offer_value <= Decimal("0.00"):
+            raise ValueError("Marketplace offer must be positive.")
+        escrow = self.withdraw(
+            owner,
+            offer_value,
+            f"Marketplace listing escrow: {chore_name}",
+            category=EventCategory.CHORE,
+            metadata={"marketplace": "escrow", "chore": chore_name},
+        )
+        listing = self._marketplace.create_listing(owner, chore_name, offer_value)
+        escrow.metadata["listing"] = listing.listing_id
+        self._audit_log.record(owner, "marketplace_list", f"{chore_name}:{offer_value}")
+        self._logger.log("marketplace_listed", owner=owner, chore=chore_name, offer=float(offer_value))
+        return listing
+
+    def claim_marketplace_chore(self, child_name: str, listing_id: str) -> ChoreListing:
+        """Allow another child to claim an open marketplace listing."""
+
+        self.get_account(child_name)
+        listing = self._marketplace.claim(listing_id, child_name)
+        self._audit_log.record(child_name, "marketplace_claim", listing.chore_name)
+        self._logger.log("marketplace_claimed", listing=listing_id, child=child_name)
+        return listing
+
+    def complete_marketplace_chore(
+        self,
+        child_name: str,
+        listing_id: str,
+        *,
+        proof: Optional[str] = None,
+        at: Optional[datetime] = None,
+    ) -> MarketplacePayout:
+        """Submit a marketplace chore for approval and queue the payout."""
+
+        self.get_account(child_name)
+        listing = self._marketplace.listing(listing_id)
+        if listing.status is not ChoreListingStatus.CLAIMED:
+            raise ValueError("Marketplace listing is not ready for completion.")
+        if listing.claimed_by != child_name:
+            raise ValueError("This marketplace listing was claimed by another child.")
+        board = self._chores[listing.owner]
+        completion = board.complete_chore(listing.chore_name, at=at, proof=proof)
+        self._marketplace.submit(listing_id, child_name, when=completion.timestamp)
+        payout = MarketplacePayout(
+            payout_id=str(uuid4()),
+            listing_id=listing.listing_id,
+            owner=listing.owner,
+            worker=child_name,
+            chore_name=listing.chore_name,
+            award=completion.awarded_value,
+            offer=listing.offer,
+            submitted_at=completion.timestamp,
+        )
+        self._marketplace_payouts[payout.payout_id] = payout
+        self._audit_log.record(child_name, "marketplace_submit", listing.chore_name)
+        self._logger.log(
+            "marketplace_submitted",
+            listing=listing.listing_id,
+            worker=child_name,
+            owner=listing.owner,
+            total=float(payout.total()),
+        )
+        self.evaluate_badges(listing.owner)
+        return payout
+
+    def pending_marketplace_payouts(self) -> Sequence[MarketplacePayout]:
+        """Return marketplace payouts waiting for administrator approval."""
+
+        return tuple(
+            payout
+            for payout in self._marketplace_payouts.values()
+            if payout.status is MarketplacePayoutStatus.PENDING
+        )
+
+    def approve_marketplace_payout(
+        self,
+        payout_id: str,
+        *,
+        approver: str,
+        amount: AmountLike | None = None,
+        reason: str | None = None,
+    ) -> MarketplacePayout:
+        payout = self._marketplace_payouts[payout_id]
+        if payout.status is not MarketplacePayoutStatus.PENDING:
+            raise ValueError("Marketplace payout has already been resolved.")
+        listing = self._marketplace.listing(payout.listing_id)
+        if listing.status is not ChoreListingStatus.SUBMITTED:
+            raise ValueError("Marketplace listing is not awaiting approval.")
+        default_total = payout.total()
+        approved = (
+            to_decimal(amount)
+            if amount is not None
+            else default_total
+        ).quantize(Decimal("0.01"))
+        if approved <= Decimal("0.00"):
+            approved = default_total
+        if approved > default_total:
+            approved = default_total
+        metadata = {
+            "marketplace": "payout",
+            "listing": payout.listing_id,
+            "chore": payout.chore_name,
+            "owner": payout.owner,
+            "award": str(payout.award),
+            "offer": str(payout.offer),
+            "approved": str(approved),
+            "approved_by": approver,
+        }
+        if reason:
+            metadata["reason"] = reason
+        transaction = self.deposit(
+            payout.worker,
+            approved,
+            f"Marketplace chore completed: {payout.chore_name}",
+            category=EventCategory.CHORE,
+            metadata=metadata,
+        )
+        owner_offer = payout.offer
+        award_component = payout.award
+        extra_from_owner = max(approved - award_component, Decimal("0.00"))
+        used_offer = min(owner_offer, extra_from_owner)
+        refund = (owner_offer - used_offer).quantize(Decimal("0.01"))
+        if refund > Decimal("0.00"):
+            refund_metadata = {
+                "marketplace": "refund",
+                "listing": payout.listing_id,
+                "chore": payout.chore_name,
+                "worker": payout.worker,
+                "approved": str(approved),
+                "approved_by": approver,
+            }
+            if reason:
+                refund_metadata["reason"] = reason
+            self.deposit(
+                payout.owner,
+                refund,
+                f"Marketplace offer returned: {payout.chore_name}",
+                category=EventCategory.CHORE,
+                metadata=refund_metadata,
+            )
+        payout.approve(actor=approver, amount=approved, reason=reason)
+        self._marketplace.finalize(payout.listing_id, when=payout.resolved_at)
+        self._audit_log.record(approver, "marketplace_approve", payout.chore_name)
+        self._logger.log(
+            "marketplace_completed",
+            listing=payout.listing_id,
+            worker=payout.worker,
+            owner=payout.owner,
+            payout=float(approved),
+            transaction_id=transaction.timestamp.isoformat(),
+        )
+        return payout
+
+    def reject_marketplace_payout(
+        self,
+        payout_id: str,
+        *,
+        approver: str,
+        reason: str | None = None,
+    ) -> MarketplacePayout:
+        payout = self._marketplace_payouts[payout_id]
+        if payout.status is not MarketplacePayoutStatus.PENDING:
+            raise ValueError("Marketplace payout has already been resolved.")
+        listing = self._marketplace.listing(payout.listing_id)
+        if listing.status is not ChoreListingStatus.SUBMITTED:
+            raise ValueError("Marketplace listing is not awaiting approval.")
+        payout.reject(actor=approver, reason=reason)
+        listing.status = ChoreListingStatus.CLAIMED
+        listing.completed_at = None
+        self._audit_log.record(approver, "marketplace_reject", payout.chore_name)
+        self._logger.log(
+            "marketplace_rejected",
+            listing=payout.listing_id,
+            worker=payout.worker,
+            owner=payout.owner,
+        )
+        return payout
+
+    def cancel_marketplace_listing(self, owner: str, listing_id: str) -> ChoreListing:
+        """Cancel an open marketplace listing and refund the escrowed funds."""
+
+        self.get_account(owner)
+        listing = self._marketplace.listing(listing_id)
+        if listing.owner != owner:
+            raise ValueError("Only the owner can cancel this marketplace listing.")
+        self._marketplace.cancel(listing_id, owner)
+        self.deposit(
+            owner,
+            listing.offer,
+            f"Marketplace listing cancelled: {listing.chore_name}",
+            category=EventCategory.CHORE,
+            metadata={"marketplace": "refund", "listing": listing.listing_id, "chore": listing.chore_name},
+        )
+        self._audit_log.record(owner, "marketplace_cancel", listing.chore_name)
+        self._logger.log("marketplace_cancelled", owner=owner, listing=listing.listing_id)
+        return listing
 
     def auto_republish_chores(self, *, at: Optional[datetime] = None) -> Dict[str, Sequence[str]]:
         republished: Dict[str, Sequence[str]] = {}
