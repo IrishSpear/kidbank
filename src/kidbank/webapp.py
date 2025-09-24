@@ -28,6 +28,7 @@ import re
 import sqlite3
 import statistics
 import textwrap
+from dataclasses import dataclass, field
 from decimal import Decimal, ROUND_HALF_UP
 from datetime import date, datetime, timedelta
 from html import escape as html_escape
@@ -143,6 +144,7 @@ SERVICE_WORKER_JS = (
 
 
 REMEMBER_COOKIE_NAME = "kid_remember"
+REMEMBER_NAME_COOKIE = "kid_remember_name"
 REMEMBER_COOKIE_LIFETIME = timedelta(days=30)
 REMEMBER_COOKIE_MAX_AGE = int(REMEMBER_COOKIE_LIFETIME.total_seconds())
 
@@ -1741,6 +1743,247 @@ def set_parent_pin(role: str, new_pin: str) -> None:
         session.commit()
 
 
+ADMIN_PRIV_META_PREFIX = "admin_privileges:"
+
+
+@dataclass
+class AdminPrivileges:
+    role: str
+    kid_scope: str = "all"
+    kid_ids: List[str] = field(default_factory=list)
+    max_credit_cents: Optional[int] = None
+    max_debit_cents: Optional[int] = None
+    can_manage_payouts: bool = True
+    can_manage_chores: bool = True
+    can_manage_time: bool = True
+    can_manage_allowance: bool = True
+    can_manage_prizes: bool = True
+    can_create_accounts: bool = True
+    can_delete_accounts: bool = True
+    can_adjust_balances: bool = True
+    can_transfer_funds: bool = True
+    can_create_admins: bool = True
+    can_delete_admins: bool = True
+    can_change_admin_pins: bool = True
+    can_manage_investing: bool = True
+    _kid_lookup: Set[str] = field(init=False, repr=False, default_factory=set)
+
+    def __post_init__(self) -> None:
+        scope = self.kid_scope if self.kid_scope in {"all", "custom"} else "all"
+        object.__setattr__(self, "kid_scope", scope)
+        cleaned_ids = sorted({kid.strip() for kid in self.kid_ids if kid and kid.strip()})
+        object.__setattr__(self, "kid_ids", cleaned_ids)
+        object.__setattr__(self, "_kid_lookup", {kid.lower() for kid in cleaned_ids})
+        credit_limit = self.max_credit_cents if isinstance(self.max_credit_cents, int) else None
+        debit_limit = self.max_debit_cents if isinstance(self.max_debit_cents, int) else None
+        if credit_limit is not None and credit_limit < 0:
+            credit_limit = None
+        if debit_limit is not None and debit_limit < 0:
+            debit_limit = None
+        object.__setattr__(self, "max_credit_cents", credit_limit)
+        object.__setattr__(self, "max_debit_cents", debit_limit)
+
+    @property
+    def is_all_kids(self) -> bool:
+        return self.kid_scope != "custom"
+
+    def allows_kid(self, kid_id: str) -> bool:
+        if not kid_id or self.is_all_kids:
+            return True
+        if kid_id == GLOBAL_CHORE_KID_ID:
+            return True
+        return kid_id.lower() in self._kid_lookup
+
+    def credit_allowed(self, amount_cents: int) -> bool:
+        if amount_cents <= 0:
+            return True
+        if self.max_credit_cents is None:
+            return True
+        return amount_cents <= self.max_credit_cents
+
+    def debit_allowed(self, amount_cents: int) -> bool:
+        if amount_cents <= 0:
+            return True
+        if self.max_debit_cents is None:
+            return True
+        return amount_cents <= self.max_debit_cents
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "kid_scope": self.kid_scope,
+            "kid_ids": list(self.kid_ids),
+            "max_credit_cents": self.max_credit_cents,
+            "max_debit_cents": self.max_debit_cents,
+            "can_manage_payouts": self.can_manage_payouts,
+            "can_manage_chores": self.can_manage_chores,
+            "can_manage_time": self.can_manage_time,
+            "can_manage_allowance": self.can_manage_allowance,
+            "can_manage_prizes": self.can_manage_prizes,
+            "can_create_accounts": self.can_create_accounts,
+            "can_delete_accounts": self.can_delete_accounts,
+            "can_adjust_balances": self.can_adjust_balances,
+            "can_transfer_funds": self.can_transfer_funds,
+            "can_create_admins": self.can_create_admins,
+            "can_delete_admins": self.can_delete_admins,
+            "can_change_admin_pins": self.can_change_admin_pins,
+            "can_manage_investing": self.can_manage_investing,
+        }
+
+    @classmethod
+    def from_dict(cls, role: str, data: Dict[str, Any]) -> "AdminPrivileges":
+        if not isinstance(data, dict):
+            data = {}
+
+        def _bool(name: str, default: bool) -> bool:
+            value = data.get(name, default)
+            return bool(value) if not isinstance(value, str) else value.lower() in {"1", "true", "yes", "on"}
+
+        def _int_or_none(name: str) -> Optional[int]:
+            value = data.get(name)
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return None
+
+        return cls(
+            role=role,
+            kid_scope=str(data.get("kid_scope", "all")),
+            kid_ids=list(data.get("kid_ids", [])),
+            max_credit_cents=_int_or_none("max_credit_cents"),
+            max_debit_cents=_int_or_none("max_debit_cents"),
+            can_manage_payouts=_bool("can_manage_payouts", True),
+            can_manage_chores=_bool("can_manage_chores", True),
+            can_manage_time=_bool("can_manage_time", True),
+            can_manage_allowance=_bool("can_manage_allowance", True),
+            can_manage_prizes=_bool("can_manage_prizes", True),
+            can_create_accounts=_bool("can_create_accounts", True),
+            can_delete_accounts=_bool("can_delete_accounts", True),
+            can_adjust_balances=_bool("can_adjust_balances", True),
+            can_transfer_funds=_bool("can_transfer_funds", True),
+            can_create_admins=_bool("can_create_admins", True),
+            can_delete_admins=_bool("can_delete_admins", True),
+            can_change_admin_pins=_bool("can_change_admin_pins", True),
+            can_manage_investing=_bool("can_manage_investing", True),
+        )
+
+    @classmethod
+    def default(cls, role: str) -> "AdminPrivileges":
+        return cls(role=role)
+
+
+def _admin_priv_key(role: str) -> str:
+    return f"{ADMIN_PRIV_META_PREFIX}{role}"
+
+
+def load_admin_privileges(session: Session, role: str) -> AdminPrivileges:
+    normalized = (role or "").strip().lower()
+    if not normalized:
+        return AdminPrivileges.default("admin")
+    if normalized == "dad":
+        return AdminPrivileges.default(normalized)
+    raw = MetaDAO.get(session, _admin_priv_key(normalized))
+    data: Dict[str, Any] = {}
+    if raw:
+        try:
+            data = json.loads(raw)
+        except Exception:
+            data = {}
+    return AdminPrivileges.from_dict(normalized, data)
+
+
+def save_admin_privileges(session: Session, privileges: AdminPrivileges) -> None:
+    if privileges.role in {role for role in DEFAULT_PARENT_ROLES}:
+        return
+    MetaDAO.set(session, _admin_priv_key(privileges.role), json.dumps(privileges.to_dict()))
+
+
+def delete_admin_privileges(session: Session, role: str) -> None:
+    normalized = (role or "").strip().lower()
+    if not normalized:
+        return
+    if normalized in DEFAULT_PARENT_ROLES:
+        return
+    key = _admin_priv_key(normalized)
+    entry = session.get(MetaKV, key)
+    if entry:
+        session.delete(entry)
+
+
+def current_admin_privileges(request: Request, session: Session | None = None) -> AdminPrivileges:
+    cached = getattr(request.state, "_admin_privileges", None)
+    if cached is not None:
+        return cached  # type: ignore[return-value]
+    role = admin_role(request) or ""
+    if session is None:
+        with Session(engine) as temp:
+            privileges = load_admin_privileges(temp, role)
+    else:
+        privileges = load_admin_privileges(session, role)
+    request.state._admin_privileges = privileges  # type: ignore[attr-defined]
+    return privileges
+
+
+def admin_forbidden(request: Request, message: str, redirect: str = "/admin") -> RedirectResponse:
+    set_admin_notice(request, message, "error")
+    return RedirectResponse(redirect, status_code=302)
+
+
+def require_admin_permission(
+    request: Request,
+    attribute: str,
+    *,
+    redirect: str = "/admin",
+) -> Optional[RedirectResponse]:
+    if (redirect_response := require_admin(request)) is not None:
+        return redirect_response
+    privileges = current_admin_privileges(request)
+    allowed = getattr(privileges, attribute, False)
+    if not allowed:
+        return admin_forbidden(request, "You do not have permission to perform that action.", redirect)
+    return None
+
+
+def ensure_admin_kid_access(
+    request: Request,
+    kid_id: Optional[str],
+    *,
+    redirect: str = "/admin",
+) -> Optional[RedirectResponse]:
+    if not kid_id:
+        return None
+    privileges = current_admin_privileges(request)
+    if privileges.allows_kid(kid_id):
+        return None
+    return admin_forbidden(request, "You do not have access to that kid.", redirect)
+
+
+def ensure_admin_amount_within_limits(
+    request: Request,
+    amount_cents: int,
+    kind: str,
+    *,
+    redirect: str = "/admin",
+) -> Optional[RedirectResponse]:
+    privileges = current_admin_privileges(request)
+    if kind == "credit" and not privileges.credit_allowed(amount_cents):
+        limit = privileges.max_credit_cents
+        if limit is not None:
+            return admin_forbidden(
+                request,
+                f"Credits above {usd(limit)} require approval from a full administrator.",
+                redirect,
+            )
+    if kind == "debit" and not privileges.debit_allowed(amount_cents):
+        limit = privileges.max_debit_cents
+        if limit is not None:
+            return admin_forbidden(
+                request,
+                f"Debits above {usd(limit)} require approval from a full administrator.",
+                redirect,
+            )
+    return None
+
+
 def _parse_rate(raw: Optional[str]) -> Optional[int]:
     if raw is None:
         return None
@@ -2822,7 +3065,6 @@ def detailed_history_chart_svg(
             + html_escape(tick_label)
             + "</text>"
         )
-    marker = f"<circle cx='{x_positions[-1]:.2f}' cy='{y_positions[-1]:.2f}' r='3.5' fill='{color}'/>"
     return (
         f"<svg class='chart chart--detail' width='{width}' height='{height}' "
         f"viewBox='0 0 {width} {height}' xmlns='http://www.w3.org/2000/svg' "
@@ -2837,7 +3079,6 @@ def detailed_history_chart_svg(
         f"stroke='{axis_color}' stroke-width='1'/>"
         + "".join(y_labels)
         + "".join(x_labels)
-        + marker
         + "</svg>"
     )
 
@@ -2927,12 +3168,14 @@ def offline_page(request: Request) -> HTMLResponse:
 def landing(request: Request) -> HTMLResponse:
     if kid_authed(request):
         return RedirectResponse("/kid", status_code=302)
+    remembered_kid = html_escape(request.cookies.get(REMEMBER_NAME_COOKIE, "") or "")
+    kid_prefill_attr = f" value='{remembered_kid}'" if remembered_kid else ""
     inner = """
     <div class='grid'>
       <div class='card'>
         <h3>Kid Sign-In</h3>
         <form method='post' action='/kid/login'>
-          <label>kid_id</label><input name='kid_id' placeholder='e.g. alex01' required>
+          <label>kid_id</label><input name='kid_id' placeholder='e.g. alex01'""" + kid_prefill_attr + """ required>
           <label style='margin-top:8px;'>PIN</label><input name='kid_pin' placeholder='your PIN' required>
           <label class='checkbox' style='margin-top:8px; display:flex; align-items:center; gap:6px;'><input type='checkbox' name='remember_me' value='1'> <span>Remember me</span></label>
           <button type='submit' style='margin-top:10px;'>View My Account</button>
@@ -2974,8 +3217,17 @@ def kid_login(
             samesite="lax",
             path="/",
         )
+        response.set_cookie(
+            REMEMBER_NAME_COOKIE,
+            kid_id,
+            max_age=REMEMBER_COOKIE_MAX_AGE,
+            httponly=True,
+            samesite="lax",
+            path="/",
+        )
     else:
         response.delete_cookie(REMEMBER_COOKIE_NAME, path="/")
+        response.delete_cookie(REMEMBER_NAME_COOKIE, path="/")
     return response
 
 
@@ -2992,6 +3244,9 @@ def kid_home(
     kid_id = kid_authed(request)
     assert kid_id
     selected_section = (section or "overview").strip().lower()
+    selected_section = {"invest": "investing", "investments": "investing"}.get(
+        selected_section, selected_section
+    )
     moment = now_local()
     today = moment.date()
     requested_day = (chore_day or "").strip()
@@ -5933,6 +6188,8 @@ def admin_home(
         notice_html = f"<div class='card' style='margin-bottom:12px; {style}'><div>{html_escape(notice_msg)}</div></div>"
     with Session(engine) as session:
         kids = session.exec(select(Child).order_by(Child.name)).all()
+        all_kids = list(kids)
+        admin_privs = current_admin_privileges(request, session)
         prizes = session.exec(select(Prize).order_by(desc(Prize.created_at))).all()
         events_limit = 160 if (admin_events_query or admin_events_kid or admin_events_dir != "all") else 60
         events = session.exec(
@@ -5980,6 +6237,10 @@ def admin_home(
         ).all()
         time_settings = get_time_settings(session)
         parent_admins = all_parent_admins(session)
+        privileges_by_role = {
+            entry["role"]: load_admin_privileges(session, entry["role"])
+            for entry in parent_admins
+        }
         approved_global_claims = session.exec(
             select(GlobalChoreClaim)
             .where(GlobalChoreClaim.status == GLOBAL_CHORE_STATUS_APPROVED)
@@ -5988,10 +6249,37 @@ def admin_home(
             select(MoneyRequest).where(MoneyRequest.status == "pending")
         ).all()
         goals_all = session.exec(select(Goal)).all()
+    def _kid_allowed(identifier: Optional[str]) -> bool:
+        if not identifier:
+            return True
+        return admin_privs.allows_kid(identifier)
+
+    if not admin_privs.is_all_kids:
+        kids = [kid for kid in kids if admin_privs.allows_kid(kid.kid_id)]
+    else:
+        kids = list(kids)
+
+    events = [event for event in events if _kid_allowed(event.child_id)]
+    analytics_events = [event for event in analytics_events if _kid_allowed(event.child_id)]
+    approval_pairs = [pair for pair in approval_pairs if _kid_allowed(pair[1].child_id)]
+    pending = [item for item in pending if _kid_allowed(item[2].kid_id)]
+    global_pending = [item for item in global_pending if _kid_allowed(item[1].kid_id)]
+    approved_global_claims = [
+        claim for claim in approved_global_claims if _kid_allowed(claim.kid_id)
+    ]
+    pending_money_requests = [
+        req
+        for req in pending_money_requests
+        if _kid_allowed(req.from_kid_id) or _kid_allowed(req.to_kid_id)
+    ]
+    goals_all = [goal for goal in goals_all if _kid_allowed(goal.kid_id)]
+    needs = [entry for entry in needs if _kid_allowed(entry[1].kid_id)]
+
     approved_lookup: Dict[Tuple[int, str], List[GlobalChoreClaim]] = {}
     for approved in approved_global_claims:
         approved_lookup.setdefault((approved.chore_id, approved.period_key), []).append(approved)
     kids_by_id = {kid.kid_id: kid for kid in kids}
+    all_kids_by_id = {kid.kid_id: kid for kid in all_kids}
     total_cash_c = sum(child.balance_cents for child in kids)
     total_market_value_c = 0
     total_cd_value_c = 0
@@ -6101,28 +6389,49 @@ def admin_home(
         f"<option value='{admin['role']}'>{html_escape(admin['label'])}</option>"
         for admin in parent_admins
     )
-    goals_rows = "".join(
-        (
-            "<tr>"
-            f"<td data-label='Kid'><b>{html_escape(child.name)}</b><div class='muted'>{child.kid_id}</div></td>"
-            f"<td data-label='Goal'><b>{html_escape(goal.name)}</b></td>"
-            f"<td data-label='Saved' class='right'>{usd(goal.saved_cents)} / {usd(goal.target_cents)}"
-            f"<div class='muted'>{format_percent(percent_complete(goal.saved_cents, goal.target_cents))} complete</div></td>"
-            f"<td data-label='Actions' class='right'>"
-            f"<form class='inline' method='post' action='/admin/goal_grant'><input type='hidden' name='goal_id' value='{goal.id}'><button type='submit'>Grant Goal</button></form> "
-            f"<form class='inline' method='post' action='/admin/goal_return_funds' style='margin-left:6px;'><input type='hidden' name='goal_id' value='{goal.id}'><button type='submit' class='danger'>Return Funds</button></form>"
-            "</td></tr>"
+    if admin_privs.can_manage_allowance:
+        goals_rows = "".join(
+            (
+                "<tr>"
+                f"<td data-label='Kid'><b>{html_escape(child.name)}</b><div class='muted'>{child.kid_id}</div></td>"
+                f"<td data-label='Goal'><b>{html_escape(goal.name)}</b></td>"
+                f"<td data-label='Saved' class='right'>{usd(goal.saved_cents)} / {usd(goal.target_cents)}"
+                f"<div class='muted'>{format_percent(percent_complete(goal.saved_cents, goal.target_cents))} complete</div></td>"
+                f"<td data-label='Actions' class='right'>"
+                f"<form class='inline' method='post' action='/admin/goal_grant'><input type='hidden' name='goal_id' value='{goal.id}'><button type='submit'>Grant Goal</button></form> "
+                f"<form class='inline' method='post' action='/admin/goal_return_funds' style='margin-left:6px;'><input type='hidden' name='goal_id' value='{goal.id}'><button type='submit' class='danger'>Return Funds</button></form>"
+                "</td></tr>"
+            )
+            for goal, child in needs
+        ) or "<tr><td colspan='4' class='muted'>(none)</td></tr>"
+        goals_card = (
+            "<div class='card'>"
+            "<h3>Goals Needing Action</h3>"
+            "<table><tr><th>Kid</th><th>Goal</th><th>Saved</th><th>Actions</th></tr>"
+            f"{goals_rows}</table>"
+            "<p class='muted' style='margin-top:6px;'>Grant allows the kid to spend the saved amount. Return moves funds back to their balance.</p>"
+            "</div>"
         )
-        for goal, child in needs
-    ) or "<tr><td colspan='4' class='muted'>(none)</td></tr>"
-    goals_card = (
-        "<div class='card'>"
-        "<h3>Goals Needing Action</h3>"
-        "<table><tr><th>Kid</th><th>Goal</th><th>Saved</th><th>Actions</th></tr>"
-        f"{goals_rows}</table>"
-        "<p class='muted' style='margin-top:6px;'>Grant allows the kid to spend the saved amount. Return moves funds back to their balance.</p>"
-        "</div>"
-    )
+    else:
+        goals_rows = "".join(
+            (
+                "<tr>"
+                f"<td data-label='Kid'><b>{html_escape(child.name)}</b><div class='muted'>{child.kid_id}</div></td>"
+                f"<td data-label='Goal'><b>{html_escape(goal.name)}</b></td>"
+                f"<td data-label='Saved' class='right'>{usd(goal.saved_cents)} / {usd(goal.target_cents)}"
+                f"<div class='muted'>{format_percent(percent_complete(goal.saved_cents, goal.target_cents))} complete</div></td>"
+                "</tr>"
+            )
+            for goal, child in needs
+        ) or "<tr><td colspan='3' class='muted'>(none)</td></tr>"
+        goals_card = (
+            "<div class='card'>"
+            "<h3>Goals Needing Action</h3>"
+            "<p class='muted'>View-only — goals can be granted or refunded by a full administrator.</p>"
+            "<table><tr><th>Kid</th><th>Goal</th><th>Saved</th></tr>"
+            f"{goals_rows}</table>"
+            "</div>"
+        )
     pending_rows_parts: List[str] = []
     for inst, chore, child in pending:
         submitted = inst.completed_at.strftime("%Y-%m-%d %H:%M") if inst.completed_at else ""
@@ -6224,14 +6533,47 @@ def admin_home(
             "</tr>"
         )
     pending_rows = "".join(pending_rows_parts) or "<tr><td colspan='5' class='muted'>(no pending)</td></tr>"
-    pending_card = (
-        "<div class='card'>"
-        "<h3>Pending Payouts</h3>"
-        "<table><tr><th>Kid</th><th>Chore</th><th>Award</th><th>Completed</th><th>Actions</th></tr>"
-        f"{pending_rows}</table>"
-        "<p class='muted' style='margin-top:6px;'>Audit trail: <a href='/admin/audit'>Pending vs Paid</a></p>"
-        "</div>"
-    )
+    if admin_privs.can_manage_payouts:
+        pending_card = (
+            "<div class='card'>"
+            "<h3>Pending Payouts</h3>"
+            "<table><tr><th>Kid</th><th>Chore</th><th>Award</th><th>Completed</th><th>Actions</th></tr>"
+            f"{pending_rows}</table>"
+            "<p class='muted' style='margin-top:6px;'>Audit trail: <a href='/admin/audit'>Pending vs Paid</a></p>"
+            "</div>"
+        )
+    else:
+        readonly_rows: List[str] = []
+        for inst, chore, child in pending:
+            submitted = inst.completed_at.strftime("%Y-%m-%d %H:%M") if inst.completed_at else ""
+            readonly_rows.append(
+                "<tr>"
+                f"<td data-label='Kid'><b>{html_escape(child.name)}</b><div class='muted'>{child.kid_id}</div></td>"
+                f"<td data-label='Chore'><b>{html_escape(chore.name)}</b><div class='muted'>{chore.type}</div></td>"
+                f"<td data-label='Award' class='right'><b>{usd(chore.award_cents)}</b></td>"
+                f"<td data-label='Completed'>{submitted}</td>"
+                "</tr>"
+            )
+        for claim, claimant, chore in global_pending:
+            submitted = claim.submitted_at.strftime("%Y-%m-%d %H:%M") if claim.submitted_at else ""
+            readonly_rows.append(
+                "<tr>"
+                f"<td data-label='Kid'><b>{html_escape(claimant.name)}</b><div class='muted'>{claimant.kid_id}</div></td>"
+                f"<td data-label='Chore'><b>{html_escape(chore.name)}</b><div class='muted'>Free-for-all ({html_escape(claim.period_key)})</div></td>"
+                f"<td data-label='Award' class='right'><b>{usd(chore.award_cents)}</b></td>"
+                f"<td data-label='Completed'>{submitted}</td>"
+                "</tr>"
+            )
+        readonly_table = "".join(readonly_rows) or "<tr><td colspan='4' class='muted'>(no pending)</td></tr>"
+        pending_card = (
+            "<div class='card'>"
+            "<h3>Pending Payouts</h3>"
+            "<p class='muted'>View-only — contact a full administrator to approve or deny payouts.</p>"
+            "<table><tr><th>Kid</th><th>Chore</th><th>Award</th><th>Completed</th></tr>"
+            f"{readonly_table}</table>"
+            "</div>"
+        )
+        multi_modals = []
     total_assets_c = total_cash_c + total_market_value_c + total_cd_value_c
     kids_count = len(kids)
     pending_payout_count = len(pending)
@@ -6590,25 +6932,54 @@ def admin_home(
     if selected_child:
         child_obj = kids_by_id.get(selected_child)
         if child_obj:
+            action_links: List[str] = [
+                f"<a href='/admin/kiosk?kid_id={child_obj.kid_id}' class='button-link secondary'>Kiosk</a>",
+                f"<a href='/admin/kiosk_full?kid_id={child_obj.kid_id}' class='button-link secondary'>Kiosk (auto)</a>",
+            ]
+            if admin_privs.can_manage_chores:
+                action_links.append(
+                    f"<a href='/admin/chores?kid_id={child_obj.kid_id}' class='button-link secondary'>Manage chores</a>"
+                )
+            if admin_privs.can_manage_allowance:
+                action_links.append(
+                    f"<a href='/admin/goals?kid_id={child_obj.kid_id}' class='button-link secondary'>Goals</a>"
+                )
+            action_links.append(
+                f"<a href='/admin/statement?kid_id={child_obj.kid_id}' class='button-link secondary'>Statement</a>"
+            )
+            detail_forms: List[str] = []
+            if admin_privs.can_create_accounts:
+                detail_forms.append(
+                    f"<form method='post' action='/admin/set_allowance' class='stacked-form'><input type='hidden' name='kid_id' value='{child_obj.kid_id}'><label>Allowance (dollars / week)</label><input name='allowance' type='text' data-money value='{dollars_value(child_obj.allowance_cents)}'><button type='submit'>Save Allowance</button></form>"
+                )
+                detail_forms.append(
+                    f"<form method='post' action='/admin/set_kid_pin' class='stacked-form'><input type='hidden' name='kid_id' value='{child_obj.kid_id}'><label>Set kid PIN</label><input name='new_pin' placeholder='e.g. 4321'><button type='submit'>Set PIN</button></form>"
+                )
+            if admin_privs.can_delete_accounts:
+                detail_forms.append(
+                    f"<form method='post' action='/delete_kid' class='stacked-form' onsubmit='return confirm(\"Delete kid and all events?\");'><input type='hidden' name='kid_id' value='{child_obj.kid_id}'><label>Parent PIN (confirm)</label><input name='pin' placeholder='parent PIN'><button type='submit' class='danger'>Delete Kid</button></form>"
+                )
+            if detail_forms:
+                forms_html = (
+                    "<div class='grid' style='grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); gap:12px; margin-top:12px;'>"
+                    + "".join(detail_forms)
+                    + "</div>"
+                )
+            else:
+                forms_html = (
+                    "<div class='muted' style='margin-top:12px;'>No account actions available for this admin.</div>"
+                )
             child_detail_card = (
                 "<div class='card'>"
                 f"<h3>{html_escape(child_obj.name)} — Details</h3>"
                 f"<div class='muted'>{child_obj.kid_id} • Level {child_obj.level} • Streak {child_obj.streak_days} day{'s' if child_obj.streak_days != 1 else ''}</div>"
                 f"<div style='margin-top:6px;'><b>Balance:</b> {usd(child_obj.balance_cents)}</div>"
                 "<div class='actions' style='margin-top:12px; flex-wrap:wrap; gap:8px;'>"
-                f"<a href='/admin/kiosk?kid_id={child_obj.kid_id}' class='button-link secondary'>Kiosk</a>"
-                f"<a href='/admin/kiosk_full?kid_id={child_obj.kid_id}' class='button-link secondary'>Kiosk (auto)</a>"
-                f"<a href='/admin/chores?kid_id={child_obj.kid_id}' class='button-link secondary'>Manage chores</a>"
-                f"<a href='/admin/goals?kid_id={child_obj.kid_id}' class='button-link secondary'>Goals</a>"
-                f"<a href='/admin/statement?kid_id={child_obj.kid_id}' class='button-link secondary'>Statement</a>"
-                "</div>"
-                "<div class='grid' style='grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); gap:12px; margin-top:12px;'>"
-                f"<form method='post' action='/admin/set_allowance' class='stacked-form'><input type='hidden' name='kid_id' value='{child_obj.kid_id}'><label>Allowance (dollars / week)</label><input name='allowance' type='text' data-money value='{dollars_value(child_obj.allowance_cents)}'><button type='submit'>Save Allowance</button></form>"
-                f"<form method='post' action='/admin/set_kid_pin' class='stacked-form'><input type='hidden' name='kid_id' value='{child_obj.kid_id}'><label>Set kid PIN</label><input name='new_pin' placeholder='e.g. 4321'><button type='submit'>Set PIN</button></form>"
-                f"<form method='post' action='/delete_kid' class='stacked-form' onsubmit='return confirm(\"Delete kid and all events?\");'><input type='hidden' name='kid_id' value='{child_obj.kid_id}'><label>Parent PIN (confirm)</label><input name='pin' placeholder='parent PIN'><button type='submit' class='danger'>Delete Kid</button></form>"
-                "</div>"
-                "<p class='muted' style='margin-top:10px;'><a href='/admin?section=children'>← Back to overview</a></p>"
-                "</div>"
+                + "".join(action_links)
+                + "</div>"
+                + forms_html
+                + "<p class='muted' style='margin-top:10px;'><a href='/admin?section=children'>← Back to overview</a></p>"
+                + "</div>"
             )
     children_content = children_overview_card + child_detail_card
     filtered_admin_events = filter_events(
@@ -6688,7 +7059,7 @@ def admin_home(
         "</div>"
     )
     create_kid_card = (
-        "<div class='card'>"
+        "<div class='card' id='create-kid'>"
         "<h3>Create Kid</h3>"
         "<form method='post' action='/create_kid' class='stacked-form'>"
         "<label>kid_id</label><input name='kid_id' placeholder='alex01' required>"
@@ -6728,27 +7099,54 @@ def admin_home(
         "</form>"
         "</div>"
     )
-    accounts_content = create_kid_card + credit_card + transfer_card
-    prize_rows = "".join(
-        (
-            f"<tr><td data-label='Prize'><b>{html_escape(prize.name)}</b><div class='muted'>{html_escape(prize.notes or '')}</div></td>"
-            f"<td data-label='Cost' class='right'>{usd(prize.cost_cents)}</td>"
-            f"<td data-label='Actions' class='right'><form method='post' action='/delete_prize' class='inline' onsubmit=\"return confirm('Delete this prize?');\"><input type='hidden' name='prize_id' value='{prize.id}'><button type='submit' class='danger'>Delete</button></form></td></tr>"
-        )
-        for prize in prizes
-    ) or "<tr><td colspan='3' class='muted'>(no prizes yet)</td></tr>"
-    prizes_card = (
-        "<div class='card'>"
-        "<h3>Prizes</h3>"
-        "<form method='post' action='/add_prize' class='stacked-form'>"
-        "<label>Name</label><input name='name' placeholder='Ice cream' required>"
-        "<label>Cost (dollars)</label><input name='cost' type='text' data-money value='1.00'>"
-        "<label>Notes</label><input name='notes' placeholder='One serving'>"
-        "<button type='submit'>Add Prize</button>"
-        "</form>"
-        f"<table style='margin-top:10px;'><tr><th>Prize</th><th>Cost</th><th>Actions</th></tr>{prize_rows}</table>"
-        "</div>"
+    account_cards: List[str] = []
+    if admin_privs.can_create_accounts:
+        account_cards.append(create_kid_card)
+    if admin_privs.can_adjust_balances:
+        account_cards.append(credit_card)
+    if admin_privs.can_transfer_funds:
+        account_cards.append(transfer_card)
+    accounts_content = (
+        "".join(account_cards)
+        if account_cards
+        else "<div class='card'><p class='muted'>No account tools available.</p></div>"
     )
+    if admin_privs.can_manage_prizes:
+        prize_rows = "".join(
+            (
+                f"<tr><td data-label='Prize'><b>{html_escape(prize.name)}</b><div class='muted'>{html_escape(prize.notes or '')}</div></td>"
+                f"<td data-label='Cost' class='right'>{usd(prize.cost_cents)}</td>"
+                f"<td data-label='Actions' class='right'><form method='post' action='/delete_prize' class='inline' onsubmit=\"return confirm('Delete this prize?');\"><input type='hidden' name='prize_id' value='{prize.id}'><button type='submit' class='danger'>Delete</button></form></td></tr>"
+            )
+            for prize in prizes
+        ) or "<tr><td colspan='3' class='muted'>(no prizes yet)</td></tr>"
+        prizes_card = (
+            "<div class='card'>"
+            "<h3>Prizes</h3>"
+            "<form method='post' action='/add_prize' class='stacked-form'>"
+            "<label>Name</label><input name='name' placeholder='Ice cream' required>"
+            "<label>Cost (dollars)</label><input name='cost' type='text' data-money value='1.00'>"
+            "<label>Notes</label><input name='notes' placeholder='One serving'>"
+            "<button type='submit'>Add Prize</button>"
+            "</form>"
+            f"<table style='margin-top:10px;'><tr><th>Prize</th><th>Cost</th><th>Actions</th></tr>{prize_rows}</table>"
+            "</div>"
+        )
+    else:
+        prize_rows = "".join(
+            (
+                f"<tr><td data-label='Prize'><b>{html_escape(prize.name)}</b><div class='muted'>{html_escape(prize.notes or '')}</div></td>"
+                f"<td data-label='Cost' class='right'>{usd(prize.cost_cents)}</td>"
+            )
+            for prize in prizes
+        ) or "<tr><td colspan='2' class='muted'>(no prizes yet)</td></tr>"
+        prizes_card = (
+            "<div class='card'>"
+            "<h3>Prizes</h3>"
+            "<p class='muted'>Prize catalog is view-only for this admin.</p>"
+            f"<table style='margin-top:10px;'><tr><th>Prize</th><th>Cost</th></tr>{prize_rows}</table>"
+            "</div>"
+        )
     cd_rates_pct = {code: cd_rates_bps.get(code, DEFAULT_CD_RATE_BPS) / 100 for code, _, _ in CD_TERM_OPTIONS}
     active_cd_total = sum(certificate_value_cents(cert, at=moment_admin) for cert in active_certs)
     active_cd_count = len(active_certs)
@@ -6826,22 +7224,30 @@ def admin_home(
     analytics_html = (
         "<ul class='muted' style='margin:8px 0 12px 18px; list-style:disc;'>" + "".join(analytics_points) + "</ul>"
     ) if analytics_points else "<p class='muted' style='margin-top:8px;'>No investing data available yet.</p>"
+    if admin_privs.can_manage_investing:
+        settings_forms = (
+            "<h4>CD rate settings</h4>"
+            "<form method='post' action='/admin/certificates/rate' style='margin-top:10px;'>"
+            "  <p class='muted'>Annual percentage rates for newly opened certificates.</p>"
+            f"{rate_fields_html}"
+            "  <button type='submit' style='margin-top:8px;'>Save Rates</button>"
+            "</form>"
+            "<form method='post' action='/admin/certificates/penalty' style='margin-top:10px;'>"
+            "  <p class='muted'>Days of interest forfeited when cashing out before maturity.</p>"
+            f"{penalty_fields_html}"
+            "  <button type='submit' style='margin-top:8px;'>Save Penalties</button>"
+            "</form>"
+        )
+    else:
+        settings_forms = (
+            "<div class='muted' style='margin-top:12px;'>Investing settings are view-only for this admin.</div>"
+        )
     investing_controls_card = (
         "<div class='card'>"
         "<h3>Portfolio tools &amp; controls</h3>"
         "<div class='muted'>Use these insights to gauge performance and adjust certificate settings.</div>"
         f"{analytics_html}"
-        "<h4>CD rate settings</h4>"
-        "<form method='post' action='/admin/certificates/rate' style='margin-top:10px;'>"
-        "  <p class='muted'>Annual percentage rates for newly opened certificates.</p>"
-        f"{rate_fields_html}"
-        "  <button type='submit' style='margin-top:8px;'>Save Rates</button>"
-        "</form>"
-        "<form method='post' action='/admin/certificates/penalty' style='margin-top:10px;'>"
-        "  <p class='muted'>Days of interest forfeited when cashing out before maturity.</p>"
-        f"{penalty_fields_html}"
-        "  <button type='submit' style='margin-top:8px;'>Save Penalties</button>"
-        "</form>"
+        f"{settings_forms}"
         "</div>"
     )
     detail_cards: List[str] = []
@@ -6909,67 +7315,207 @@ def admin_home(
             manual_display = manual_dt.strftime("%Y-%m-%dT%H:%M")
         except ValueError:
             manual_display = manual_raw
-    time_card = (
-        "<div class='card'>"
-        "<h3>Time Controls</h3>"
-        f"<div class='muted'>Current app time: {current_display.strftime('%Y-%m-%d %H:%M:%S')}</div>"
-        "<form method='post' action='/admin/time_settings' class='stacked-form'>"
-        f"<label>Mode</label><select name='mode'><option value='{TIME_MODE_AUTO}' {'selected' if mode_value == TIME_MODE_AUTO else ''}>Auto (system clock)</option><option value='{TIME_MODE_MANUAL}' {'selected' if mode_value == TIME_MODE_MANUAL else ''}>Manual override</option></select>"
-        f"<label>Offset minutes (auto mode)</label><input name='offset' type='number' step='1' value='{offset_value}'>"
-        f"<label>Manual date &amp; time</label><input name='manual_datetime' type='datetime-local' value='{manual_display}'>"
-        "<div class='muted'>Manual time only applies when manual mode is selected. Leave blank to keep the previous manual value.</div>"
-        "<button type='submit'>Save Time Settings</button>"
-        "</form>"
-        "</div>"
-    )
-    rules_card = (
-        "<div class='card'>"
-        "<h3>Allowance Rules</h3>"
-        "<form method='post' action='/admin/rules' class='stacked-form'>"
-        f"<label><input type='checkbox' name='bonus_all' {'checked' if bonus_on_all else ''}> Bonus if all chores complete</label>"
-        f"<input name='bonus' type='text' data-money value='{dollars_value(bonus_cents)}' placeholder='bonus $'>"
-        f"<label><input type='checkbox' name='penalty_miss' {'checked' if penalty_on_miss else ''}> Penalty if chores missed</label>"
-        f"<input name='penalty' type='text' data-money value='{dollars_value(penalty_cents)}' placeholder='penalty $'>"
-        "<button type='submit'>Save Rules</button>"
-        "</form>"
-        "<p class='muted' style='margin-top:6px;'>Rules apply when weekly allowance runs (first admin view each Sunday).</p>"
-        "</div>"
-    )
-    admin_list_items = []
+    if admin_privs.can_manage_time:
+        time_card = (
+            "<div class='card'>"
+            "<h3>Time Controls</h3>"
+            f"<div class='muted'>Current app time: {current_display.strftime('%Y-%m-%d %H:%M:%S')}</div>"
+            "<form method='post' action='/admin/time_settings' class='stacked-form'>"
+            f"<label>Mode</label><select name='mode'><option value='{TIME_MODE_AUTO}' {'selected' if mode_value == TIME_MODE_AUTO else ''}>Auto (system clock)</option><option value='{TIME_MODE_MANUAL}' {'selected' if mode_value == TIME_MODE_MANUAL else ''}>Manual override</option></select>"
+            f"<label>Offset minutes (auto mode)</label><input name='offset' type='number' step='1' value='{offset_value}'>"
+            f"<label>Manual date &amp; time</label><input name='manual_datetime' type='datetime-local' value='{manual_display}'>"
+            "<div class='muted'>Manual time only applies when manual mode is selected. Leave blank to keep the previous manual value.</div>"
+            "<button type='submit'>Save Time Settings</button>"
+            "</form>"
+            "</div>"
+        )
+    else:
+        time_card = (
+            "<div class='card'>"
+            "<h3>Time Controls</h3>"
+            f"<div class='muted'>Current app time: {current_display.strftime('%Y-%m-%d %H:%M:%S')}</div>"
+            "<p class='muted' style='margin-top:6px;'>You do not have permission to change time settings.</p>"
+            "</div>"
+        )
+    if admin_privs.can_manage_allowance:
+        rules_card = (
+            "<div class='card'>"
+            "<h3>Allowance Rules</h3>"
+            "<form method='post' action='/admin/rules' class='stacked-form'>"
+            f"<label><input type='checkbox' name='bonus_all' {'checked' if bonus_on_all else ''}> Bonus if all chores complete</label>"
+            f"<input name='bonus' type='text' data-money value='{dollars_value(bonus_cents)}' placeholder='bonus $'>"
+            f"<label><input type='checkbox' name='penalty_miss' {'checked' if penalty_on_miss else ''}> Penalty if chores missed</label>"
+            f"<input name='penalty' type='text' data-money value='{dollars_value(penalty_cents)}' placeholder='penalty $'>"
+            "<button type='submit'>Save Rules</button>"
+            "</form>"
+            "<p class='muted' style='margin-top:6px;'>Rules apply when weekly allowance runs (first admin view each Sunday).</p>"
+            "</div>"
+        )
+    else:
+        bonus_text = "Enabled" if bonus_on_all else "Disabled"
+        penalty_text = "Enabled" if penalty_on_miss else "Disabled"
+        rules_card = (
+            "<div class='card'>"
+            "<h3>Allowance Rules</h3>"
+            f"<div>Bonus if all chores complete: <b>{bonus_text}</b> ({usd(bonus_cents)})</div>"
+            f"<div style='margin-top:4px;'>Penalty if chores missed: <b>{penalty_text}</b> ({usd(penalty_cents)})</div>"
+            "<p class='muted' style='margin-top:8px;'>Contact a full administrator to adjust these settings.</p>"
+            "</div>"
+        )
+    permission_options = [
+        ("perm_payouts", "can_manage_payouts", "Approve/deny payouts"),
+        ("perm_chores", "can_manage_chores", "Manage chores"),
+        ("perm_time", "can_manage_time", "Time controls"),
+        ("perm_allowance", "can_manage_allowance", "Allowance rules & goals"),
+        ("perm_prizes", "can_manage_prizes", "Manage prize catalog"),
+        ("perm_create_accounts", "can_create_accounts", "Create kid accounts / pins"),
+        ("perm_delete_accounts", "can_delete_accounts", "Delete kid accounts"),
+        ("perm_adjust_balances", "can_adjust_balances", "Credit / debit balances"),
+        ("perm_transfer", "can_transfer_funds", "Transfer between kids"),
+        ("perm_create_admins", "can_create_admins", "Create admins"),
+        ("perm_delete_admins", "can_delete_admins", "Delete admins"),
+        ("perm_change_pins", "can_change_admin_pins", "Change admin PINs"),
+        ("perm_investing", "can_manage_investing", "Manage investing controls"),
+    ]
+    admin_list_items: List[str] = []
+    privilege_form_blocks: List[str] = []
+    current_admin_role = (role or "").lower()
+    can_manage_privileges = current_admin_role == "dad"
     for admin in parent_admins:
         role_key = admin["role"]
         label = html_escape(admin["label"])
-        if role_key in DEFAULT_PARENT_ROLES:
-            admin_list_items.append(
-                f"<li>{label} <span class='muted'>({role_key})</span> <span class='pill'>Default</span></li>"
-            )
+        privileges = privileges_by_role.get(role_key, AdminPrivileges.default(role_key))
+        if privileges.is_all_kids:
+            kid_scope_text = "All kids"
+        elif privileges.kid_ids:
+            kid_labels = []
+            for kid_id in privileges.kid_ids:
+                kid_obj = all_kids_by_id.get(kid_id)
+                if kid_obj:
+                    kid_labels.append(f"{html_escape(kid_obj.name)} ({kid_id})")
+                else:
+                    kid_labels.append(html_escape(kid_id))
+            kid_scope_text = ", ".join(kid_labels)
         else:
-            admin_list_items.append(
-                "<li>"
-                + f"{label} <span class='muted'>({role_key})</span>"
-                + f"<form method='post' action='/admin/delete_parent_admin' class='inline' style='margin-left:8px;'><input type='hidden' name='role' value='{role_key}'><button type='submit' class='danger secondary'>Delete</button></form>"
-                + "</li>"
+            kid_scope_text = "No kids selected"
+        limit_bits: List[str] = []
+        if privileges.max_credit_cents is not None:
+            limit_bits.append(f"credit ≤ {usd(privileges.max_credit_cents)}")
+        if privileges.max_debit_cents is not None:
+            limit_bits.append(f"debit ≤ {usd(privileges.max_debit_cents)}")
+        limits_summary = ", ".join(limit_bits) if limit_bits else "None"
+        enabled_permissions = [
+            label_text for _, attr, label_text in permission_options if getattr(privileges, attr)
+        ]
+        permission_summary = ", ".join(enabled_permissions) if enabled_permissions else "None"
+        delete_button = ""
+        if role_key not in DEFAULT_PARENT_ROLES and admin_privs.can_delete_admins:
+            delete_button = (
+                "<form method='post' action='/admin/delete_parent_admin' class='inline' "
+                "style='margin-left:8px;'>"
+                f"<input type='hidden' name='role' value='{role_key}'>"
+                "<button type='submit' class='danger secondary'>Delete</button>"
+                "</form>"
             )
-    admin_list_html = "".join(admin_list_items) or "<li class='muted'>(none yet)</li>"
+        admin_list_items.append(
+            "<li>"
+            + f"{label} <span class='muted'>({role_key})</span>"
+            + (" <span class='pill'>Default</span>" if role_key in DEFAULT_PARENT_ROLES else "")
+            + delete_button
+            + "<div class='muted' style='margin-top:4px;'>Kid access: "
+            + kid_scope_text
+            + "</div>"
+            + "<div class='muted'>Limits: "
+            + limits_summary
+            + "</div>"
+            + "<div class='muted'>Permissions: "
+            + permission_summary
+            + "</div>"
+            + "</li>"
+        )
+        if can_manage_privileges and role_key not in DEFAULT_PARENT_ROLES:
+            checked_ids = {kid.lower() for kid in privileges.kid_ids}
+            kid_checkboxes = "".join(
+                f"<label class='checkbox'><input type='checkbox' name='kid_ids' value='{kid.kid_id}'"
+                + (" checked" if kid.kid_id.lower() in checked_ids else "")
+                + f"> {html_escape(kid.name)} ({kid.kid_id})</label>"
+                for kid in all_kids
+            ) or "<div class='muted'>No kids available yet.</div>"
+            max_credit_value = html_escape(dollars_value(privileges.max_credit_cents) if privileges.max_credit_cents is not None else "")
+            max_debit_value = html_escape(dollars_value(privileges.max_debit_cents) if privileges.max_debit_cents is not None else "")
+            permission_checkboxes = "".join(
+                "<label class='checkbox'><input type='checkbox' name='"
+                + field
+                + "' value='1'"
+                + (" checked" if getattr(privileges, attr) else "")
+                + f"> {label_text}</label>"
+                for field, attr, label_text in permission_options
+            )
+            privilege_form_blocks.append(
+                "<form method='post' action='/admin/update_privileges' class='stacked-form' style='margin-top:12px;'>"
+                + f"<h4>{label} — Privileges</h4>"
+                + f"<input type='hidden' name='role' value='{role_key}'>"
+                + "<label>Kid access</label>"
+                + f"<select name='kid_scope'><option value='all'{' selected' if privileges.is_all_kids else ''}>All kids</option><option value='custom'{' selected' if not privileges.is_all_kids else ''}>Choose specific kids</option></select>"
+                + "<div class='muted' style='margin-top:4px;'>Global chores are always visible to all admins.</div>"
+                + "<div class='grid' style='grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:6px; margin-top:6px;'>"
+                + kid_checkboxes
+                + "</div>"
+                + "<div class='grid' style='grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:8px; margin-top:10px;'>"
+                + f"<div><label>Max credit ($)</label><input name='max_credit' type='text' data-money value='{max_credit_value}' placeholder='no limit'></div>"
+                + f"<div><label>Max debit ($)</label><input name='max_debit' type='text' data-money value='{max_debit_value}' placeholder='no limit'></div>"
+                + "</div>"
+                + "<div class='muted' style='margin-top:4px;'>Leave limits blank for unlimited approvals.</div>"
+                + "<label style='margin-top:10px;'>Permissions</label>"
+                + "<div class='grid' style='grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:6px;'>"
+                + permission_checkboxes
+                + "</div>"
+                + "<button type='submit' style='margin-top:10px;'>Save Privileges</button>"
+                + "</form>"
+            )
+    admin_list_html = "".join(admin_list_items) or "<li class='muted'>(no admins yet)</li>"
+    privilege_forms_html = "".join(privilege_form_blocks)
+    if not can_manage_privileges:
+        privilege_note = "<p class='muted' style='margin-top:12px;'>Only the default Dad administrator can change privileges.</p>"
+    elif not privilege_form_blocks:
+        privilege_note = "<p class='muted' style='margin-top:12px;'>Add another admin to configure custom privileges.</p>"
+    else:
+        privilege_note = ""
+    pin_form_html = ""
+    if admin_privs.can_change_admin_pins:
+        pin_form_html = (
+            "<form method='post' action='/admin/set_parent_pin' class='stacked-form' style='margin-top:12px;'>"
+            "<h4>Update PIN</h4>"
+            f"<select name='role'>{parent_options_html}</select>"
+            "<label>New PIN</label><input name='new_pin' type='password' placeholder='****' autocomplete='new-password' required>"
+            "<label>Confirm PIN</label><input name='confirm_pin' type='password' placeholder='****' autocomplete='new-password' required>"
+            "<button type='submit'>Set PIN</button>"
+            "</form>"
+        )
+    elif parent_admins:
+        pin_form_html = "<p class='muted' style='margin-top:12px;'>You do not have permission to change admin PINs.</p>"
+    add_admin_form_html = ""
+    if admin_privs.can_create_admins:
+        add_admin_form_html = (
+            "<form method='post' action='/admin/add_parent_admin' class='stacked-form' style='margin-top:12px;'>"
+            "<h4>Add another admin</h4>"
+            "<label>Name</label><input name='label' placeholder='Grandma' required>"
+            "<label>PIN</label><input name='pin' type='password' placeholder='****' required>"
+            "<label>Confirm PIN</label><input name='confirm_pin' type='password' placeholder='****' required>"
+            "<button type='submit'>Add Admin</button>"
+            "</form>"
+        )
+    else:
+        add_admin_form_html = "<p class='muted' style='margin-top:12px;'>You do not have permission to add new admins.</p>"
     parent_admins_card = (
         "<div class='card'>"
         "<h3>Parent Admins</h3>"
         f"<ul class='admin-list'>{admin_list_html}</ul>"
-        "<form method='post' action='/admin/set_parent_pin' class='stacked-form' style='margin-top:12px;'>"
-        "<h4>Update PIN</h4>"
-        f"<select name='role'>{parent_options_html}</select>"
-        "<label>New PIN</label><input name='new_pin' type='password' placeholder='****' autocomplete='new-password' required>"
-        "<label>Confirm PIN</label><input name='confirm_pin' type='password' placeholder='****' autocomplete='new-password' required>"
-        "<button type='submit'>Set PIN</button>"
-        "</form>"
-        "<form method='post' action='/admin/add_parent_admin' class='stacked-form' style='margin-top:12px;'>"
-        "<h4>Add another admin</h4>"
-        "<label>Name</label><input name='label' placeholder='Grandma' required>"
-        "<label>PIN</label><input name='pin' type='password' placeholder='****' required>"
-        "<label>Confirm PIN</label><input name='confirm_pin' type='password' placeholder='****' required>"
-        "<button type='submit'>Add Admin</button>"
-        "</form>"
-        "</div>"
+        + privilege_note
+        + privilege_forms_html
+        + pin_form_html
+        + add_admin_form_html
+        + "</div>"
     )
     weekday_selector = "".join(
         f"<label style='margin-right:6px;'><input type='checkbox' name='weekdays' value='{day}'> {label}</label>"
@@ -7109,8 +7655,19 @@ def admin_kiosk_full(request: Request, kid_id: str = Query(...)):
 
 @app.get("/admin/chores", response_class=HTMLResponse)
 def admin_manage_chores(request: Request, kid_id: str = Query(...)):
-    if (redirect := require_admin(request)) is not None:
+    if (
+        redirect := require_admin_permission(
+            request, "can_manage_chores", redirect="/admin?section=chores"
+        )
+    ) is not None:
         return redirect
+    if kid_id != GLOBAL_CHORE_KID_ID:
+        if (
+            denied := ensure_admin_kid_access(
+                request, kid_id, redirect="/admin?section=chores"
+            )
+        ) is not None:
+            return denied
     is_global = kid_id == GLOBAL_CHORE_KID_ID
     with Session(engine) as session:
         pending_claim_rows: List[Tuple[GlobalChoreClaim, Child, Chore]] = []
@@ -7345,7 +7902,11 @@ def admin_chore_create(
     weekdays: List[str] = Form([]),
     specific_dates: str = Form(""),
 ):
-    if (redirect := require_admin(request)) is not None:
+    if (
+        redirect := require_admin_permission(
+            request, "can_manage_chores", redirect="/admin?section=chores"
+        )
+    ) is not None:
         return redirect
     award_c = to_cents_from_dollars_str(award, 0)
     try:
@@ -7356,6 +7917,13 @@ def admin_chore_create(
     weekday_csv = serialize_weekday_selection(weekdays) if weekdays else None
     dates_csv = serialize_specific_dates(specific_dates) if specific_dates else None
     kid_value = (kid_id or "").strip()
+    if kid_value and kid_value != GLOBAL_CHORE_KID_ID:
+        if (
+            denied := ensure_admin_kid_access(
+                request, kid_value, redirect="/admin?section=chores"
+            )
+        ) is not None:
+            return denied
     normalized_type = normalize_chore_type(type, is_global=kid_value == GLOBAL_CHORE_KID_ID)
     kid_label = "Free-for-all" if kid_value == GLOBAL_CHORE_KID_ID else kid_value or "Unknown"
     with Session(engine) as session:
@@ -7399,7 +7967,11 @@ def admin_chore_update(
     weekdays: List[str] = Form([]),
     specific_dates: str = Form(""),
 ):
-    if (redirect := require_admin(request)) is not None:
+    if (
+        redirect := require_admin_permission(
+            request, "can_manage_chores", redirect="/admin?section=chores"
+        )
+    ) is not None:
         return redirect
     award_c = to_cents_from_dollars_str(award, 0)
     try:
@@ -7413,6 +7985,13 @@ def admin_chore_update(
         chore = session.get(Chore, chore_id)
         if not chore:
             return RedirectResponse("/admin", status_code=302)
+        if chore.kid_id and chore.kid_id != GLOBAL_CHORE_KID_ID:
+            if (
+                denied := ensure_admin_kid_access(
+                    request, chore.kid_id, redirect="/admin?section=chores"
+                )
+            ) is not None:
+                return denied
         normalized_type = normalize_chore_type(type, is_global=chore.kid_id == GLOBAL_CHORE_KID_ID)
         target_kid = chore.kid_id
         chore.name = name.strip()
@@ -7431,8 +8010,6 @@ def admin_chore_update(
 
 @app.post("/admin/global_chore/claims")
 async def admin_global_chore_claims(request: Request):
-    if (redirect := require_admin(request)) is not None:
-        return redirect
     form = await request.form()
     decision = (form.get("decision") or "approve").strip().lower()
     chore_id_raw = form.get("chore_id") or "0"
@@ -7441,6 +8018,12 @@ async def admin_global_chore_claims(request: Request):
     redirect_target = (form.get("redirect") or "").strip()
     if not redirect_target or not redirect_target.startswith("/"):
         redirect_target = f"/admin/chores?kid_id={GLOBAL_CHORE_KID_ID}"
+    if (
+        redirect_response := require_admin_permission(
+            request, "can_manage_payouts", redirect=redirect_target
+        )
+    ) is not None:
+        return redirect_response
     try:
         chore_id = int(chore_id_raw)
     except ValueError:
@@ -7479,6 +8062,12 @@ async def admin_global_chore_claims(request: Request):
             if claim.status != GLOBAL_CHORE_STATUS_PENDING:
                 body = "<div class='card'><p style='color:#f87171;'>Only pending submissions can be processed.</p><p><a href='/admin/chores?kid_id=" + GLOBAL_CHORE_KID_ID + "'>Back</a></p></div>"
                 return render_page(request, "Approve Global Chores", body, status_code=400)
+            if (
+                denied := ensure_admin_kid_access(
+                    request, claim.kid_id, redirect=redirect_target
+                )
+            ) is not None:
+                return denied
         approved_existing = session.exec(
             select(GlobalChoreClaim)
             .where(GlobalChoreClaim.chore_id == chore.id)
@@ -7529,7 +8118,8 @@ async def admin_global_chore_claims(request: Request):
             if not raw_amount:
                 continue
             cents = to_cents_from_dollars_str(raw_amount, 0)
-            cents = max(0, cents)
+            if cents <= 0:
+                continue
             overrides[claim.id] = cents
             override_total += cents
         if override_total > remaining_award:
@@ -7550,6 +8140,15 @@ async def admin_global_chore_claims(request: Request):
         if payout_total > remaining_award:
             body = "<div class='card'><p style='color:#f87171;'>Calculated rewards exceed the remaining amount.</p><p><a href='/admin/chores?kid_id=" + GLOBAL_CHORE_KID_ID + "'>Back</a></p></div>"
             return render_page(request, "Approve Global Chores", body, status_code=400)
+        for award_value in share_map.values():
+            if award_value <= 0:
+                continue
+            if (
+                limit_redirect := ensure_admin_amount_within_limits(
+                    request, award_value, "credit", redirect=redirect_target
+                )
+            ) is not None:
+                return limit_redirect
         for claim in claims:
             award_cents = share_map.get(claim.id, 0)
             claim.status = GLOBAL_CHORE_STATUS_APPROVED
@@ -7582,12 +8181,23 @@ async def admin_global_chore_claims(request: Request):
 
 @app.post("/admin/chores/activate")
 def admin_chore_activate(request: Request, chore_id: int = Form(...)):
-    if (redirect := require_admin(request)) is not None:
+    if (
+        redirect := require_admin_permission(
+            request, "can_manage_chores", redirect="/admin?section=chores"
+        )
+    ) is not None:
         return redirect
     with Session(engine) as session:
         chore = session.get(Chore, chore_id)
         if not chore:
             return RedirectResponse("/admin", status_code=302)
+        if chore.kid_id and chore.kid_id != GLOBAL_CHORE_KID_ID:
+            if (
+                denied := ensure_admin_kid_access(
+                    request, chore.kid_id, redirect="/admin?section=chores"
+                )
+            ) is not None:
+                return denied
         target_kid = chore.kid_id
         chore.active = True
         session.add(chore)
@@ -7597,12 +8207,23 @@ def admin_chore_activate(request: Request, chore_id: int = Form(...)):
 
 @app.post("/admin/chores/deactivate")
 def admin_chore_deactivate(request: Request, chore_id: int = Form(...)):
-    if (redirect := require_admin(request)) is not None:
+    if (
+        redirect := require_admin_permission(
+            request, "can_manage_chores", redirect="/admin?section=chores"
+        )
+    ) is not None:
         return redirect
     with Session(engine) as session:
         chore = session.get(Chore, chore_id)
         if not chore:
             return RedirectResponse("/admin", status_code=302)
+        if chore.kid_id and chore.kid_id != GLOBAL_CHORE_KID_ID:
+            if (
+                denied := ensure_admin_kid_access(
+                    request, chore.kid_id, redirect="/admin?section=chores"
+                )
+            ) is not None:
+                return denied
         target_kid = chore.kid_id
         chore.active = False
         session.add(chore)
@@ -7612,7 +8233,11 @@ def admin_chore_deactivate(request: Request, chore_id: int = Form(...)):
 
 @app.post("/admin/chore_make_available_now")
 def chore_make_available_now(request: Request, chore_id: int = Form(...)):
-    if (redirect := require_admin(request)) is not None:
+    if (
+        redirect := require_admin_permission(
+            request, "can_manage_chores", redirect="/admin?section=chores"
+        )
+    ) is not None:
         return redirect
     moment = now_local()
     today = moment.date()
@@ -7620,6 +8245,13 @@ def chore_make_available_now(request: Request, chore_id: int = Form(...)):
         chore = session.get(Chore, chore_id)
         if not chore:
             return render_page(request, "Admin", "<div class='card danger'>Chore not found.</div>")
+        if chore.kid_id and chore.kid_id != GLOBAL_CHORE_KID_ID:
+            if (
+                denied := ensure_admin_kid_access(
+                    request, chore.kid_id, redirect="/admin?section=chores"
+                )
+            ) is not None:
+                return denied
         kid_id = chore.kid_id
         if not is_chore_in_window(chore, today):
             return RedirectResponse(f"/admin/chores?kid_id={kid_id}", status_code=302)
@@ -7632,8 +8264,18 @@ def chore_make_available_now(request: Request, chore_id: int = Form(...)):
 
 @app.get("/admin/goals", response_class=HTMLResponse)
 def admin_goals(request: Request, kid_id: str = Query(...)):
-    if (redirect := require_admin(request)) is not None:
+    if (
+        redirect := require_admin_permission(
+            request, "can_manage_allowance", redirect="/admin?section=goals"
+        )
+    ) is not None:
         return redirect
+    if (
+        denied := ensure_admin_kid_access(
+            request, kid_id, redirect="/admin?section=goals"
+        )
+    ) is not None:
+        return denied
     with Session(engine) as session:
         child = session.exec(select(Child).where(Child.kid_id == kid_id)).first()
         if not child:
@@ -7895,8 +8537,18 @@ def admin_statement(request: Request, kid_id: str = Query(...)):
 
 @app.post("/admin/goal_create")
 def admin_goal_create(request: Request, kid_id: str = Form(...), name: str = Form(...), target: str = Form(...)):
-    if (redirect := require_admin(request)) is not None:
+    if (
+        redirect := require_admin_permission(
+            request, "can_manage_allowance", redirect="/admin?section=goals"
+        )
+    ) is not None:
         return redirect
+    if (
+        denied := ensure_admin_kid_access(
+            request, kid_id, redirect="/admin?section=goals"
+        )
+    ) is not None:
+        return denied
     target_c = to_cents_from_dollars_str(target, 0)
     with Session(engine) as session:
         session.add(Goal(kid_id=kid_id, name=name.strip(), target_cents=target_c))
@@ -7906,8 +8558,18 @@ def admin_goal_create(request: Request, kid_id: str = Form(...), name: str = For
 
 @app.post("/admin/goal_update")
 def admin_goal_update(request: Request, goal_id: int = Form(...), kid_id: str = Form(...), name: str = Form(...), target: str = Form(...)):
-    if (redirect := require_admin(request)) is not None:
+    if (
+        redirect := require_admin_permission(
+            request, "can_manage_allowance", redirect="/admin?section=goals"
+        )
+    ) is not None:
         return redirect
+    if (
+        denied := ensure_admin_kid_access(
+            request, kid_id, redirect="/admin?section=goals"
+        )
+    ) is not None:
+        return denied
     target_c = to_cents_from_dollars_str(target, 0)
     with Session(engine) as session:
         goal = session.get(Goal, goal_id)
@@ -7925,7 +8587,11 @@ def admin_goal_update(request: Request, goal_id: int = Form(...), kid_id: str = 
 
 @app.post("/admin/goal_return_funds")
 def admin_goal_return_funds(request: Request, goal_id: int = Form(...), kid_id: Optional[str] = Form(None)):
-    if (redirect := require_admin(request)) is not None:
+    if (
+        redirect := require_admin_permission(
+            request, "can_manage_allowance", redirect="/admin?section=goals"
+        )
+    ) is not None:
         return redirect
     with Session(engine) as session:
         goal = session.get(Goal, goal_id)
@@ -7935,7 +8601,20 @@ def admin_goal_return_funds(request: Request, goal_id: int = Form(...), kid_id: 
         child = session.exec(select(Child).where(Child.kid_id == kid)).first()
         if not child:
             return RedirectResponse("/admin", status_code=302)
+        redirect_target = f"/admin/goals?kid_id={kid}"
+        if (
+            denied := ensure_admin_kid_access(
+                request, kid, redirect=redirect_target
+            )
+        ) is not None:
+            return denied
         if goal.saved_cents > 0:
+            if (
+                limit_redirect := ensure_admin_amount_within_limits(
+                    request, goal.saved_cents, "credit", redirect=redirect_target
+                )
+            ) is not None:
+                return limit_redirect
             child.balance_cents += goal.saved_cents
             session.add(Event(child_id=kid, change_cents=goal.saved_cents, reason=f"goal_refund_admin:{goal.name}"))
             goal.saved_cents = 0
@@ -7950,14 +8629,32 @@ def admin_goal_return_funds(request: Request, goal_id: int = Form(...), kid_id: 
 
 @app.post("/admin/goal_delete")
 def admin_goal_delete(request: Request, goal_id: int = Form(...), kid_id: Optional[str] = Form(None)):
-    if (redirect := require_admin(request)) is not None:
+    if (
+        redirect := require_admin_permission(
+            request, "can_manage_allowance", redirect="/admin?section=goals"
+        )
+    ) is not None:
         return redirect
     with Session(engine) as session:
         goal = session.get(Goal, goal_id)
         if not goal:
             return RedirectResponse("/admin", status_code=302)
+        target_kid = kid_id or goal.kid_id
+        if (
+            denied := ensure_admin_kid_access(
+                request, target_kid, redirect=f"/admin/goals?kid_id={target_kid}"
+            )
+        ) is not None:
+            return denied
         child = session.exec(select(Child).where(Child.kid_id == goal.kid_id)).first()
         if child and goal.saved_cents > 0:
+            redirect_target = f"/admin/goals?kid_id={goal.kid_id}"
+            if (
+                limit_redirect := ensure_admin_amount_within_limits(
+                    request, goal.saved_cents, "credit", redirect=redirect_target
+                )
+            ) is not None:
+                return limit_redirect
             child.balance_cents += goal.saved_cents
             session.add(Event(child_id=goal.kid_id, change_cents=goal.saved_cents, reason=f"goal_refund_delete_admin:{goal.name}"))
             child.updated_at = datetime.utcnow()
@@ -7971,12 +8668,22 @@ def admin_goal_delete(request: Request, goal_id: int = Form(...), kid_id: Option
 
 @app.post("/admin/goal_grant")
 def admin_goal_grant(request: Request, goal_id: int = Form(...)):
-    if (redirect := require_admin(request)) is not None:
+    if (
+        redirect := require_admin_permission(
+            request, "can_manage_allowance", redirect="/admin?section=goals"
+        )
+    ) is not None:
         return redirect
     with Session(engine) as session:
         goal = session.get(Goal, goal_id)
         if not goal:
             return RedirectResponse("/admin", status_code=302)
+        if (
+            denied := ensure_admin_kid_access(
+                request, goal.kid_id, redirect=f"/admin/goals?kid_id={goal.kid_id}"
+            )
+        ) is not None:
+            return denied
         session.add(Event(child_id=goal.kid_id, change_cents=0, reason=f"goal_granted:{goal.name}"))
         session.delete(goal)
         session.commit()
@@ -7984,7 +8691,11 @@ def admin_goal_grant(request: Request, goal_id: int = Form(...)):
 
 @app.post("/create_kid")
 def create_kid(request: Request, kid_id: str = Form(...), name: str = Form(...), starting: str = Form("0.00"), allowance: str = Form("0.00"), kid_pin: str = Form("")):
-    if (redirect := require_admin(request)) is not None:
+    if (
+        redirect := require_admin_permission(
+            request, "can_create_accounts", redirect="/admin?section=accounts"
+        )
+    ) is not None:
         return redirect
     starting_c = to_cents_from_dollars_str(starting, 0)
     allowance_c = to_cents_from_dollars_str(allowance, 0)
@@ -8003,12 +8714,17 @@ def create_kid(request: Request, kid_id: str = Form(...), name: str = Form(...),
         if starting_c:
             session.add(Event(child_id=kid_id.strip(), change_cents=starting_c, reason="starting_balance"))
         session.commit()
-    return RedirectResponse("/admin", status_code=302)
+    set_admin_notice(request, f"Created kid profile {html_escape(name.strip())}.", "success")
+    return RedirectResponse("/admin?section=accounts#create-kid", status_code=302)
 
 
 @app.post("/delete_kid")
 def delete_kid(request: Request, kid_id: str = Form(...), pin: str = Form(...)):
-    if (redirect := require_admin(request)) is not None:
+    if (
+        redirect := require_admin_permission(
+            request, "can_delete_accounts", redirect="/admin?section=accounts"
+        )
+    ) is not None:
         return redirect
     with Session(engine) as session:
         if resolve_admin_role(pin, session=session) is None:
@@ -8016,7 +8732,13 @@ def delete_kid(request: Request, kid_id: str = Form(...), pin: str = Form(...)):
             return render_page(request, "Admin", body)
         child = session.exec(select(Child).where(Child.kid_id == kid_id)).first()
         if not child:
-            return RedirectResponse("/admin", status_code=302)
+            return RedirectResponse("/admin?section=accounts", status_code=302)
+        if (
+            denied := ensure_admin_kid_access(
+                request, child.kid_id, redirect="/admin?section=accounts"
+            )
+        ) is not None:
+            return denied
         kid_name = child.name
         for event in session.exec(select(Event).where(Event.child_id == kid_id)).all():
             session.delete(event)
@@ -8058,7 +8780,11 @@ def admin_set_parent_pin(
     new_pin: str = Form(...),
     confirm_pin: str = Form(...),
 ):
-    if (redirect := require_admin(request)) is not None:
+    if (
+        redirect := require_admin_permission(
+            request, "can_change_admin_pins", redirect="/admin?section=admins"
+        )
+    ) is not None:
         return redirect
     normalized_role = (role or "").lower()
     available_roles = {admin["role"] for admin in all_parent_admins()}
@@ -8084,7 +8810,11 @@ def admin_add_parent_admin(
     pin: str = Form(...),
     confirm_pin: str = Form(...),
 ):
-    if (redirect := require_admin(request)) is not None:
+    if (
+        redirect := require_admin_permission(
+            request, "can_create_admins", redirect="/admin?section=admins"
+        )
+    ) is not None:
         return redirect
     display_name = (label or "").strip()
     pin_value = (pin or "").strip()
@@ -8111,13 +8841,18 @@ def admin_add_parent_admin(
         extras.append({"role": slug, "label": display_name})
         MetaDAO.set(session, EXTRA_PARENT_ADMINS_KEY, json.dumps(extras))
         MetaDAO.set(session, _parent_pin_meta_key(slug), pin_value)
+        save_admin_privileges(session, AdminPrivileges.default(slug))
         session.commit()
     return RedirectResponse("/admin", status_code=302)
 
 
 @app.post("/admin/delete_parent_admin")
 def admin_delete_parent_admin(request: Request, role: str = Form(...)):
-    if (redirect := require_admin(request)) is not None:
+    if (
+        redirect := require_admin_permission(
+            request, "can_delete_admins", redirect="/admin?section=admins"
+        )
+    ) is not None:
         return redirect
     normalized_role = (role or "").strip().lower()
     if not normalized_role:
@@ -8137,53 +8872,178 @@ def admin_delete_parent_admin(request: Request, role: str = Form(...)):
         existing_pin = session.get(MetaKV, pin_key)
         if existing_pin:
             session.delete(existing_pin)
+        delete_admin_privileges(session, normalized_role)
         session.commit()
     return RedirectResponse("/admin", status_code=302)
 
 
+@app.post("/admin/update_privileges")
+async def admin_update_privileges(request: Request):
+    if (redirect := require_admin(request)) is not None:
+        return redirect
+    if (admin_role(request) or "").lower() != "dad":
+        return admin_forbidden(
+            request,
+            "Only the default Dad administrator can update privileges.",
+            "/admin?section=admins",
+        )
+    form = await request.form()
+    target_role = (form.get("role") or "").strip().lower()
+    if not target_role:
+        return admin_forbidden(
+            request,
+            "Select an admin before saving privileges.",
+            "/admin?section=admins",
+        )
+    if target_role in DEFAULT_PARENT_ROLES:
+        return admin_forbidden(
+            request,
+            "Default admins always retain full access.",
+            "/admin?section=admins",
+        )
+    kid_scope_raw = (form.get("kid_scope") or "all").strip().lower()
+    kid_scope = kid_scope_raw if kid_scope_raw in {"all", "custom"} else "all"
+    kid_ids: List[str] = []
+    if kid_scope == "custom":
+        if hasattr(form, "getlist"):
+            kid_ids = [kid.strip() for kid in form.getlist("kid_ids") if kid and kid.strip()]
+        else:
+            raw_ids = form.get("kid_ids") or ""
+            kid_ids = [kid.strip() for kid in raw_ids.split(",") if kid.strip()]
+
+    def parse_limit(field_name: str) -> Optional[int]:
+        raw_value = (form.get(field_name) or "").strip()
+        if not raw_value:
+            return None
+        cents = to_cents_from_dollars_str(raw_value, 0)
+        return cents if cents > 0 else None
+
+    def checkbox_enabled(field_name: str) -> bool:
+        value = form.get(field_name)
+        if value is None:
+            return False
+        return str(value).lower() in {"1", "true", "on", "yes"}
+
+    max_credit_c = parse_limit("max_credit")
+    max_debit_c = parse_limit("max_debit")
+    permission_fields = {
+        "can_manage_payouts": checkbox_enabled("perm_payouts"),
+        "can_manage_chores": checkbox_enabled("perm_chores"),
+        "can_manage_time": checkbox_enabled("perm_time"),
+        "can_manage_allowance": checkbox_enabled("perm_allowance"),
+        "can_manage_prizes": checkbox_enabled("perm_prizes"),
+        "can_create_accounts": checkbox_enabled("perm_create_accounts"),
+        "can_delete_accounts": checkbox_enabled("perm_delete_accounts"),
+        "can_adjust_balances": checkbox_enabled("perm_adjust_balances"),
+        "can_transfer_funds": checkbox_enabled("perm_transfer"),
+        "can_create_admins": checkbox_enabled("perm_create_admins"),
+        "can_delete_admins": checkbox_enabled("perm_delete_admins"),
+        "can_change_admin_pins": checkbox_enabled("perm_change_pins"),
+        "can_manage_investing": checkbox_enabled("perm_investing"),
+    }
+    with Session(engine) as session:
+        existing_roles = {admin["role"] for admin in all_parent_admins(session)}
+        if target_role not in existing_roles:
+            return admin_forbidden(
+                request,
+                "That admin account could not be found.",
+                "/admin?section=admins",
+            )
+        privileges = AdminPrivileges(
+            role=target_role,
+            kid_scope=kid_scope,
+            kid_ids=kid_ids,
+            max_credit_cents=max_credit_c,
+            max_debit_cents=max_debit_c,
+            **permission_fields,
+        )
+        save_admin_privileges(session, privileges)
+        session.commit()
+    set_admin_notice(request, "Updated admin privileges.", "success")
+    return RedirectResponse("/admin?section=admins", status_code=302)
+
+
 @app.post("/admin/set_allowance")
 def admin_set_allowance(request: Request, kid_id: str = Form(...), allowance: str = Form("0.00")):
-    if (redirect := require_admin(request)) is not None:
+    if (
+        redirect := require_admin_permission(
+            request, "can_create_accounts", redirect="/admin?section=accounts"
+        )
+    ) is not None:
         return redirect
     allowance_c = to_cents_from_dollars_str(allowance, 0)
     with Session(engine) as session:
         child = session.exec(select(Child).where(Child.kid_id == kid_id)).first()
         if not child:
             return render_page(request, "Admin", "<div class='card'>Child not found.</div>")
+        if (
+            denied := ensure_admin_kid_access(
+                request, child.kid_id, redirect="/admin?section=accounts"
+            )
+        ) is not None:
+            return denied
         child.allowance_cents = allowance_c
         child.updated_at = datetime.utcnow()
         session.add(child)
         session.commit()
-    return RedirectResponse("/admin", status_code=302)
+    set_admin_notice(request, "Updated allowance.", "success")
+    return RedirectResponse("/admin?section=accounts", status_code=302)
 
 
 @app.post("/admin/set_kid_pin")
 def set_kid_pin(request: Request, kid_id: str = Form(...), new_pin: str = Form(...)):
-    if (redirect := require_admin(request)) is not None:
+    if (
+        redirect := require_admin_permission(
+            request, "can_create_accounts", redirect="/admin?section=accounts"
+        )
+    ) is not None:
         return redirect
     with Session(engine) as session:
         child = session.exec(select(Child).where(Child.kid_id == kid_id)).first()
         if not child:
             return render_page(request, "Admin", "<div class='card'>Child not found.</div>")
+        if (
+            denied := ensure_admin_kid_access(
+                request, child.kid_id, redirect="/admin?section=accounts"
+            )
+        ) is not None:
+            return denied
         child.kid_pin = (new_pin or "").strip()
         child.updated_at = datetime.utcnow()
         session.add(child)
         session.commit()
-    return RedirectResponse("/admin", status_code=302)
+    set_admin_notice(request, "Updated kid PIN.", "success")
+    return RedirectResponse("/admin?section=accounts", status_code=302)
 
 
 @app.post("/adjust_balance")
 def adjust_balance(request: Request, kid_id: str = Form(...), amount: str = Form("0.00"), kind: str = Form(...), reason: str = Form("")):
-    if (redirect := require_admin(request)) is not None:
+    if (
+        redirect := require_admin_permission(
+            request, "can_adjust_balances", redirect="/admin?section=accounts"
+        )
+    ) is not None:
         return redirect
     amount_c = to_cents_from_dollars_str(amount, 0)
     kind = (kind or "").lower()
     if kind not in {"credit", "debit"}:
         return render_page(request, "Admin", "<div class='card'>Invalid type.</div>")
+    if (
+        limit_redirect := ensure_admin_amount_within_limits(
+            request, amount_c, kind, redirect="/admin?section=accounts"
+        )
+    ) is not None:
+        return limit_redirect
     with Session(engine) as session:
         child = session.exec(select(Child).where(Child.kid_id == kid_id)).first()
         if not child:
             return render_page(request, "Admin", "<div class='card'>Child not found.</div>")
+        if (
+            denied := ensure_admin_kid_access(
+                request, child.kid_id, redirect="/admin?section=accounts"
+            )
+        ) is not None:
+            return denied
         if kind == "credit":
             child.balance_cents += amount_c
             session.add(Event(child_id=kid_id, change_cents=amount_c, reason=reason or "credit"))
@@ -8192,10 +9052,16 @@ def adjust_balance(request: Request, kid_id: str = Form(...), amount: str = Form
                 return render_page(request, "Admin", "<div class='card'>Insufficient funds.</div>")
             child.balance_cents -= amount_c
             session.add(Event(child_id=kid_id, change_cents=-amount_c, reason=reason or "debit"))
-        child.updated_at = datetime.utcnow()
+            child.updated_at = datetime.utcnow()
         session.add(child)
         session.commit()
-    return RedirectResponse("/admin", status_code=302)
+    action = "Credited" if kind == "credit" else "Debited"
+    set_admin_notice(
+        request,
+        f"{action} {usd(amount_c)} for {html_escape(kid_id)}.",
+        "success",
+    )
+    return RedirectResponse("/admin?section=accounts", status_code=302)
 
 
 @app.post("/admin/transfer")
@@ -8206,7 +9072,11 @@ def admin_transfer(
     amount: str = Form("0.00"),
     note: str = Form(""),
 ):
-    if (redirect := require_admin(request)) is not None:
+    if (
+        redirect := require_admin_permission(
+            request, "can_transfer_funds", redirect="/admin?section=accounts"
+        )
+    ) is not None:
         return redirect
     from_kid = (from_kid or "").strip()
     to_kid = (to_kid or "").strip()
@@ -8215,13 +9085,37 @@ def admin_transfer(
         return render_page(request, "Admin", body, status_code=400)
     amount_c = to_cents_from_dollars_str(amount, 0)
     if amount_c <= 0:
-        return RedirectResponse("/admin", status_code=302)
+        return RedirectResponse("/admin?section=accounts", status_code=302)
+    if (
+        limit_redirect := ensure_admin_amount_within_limits(
+            request, amount_c, "debit", redirect="/admin?section=accounts"
+        )
+    ) is not None:
+        return limit_redirect
+    if (
+        limit_redirect := ensure_admin_amount_within_limits(
+            request, amount_c, "credit", redirect="/admin?section=accounts"
+        )
+    ) is not None:
+        return limit_redirect
     with Session(engine) as session:
         sender = session.exec(select(Child).where(Child.kid_id == from_kid)).first()
         recipient = session.exec(select(Child).where(Child.kid_id == to_kid)).first()
         if not sender or not recipient:
             body = "<div class='card'><p style='color:#ff6b6b;'>Child not found.</p><p><a href='/admin'>Back</a></p></div>"
             return render_page(request, "Admin", body, status_code=404)
+        if (
+            denied := ensure_admin_kid_access(
+                request, sender.kid_id, redirect="/admin?section=accounts"
+            )
+        ) is not None:
+            return denied
+        if (
+            denied := ensure_admin_kid_access(
+                request, recipient.kid_id, redirect="/admin?section=accounts"
+            )
+        ) is not None:
+            return denied
         if amount_c > sender.balance_cents:
             body = "<div class='card'><p style='color:#ff6b6b;'>Insufficient funds for this transfer.</p><p><a href='/admin'>Back</a></p></div>"
             return render_page(request, "Admin", body, status_code=400)
@@ -8237,30 +9131,50 @@ def admin_transfer(
         session.add(Event(child_id=from_kid, change_cents=-amount_c, reason=reason_out))
         session.add(Event(child_id=to_kid, change_cents=amount_c, reason=reason_in))
         session.commit()
-    return RedirectResponse("/admin", status_code=302)
+    set_admin_notice(
+        request,
+        f"Transferred {usd(amount_c)} from {html_escape(from_kid)} to {html_escape(to_kid)}.",
+        "success",
+    )
+    return RedirectResponse("/admin?section=accounts", status_code=302)
 
 
 @app.post("/add_prize")
 def add_prize(request: Request, name: str = Form(...), cost: str = Form("0.00"), notes: str = Form("")):
-    if (redirect := require_admin(request)) is not None:
+    if (
+        redirect := require_admin_permission(
+            request, "can_manage_prizes", redirect="/admin?section=prizes"
+        )
+    ) is not None:
         return redirect
     cost_c = to_cents_from_dollars_str(cost, 0)
     with Session(engine) as session:
         prize = Prize(name=name.strip(), cost_cents=cost_c, notes=notes.strip() or None)
         session.add(prize)
         session.commit()
-    return RedirectResponse("/admin", status_code=302)
+    set_admin_notice(request, f"Added prize {html_escape(name.strip())}.", "success")
+    return RedirectResponse("/admin?section=prizes", status_code=302)
 
 
 @app.post("/redeem_prize")
 def redeem_prize(request: Request, kid_id: str = Form(...), prize_id: int = Form(...)):
-    if (redirect := require_admin(request)) is not None:
+    if (
+        redirect := require_admin_permission(
+            request, "can_manage_prizes", redirect="/admin?section=prizes"
+        )
+    ) is not None:
         return redirect
     with Session(engine) as session:
         child = session.exec(select(Child).where(Child.kid_id == kid_id)).first()
         prize = session.get(Prize, prize_id)
         if not child or not prize:
             return render_page(request, "Admin", "<div class='card'>Child or prize not found.</div>")
+        if (
+            denied := ensure_admin_kid_access(
+                request, child.kid_id, redirect="/admin?section=prizes"
+            )
+        ) is not None:
+            return denied
         if prize.cost_cents > child.balance_cents:
             return render_page(request, "Admin", "<div class='card'>Insufficient funds for prize.</div>")
         child.balance_cents -= prize.cost_cents
@@ -8268,12 +9182,17 @@ def redeem_prize(request: Request, kid_id: str = Form(...), prize_id: int = Form
         session.add(Event(child_id=kid_id, change_cents=-prize.cost_cents, reason=f"prize:{prize.name}"))
         session.add(child)
         session.commit()
-    return RedirectResponse("/admin", status_code=302)
+    set_admin_notice(request, "Redeemed prize.", "success")
+    return RedirectResponse("/admin?section=prizes", status_code=302)
 
 
 @app.post("/delete_prize")
 def delete_prize(request: Request, prize_id: int = Form(...)):
-    if (redirect := require_admin(request)) is not None:
+    if (
+        redirect := require_admin_permission(
+            request, "can_manage_prizes", redirect="/admin?section=prizes"
+        )
+    ) is not None:
         return redirect
     with Session(engine) as session:
         prize = session.get(Prize, prize_id)
@@ -8281,7 +9200,8 @@ def delete_prize(request: Request, prize_id: int = Form(...)):
             return render_page(request, "Admin", "<div class='card'>Prize not found.</div>")
         session.delete(prize)
         session.commit()
-    return RedirectResponse("/admin", status_code=302)
+    set_admin_notice(request, "Deleted prize.", "success")
+    return RedirectResponse("/admin?section=prizes", status_code=302)
 
 @app.post("/admin/chore_deny")
 def admin_chore_deny(
@@ -8289,11 +9209,15 @@ def admin_chore_deny(
     instance_id: int = Form(...),
     redirect: str = Form("/admin?section=payouts"),
 ):
-    if (auth_redirect := require_admin(request)) is not None:
-        return auth_redirect
     redirect_target = (redirect or "").strip()
     if not redirect_target or not redirect_target.startswith("/"):
         redirect_target = "/admin?section=payouts"
+    if (
+        auth_redirect := require_admin_permission(
+            request, "can_manage_payouts", redirect=redirect_target
+        )
+    ) is not None:
+        return auth_redirect
     with Session(engine) as session:
         instance = session.get(ChoreInstance, instance_id)
         if not instance or instance.status != "pending":
@@ -8301,6 +9225,14 @@ def admin_chore_deny(
             return RedirectResponse(redirect_target, status_code=302)
         instance.status = "available"
         instance.completed_at = None
+        chore = session.get(Chore, instance.chore_id)
+        if chore and chore.kid_id:
+            if (
+                denied := ensure_admin_kid_access(
+                    request, chore.kid_id, redirect=redirect_target
+                )
+            ) is not None:
+                return denied
         session.add(instance)
         session.commit()
     set_admin_notice(request, "Moved chore back to Available for review later.", "success")
@@ -8315,11 +9247,15 @@ def admin_chore_payout(
     reason: str = Form(""),
     redirect: str = Form("/admin?section=payouts"),
 ):
-    if (auth_redirect := require_admin(request)) is not None:
-        return auth_redirect
     redirect_target = (redirect or "").strip()
     if not redirect_target or not redirect_target.startswith("/"):
         redirect_target = "/admin?section=payouts"
+    if (
+        auth_redirect := require_admin_permission(
+            request, "can_manage_payouts", redirect=redirect_target
+        )
+    ) is not None:
+        return auth_redirect
     child_name = ""
     chore_name = ""
     payout_c = 0
@@ -8336,12 +9272,24 @@ def admin_chore_payout(
         if not child:
             set_admin_notice(request, "Kid account could not be found.", "error")
             return RedirectResponse(redirect_target, status_code=302)
+        if (
+            denied := ensure_admin_kid_access(
+                request, child.kid_id, redirect=redirect_target
+            )
+        ) is not None:
+            return denied
         raw_amount = (amount or "").strip()
         if not raw_amount:
             payout_c = chore.award_cents
         else:
             parsed_amount = to_cents_from_dollars_str(raw_amount, chore.award_cents)
             payout_c = chore.award_cents if parsed_amount <= 0 else parsed_amount
+        if (
+            limit_redirect := ensure_admin_amount_within_limits(
+                request, payout_c, "credit", redirect=redirect_target
+            )
+        ) is not None:
+            return limit_redirect
         moment = _time_provider()
         child.balance_cents += payout_c
         child.updated_at = moment
@@ -8369,7 +9317,11 @@ def admin_chore_payout(
 
 @app.post("/admin/rules")
 def admin_rules(request: Request, bonus_all: Optional[str] = Form(None), bonus: str = Form("0.00"), penalty_miss: Optional[str] = Form(None), penalty: str = Form("0.00")):
-    if (redirect := require_admin(request)) is not None:
+    if (
+        redirect := require_admin_permission(
+            request, "can_manage_allowance", redirect="/admin?section=rules"
+        )
+    ) is not None:
         return redirect
     bonus_c = to_cents_from_dollars_str(bonus, 0)
     penalty_c = to_cents_from_dollars_str(penalty, 0)
@@ -8379,12 +9331,17 @@ def admin_rules(request: Request, bonus_all: Optional[str] = Form(None), bonus: 
         MetaDAO.set(session, "rule_penalty_on_miss", "1" if penalty_miss else "0")
         MetaDAO.set(session, "rule_penalty_cents", str(penalty_c))
         session.commit()
-    return RedirectResponse("/admin", status_code=302)
+    set_admin_notice(request, "Saved allowance rules.", "success")
+    return RedirectResponse("/admin?section=rules", status_code=302)
 
 
 @app.post("/admin/certificates/rate")
 async def admin_set_certificate_rate(request: Request):
-    if (redirect := require_admin(request)) is not None:
+    if (
+        redirect := require_admin_permission(
+            request, "can_manage_investing", redirect="/admin?section=investing"
+        )
+    ) is not None:
         return redirect
     form = await request.form()
     invalid_terms: list[str] = []
@@ -8416,12 +9373,17 @@ async def admin_set_certificate_rate(request: Request):
         if default_rate is not None:
             MetaDAO.set(session, CD_RATE_KEY, str(default_rate))
         session.commit()
-    return RedirectResponse("/admin", status_code=302)
+    set_admin_notice(request, "Updated CD rates.", "success")
+    return RedirectResponse("/admin?section=investing", status_code=302)
 
 
 @app.post("/admin/certificates/penalty")
 async def admin_set_certificate_penalty(request: Request):
-    if (redirect := require_admin(request)) is not None:
+    if (
+        redirect := require_admin_permission(
+            request, "can_manage_investing", redirect="/admin?section=investing"
+        )
+    ) is not None:
         return redirect
     form = await request.form()
     updates: Dict[str, int] = {}
@@ -8454,7 +9416,8 @@ async def admin_set_certificate_penalty(request: Request):
         if default_days is not None:
             MetaDAO.set(session, CD_PENALTY_DAYS_KEY, str(default_days))
         session.commit()
-    return RedirectResponse("/admin", status_code=302)
+    set_admin_notice(request, "Updated CD penalties.", "success")
+    return RedirectResponse("/admin?section=investing", status_code=302)
 
 
 @app.post("/admin/market_instruments/add")
@@ -8464,18 +9427,28 @@ def admin_market_instrument_add(
     name: str = Form(""),
     kind: str = Form(INSTRUMENT_KIND_STOCK),
 ):
-    if (redirect := require_admin(request)) is not None:
+    if (
+        redirect := require_admin_permission(
+            request, "can_manage_investing", redirect="/admin?section=investing"
+        )
+    ) is not None:
         return redirect
     add_market_instrument(symbol, name, kind)
-    return RedirectResponse("/admin", status_code=302)
+    set_admin_notice(request, f"Added market instrument {html_escape(symbol)}.", "success")
+    return RedirectResponse("/admin?section=investing", status_code=302)
 
 
 @app.post("/admin/market_instruments/delete")
 def admin_market_instrument_delete(request: Request, instrument_id: int = Form(...)):
-    if (redirect := require_admin(request)) is not None:
+    if (
+        redirect := require_admin_permission(
+            request, "can_manage_investing", redirect="/admin?section=investing"
+        )
+    ) is not None:
         return redirect
     delete_market_instrument(instrument_id)
-    return RedirectResponse("/admin", status_code=302)
+    set_admin_notice(request, "Removed market instrument.", "success")
+    return RedirectResponse("/admin?section=investing", status_code=302)
 
 
 @app.post("/admin/time_settings")
