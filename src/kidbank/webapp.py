@@ -270,8 +270,10 @@ class ChoreInstance(SQLModel, table=True):
 
 MARKETPLACE_STATUS_OPEN = "open"
 MARKETPLACE_STATUS_CLAIMED = "claimed"
+MARKETPLACE_STATUS_SUBMITTED = "submitted"
 MARKETPLACE_STATUS_COMPLETED = "completed"
 MARKETPLACE_STATUS_CANCELLED = "cancelled"
+MARKETPLACE_STATUS_REJECTED = "rejected"
 
 
 class MarketplaceListing(SQLModel, table=True):
@@ -4413,8 +4415,10 @@ def kid_home(
         status_styles = {
             MARKETPLACE_STATUS_OPEN: ("Open", "#dbeafe", "#1d4ed8"),
             MARKETPLACE_STATUS_CLAIMED: ("Claimed", "#fef3c7", "#b45309"),
+            MARKETPLACE_STATUS_SUBMITTED: ("Submitted", "#e0e7ff", "#4338ca"),
             MARKETPLACE_STATUS_COMPLETED: ("Completed", "#dcfce7", "#166534"),
             MARKETPLACE_STATUS_CANCELLED: ("Cancelled", "#fee2e2", "#b91c1c"),
+            MARKETPLACE_STATUS_REJECTED: ("Rejected", "#fee2e2", "#b91c1c"),
         }
         empty_action_html = "<span class='muted'>—</span>"
 
@@ -4478,10 +4482,20 @@ def kid_home(
             status_html = _status_badge(listing)
             if listing.status == MARKETPLACE_STATUS_CLAIMED and claimer_name:
                 status_html += f"<div class='muted'>By {claimer_name}</div>"
+            elif listing.status == MARKETPLACE_STATUS_SUBMITTED and claimer_name:
+                status_html += (
+                    f"<div class='muted'>Submitted by {claimer_name}</div>"
+                    f"<div class='muted'>{_format_ts(listing.submitted_at)}</div>"
+                )
             elif listing.status == MARKETPLACE_STATUS_COMPLETED:
                 status_html += f"<div class='muted'>Completed {_format_ts(listing.completed_at)}</div>"
             elif listing.status == MARKETPLACE_STATUS_CANCELLED:
                 status_html += f"<div class='muted'>Cancelled {_format_ts(listing.cancelled_at)}</div>"
+            elif listing.status == MARKETPLACE_STATUS_REJECTED:
+                note = html_escape(listing.payout_note) if listing.payout_note else ""
+                status_html += f"<div class='muted'>Rejected {_format_ts(listing.completed_at)}</div>"
+                if note:
+                    status_html += f"<div class='muted'>{note}</div>"
             actions_html = ""
             if listing.status == MARKETPLACE_STATUS_OPEN:
                 actions_html = (
@@ -4517,6 +4531,13 @@ def kid_home(
                 status_html += f"<div class='muted'>Completed {_format_ts(listing.completed_at)}</div>"
             elif listing.status == MARKETPLACE_STATUS_CANCELLED:
                 status_html += "<div class='muted'>Cancelled by owner</div>"
+            elif listing.status == MARKETPLACE_STATUS_SUBMITTED:
+                status_html += f"<div class='muted'>Waiting on approval {_format_ts(listing.submitted_at)}</div>"
+            elif listing.status == MARKETPLACE_STATUS_REJECTED:
+                note = html_escape(listing.payout_note) if listing.payout_note else ""
+                status_html += "<div class='muted'>Rejected by admin</div>"
+                if note:
+                    status_html += f"<div class='muted'>{note}</div>"
             actions_html = ""
             if listing.status == MARKETPLACE_STATUS_CLAIMED and listing.claimed_by == kid_id:
                 actions_html = (
@@ -5146,7 +5167,11 @@ def kid_checkoff(request: Request, chore_id: int = Form(...)):
             .where(MarketplaceListing.owner_kid_id == kid_id)
             .where(
                 MarketplaceListing.status.in_(
-                    [MARKETPLACE_STATUS_OPEN, MARKETPLACE_STATUS_CLAIMED]
+                    [
+                        MARKETPLACE_STATUS_OPEN,
+                        MARKETPLACE_STATUS_CLAIMED,
+                        MARKETPLACE_STATUS_SUBMITTED,
+                    ]
                 )
             ),
         )
@@ -5589,31 +5614,21 @@ def kid_marketplace_complete(request: Request, listing_id: int = Form(...)):
             set_kid_notice(request, "Could not process that completion right now.", "error")
             return RedirectResponse("/kid?section=marketplace", status_code=302)
         award_cents = listing.chore_award_cents or (chore.award_cents if chore else 0)
-        total_credit = listing.offer_cents + award_cents
         moment = datetime.utcnow()
-        listing.status = MARKETPLACE_STATUS_COMPLETED
-        listing.completed_at = moment
+        listing.status = MARKETPLACE_STATUS_SUBMITTED
         listing.submitted_at = moment
-        listing.final_payout_cents = total_credit
+        listing.completed_at = None
+        listing.final_payout_cents = None
         listing.payout_note = None
         listing.resolved_by = None
+        listing.payout_event_id = None
         session.add(
             Event(
                 child_id=owner.kid_id,
                 change_cents=0,
-                reason=f"Marketplace helper {worker.name} finished {listing.chore_name}",
+                reason=f"Marketplace helper {worker.name} submitted {listing.chore_name}",
             )
         )
-        worker.balance_cents += total_credit
-        worker.updated_at = moment
-        payout_event = Event(
-            child_id=worker.kid_id,
-            change_cents=total_credit,
-            reason=f"Marketplace payout: {listing.chore_name}",
-        )
-        session.add(payout_event)
-        session.flush()
-        listing.payout_event_id = payout_event.id
         if chore:
             chore_type = normalize_chore_type(chore.type)
             period_key = (
@@ -5631,15 +5646,14 @@ def kid_marketplace_complete(request: Request, listing_id: int = Form(...)):
                     period_key=period_key,
                     status="available",
                 )
-            inst.status = "paid"
+            inst.status = "pending"
             inst.completed_at = moment
             session.add(inst)
-        session.add(worker)
         session.add(listing)
         session.commit()
     set_kid_notice(
         request,
-        f"Marketplace chore completed! You earned {usd(total_credit)}.",
+        "Marketplace chore submitted! A parent will review the payout soon.",
         "success",
     )
     return RedirectResponse("/kid?section=marketplace", status_code=302)
@@ -7024,6 +7038,33 @@ def admin_home(
             f"<form class='inline' method='post' action='/admin/chore_deny' style='margin-left:6px;' onsubmit='return confirm(\"Deny and push back to Available?\");'><input type='hidden' name='instance_id' value='{inst.id}'><input type='hidden' name='redirect' value='/admin?section=payouts'><button type='submit' class='danger'>Deny</button></form>"
             "</td></tr>"
         )
+    for listing in marketplace_submitted:
+        owner = all_kids_by_id.get(listing.owner_kid_id)
+        worker = all_kids_by_id.get(listing.claimed_by) if listing.claimed_by else None
+        owner_name = html_escape(owner.name) if owner else html_escape(listing.owner_kid_id)
+        worker_name = html_escape(worker.name) if worker else html_escape(listing.claimed_by or "Unknown")
+        submitted_at = _format_market_ts(listing.submitted_at)
+        total_value = listing.offer_cents + listing.chore_award_cents
+        pending_rows_parts.append(
+            "<tr>"
+            f"<td data-label='Kid'><b>{worker_name}</b><div class='muted'>{html_escape(listing.claimed_by or '')}</div></td>"
+            f"<td data-label='Chore'><b>{html_escape(listing.chore_name)}</b><div class='muted'>Marketplace from {owner_name}</div></td>"
+            f"<td data-label='Award' class='right'><b>{usd(total_value)}</b><div class='muted'>Offer {usd(listing.offer_cents)} • Award {usd(listing.chore_award_cents)}</div></td>"
+            f"<td data-label='Completed'>{submitted_at}</td>"
+            "<td data-label='Actions' class='right'>"
+            "<form class='inline' method='post' action='/admin/marketplace/payout'>"
+            f"<input type='hidden' name='listing_id' value='{listing.id}'>"
+            "<input type='hidden' name='redirect' value='/admin?section=payouts'>"
+            "<input name='amount' type='text' data-money placeholder='override $ (optional)' style='max-width:150px'>"
+            "<input name='reason' type='text' placeholder='reason (optional)' style='max-width:200px'>"
+            "<button type='submit'>Approve</button></form> "
+            "<form class='inline' method='post' action='/admin/marketplace/deny' style='margin-left:6px;' onsubmit='return confirm(\"Deny this marketplace payout?\");'>"
+            f"<input type='hidden' name='listing_id' value='{listing.id}'>"
+            "<input type='hidden' name='redirect' value='/admin?section=payouts'>"
+            "<input name='reason' type='text' placeholder='reason (optional)' style='max-width:200px'>"
+            "<button type='submit' class='danger'>Deny</button></form>"
+            "</td></tr>"
+        )
     global_groups: Dict[Tuple[int, str], Dict[str, Any]] = {}
     for claim, claimant, chore in global_pending:
         key = (claim.chore_id, claim.period_key)
@@ -7139,6 +7180,23 @@ def admin_home(
                 f"<td data-label='Completed'>{submitted}</td>"
                 "</tr>"
             )
+        for listing in marketplace_submitted:
+            worker = (
+                all_kids_by_id.get(listing.claimed_by)
+                if listing.claimed_by
+                else None
+            )
+            owner = all_kids_by_id.get(listing.owner_kid_id)
+            worker_name = html_escape(worker.name) if worker else html_escape(listing.claimed_by or "Unknown")
+            owner_name = html_escape(owner.name) if owner else html_escape(listing.owner_kid_id)
+            readonly_rows.append(
+                "<tr>"
+                f"<td data-label='Kid'><b>{worker_name}</b><div class='muted'>{html_escape(listing.claimed_by or '')}</div></td>"
+                f"<td data-label='Chore'><b>{html_escape(listing.chore_name)}</b><div class='muted'>Marketplace from {owner_name}</div></td>"
+                f"<td data-label='Award' class='right'><b>{usd(listing.offer_cents + listing.chore_award_cents)}</b></td>"
+                f"<td data-label='Completed'>{_format_market_ts(listing.submitted_at)}</td>"
+                "</tr>"
+            )
         readonly_table = "".join(readonly_rows) or "<tr><td colspan='4' class='muted'>(no pending)</td></tr>"
         pending_card = (
             "<div class='card'>"
@@ -7151,7 +7209,7 @@ def admin_home(
         multi_modals = []
     total_assets_c = total_cash_c + total_market_value_c + total_cd_value_c
     kids_count = len(kids)
-    pending_payout_count = len(pending)
+    pending_payout_count = len(pending) + len(marketplace_submitted)
     global_pending_count = len(global_pending)
     money_request_count = len(pending_money_requests)
     goals_attention_count = len(needs)
@@ -8098,11 +8156,17 @@ def admin_home(
     marketplace_claimed = [
         listing for listing in marketplace_listings if listing.status == MARKETPLACE_STATUS_CLAIMED
     ]
+    marketplace_submitted = [
+        listing for listing in marketplace_listings if listing.status == MARKETPLACE_STATUS_SUBMITTED
+    ]
     marketplace_completed = [
         listing for listing in marketplace_listings if listing.status == MARKETPLACE_STATUS_COMPLETED
     ]
     marketplace_cancelled = [
         listing for listing in marketplace_listings if listing.status == MARKETPLACE_STATUS_CANCELLED
+    ]
+    marketplace_rejected = [
+        listing for listing in marketplace_listings if listing.status == MARKETPLACE_STATUS_REJECTED
     ]
     escrow_total_c = sum(
         listing.offer_cents
@@ -8111,6 +8175,7 @@ def admin_home(
         in {
             MARKETPLACE_STATUS_OPEN,
             MARKETPLACE_STATUS_CLAIMED,
+            MARKETPLACE_STATUS_SUBMITTED,
         }
     )
     payout_total_c = sum(
@@ -8121,8 +8186,10 @@ def admin_home(
     status_styles_market = {
         MARKETPLACE_STATUS_OPEN: ("Open", "#dbeafe", "#1d4ed8"),
         MARKETPLACE_STATUS_CLAIMED: ("Claimed", "#fef3c7", "#b45309"),
+        MARKETPLACE_STATUS_SUBMITTED: ("Submitted", "#e0e7ff", "#4338ca"),
         MARKETPLACE_STATUS_COMPLETED: ("Completed", "#dcfce7", "#166534"),
         MARKETPLACE_STATUS_CANCELLED: ("Cancelled", "#fee2e2", "#b91c1c"),
+        MARKETPLACE_STATUS_REJECTED: ("Rejected", "#fee2e2", "#b91c1c"),
     }
 
     def _format_market_ts(value: Optional[datetime]) -> str:
@@ -8156,10 +8223,18 @@ def admin_home(
         status_html = _market_status_badge(listing)
         if listing.status == MARKETPLACE_STATUS_CLAIMED and claimer_name:
             status_html += f"<div class='muted'>By {claimer_name}</div><div class='muted'>{_format_market_ts(listing.claimed_at)}</div>"
+        elif listing.status == MARKETPLACE_STATUS_SUBMITTED:
+            status_html += f"<div class='muted'>Submitted {_format_market_ts(listing.submitted_at)}</div>"
+            if claimer_name:
+                status_html += f"<div class='muted'>By {claimer_name}</div>"
         elif listing.status == MARKETPLACE_STATUS_COMPLETED:
             status_html += f"<div class='muted'>Completed {_format_market_ts(listing.completed_at)}</div>"
         elif listing.status == MARKETPLACE_STATUS_CANCELLED:
             status_html += f"<div class='muted'>Cancelled {_format_market_ts(listing.cancelled_at)}</div>"
+        elif listing.status == MARKETPLACE_STATUS_REJECTED:
+            status_html += f"<div class='muted'>Rejected {_format_market_ts(listing.completed_at)}</div>"
+            if listing.payout_note:
+                status_html += f"<div class='muted'>{html_escape(listing.payout_note)}</div>"
         total_value_c = listing.final_payout_cents or (
             listing.offer_cents + listing.chore_award_cents
         )
@@ -8179,7 +8254,9 @@ def admin_home(
     )
     marketplace_summary = (
         f"Open {len(marketplace_open)} • Claimed {len(marketplace_claimed)}"
+        f" • Submitted {len(marketplace_submitted)}"
         f" • Completed {len(marketplace_completed)} • Cancelled {len(marketplace_cancelled)}"
+        f" • Rejected {len(marketplace_rejected)}"
     )
     marketplace_card = (
         "<div class='card'>"
@@ -9999,10 +10076,113 @@ def admin_marketplace_payout(
     redirect_target = (redirect or "").strip() or "/admin?section=payouts"
     if not redirect_target.startswith("/"):
         redirect_target = "/admin?section=payouts"
+    if (
+        auth_redirect := require_admin_permission(
+            request, "can_manage_payouts", redirect=redirect_target
+        )
+    ) is not None:
+        return auth_redirect
+    actor = admin_role(request) or "guardian"
+    with Session(engine) as session:
+        listing = session.get(MarketplaceListing, listing_id)
+        if not listing or listing.status != MARKETPLACE_STATUS_SUBMITTED:
+            set_admin_notice(request, "That marketplace submission is not pending.", "error")
+            return RedirectResponse(redirect_target, status_code=302)
+        owner = session.exec(select(Child).where(Child.kid_id == listing.owner_kid_id)).first()
+        worker = (
+            session.exec(select(Child).where(Child.kid_id == listing.claimed_by)).first()
+            if listing.claimed_by
+            else None
+        )
+        chore = session.get(Chore, listing.chore_id)
+        if not owner or not worker:
+            set_admin_notice(request, "Could not locate kids for that marketplace payout.", "error")
+            return RedirectResponse(redirect_target, status_code=302)
+        award_cents = listing.chore_award_cents or (chore.award_cents if chore else 0)
+        default_total_c = listing.offer_cents + award_cents
+        raw_amount = (amount or "").strip()
+        if raw_amount:
+            override_c = to_cents_from_dollars_str(raw_amount, default_total_c)
+            final_total_c = max(0, override_c)
+        else:
+            final_total_c = default_total_c
+        offer_component_c = max(final_total_c - award_cents, 0)
+        offer_delta_c = offer_component_c - listing.offer_cents
+        if offer_delta_c > 0 and owner.balance_cents < offer_delta_c:
+            set_admin_notice(
+                request,
+                f"{html_escape(owner.name)} does not have enough balance for that override.",
+                "error",
+            )
+            return RedirectResponse(redirect_target, status_code=302)
+        moment = datetime.utcnow()
+        note_clean = (reason or "").strip() or None
+        if offer_delta_c > 0:
+            owner.balance_cents -= offer_delta_c
+            session.add(
+                Event(
+                    child_id=owner.kid_id,
+                    change_cents=-offer_delta_c,
+                    reason=f"Marketplace offer increase: {listing.chore_name}",
+                )
+            )
+        elif offer_delta_c < 0:
+            refund_c = -offer_delta_c
+            owner.balance_cents += refund_c
+            session.add(
+                Event(
+                    child_id=owner.kid_id,
+                    change_cents=refund_c,
+                    reason=f"Marketplace offer refund: {listing.chore_name}",
+                )
+            )
+        owner.updated_at = moment
+        payout_event: Optional[Event] = None
+        if final_total_c > 0:
+            worker.balance_cents += final_total_c
+            worker.updated_at = moment
+            payout_reason = f"Marketplace payout: {listing.chore_name}"
+            if note_clean:
+                payout_reason += f" ({note_clean})"
+            payout_event = Event(
+                child_id=worker.kid_id,
+                change_cents=final_total_c,
+                reason=payout_reason,
+            )
+            session.add(payout_event)
+            session.flush()
+            listing.payout_event_id = payout_event.id
+        else:
+            listing.payout_event_id = None
+        if chore:
+            chore_type = normalize_chore_type(chore.type)
+            period_key = (
+                "SPECIAL"
+                if chore_type == "special"
+                else period_key_for(chore_type, now_local())
+            )
+            query = select(ChoreInstance).where(ChoreInstance.chore_id == chore.id)
+            if chore_type != "special":
+                query = query.where(ChoreInstance.period_key == period_key)
+            inst = session.exec(query.order_by(desc(ChoreInstance.id))).first()
+            if inst:
+                inst.status = "paid"
+                inst.completed_at = inst.completed_at or moment
+                inst.paid_event_id = payout_event.id if payout_event else inst.paid_event_id
+                session.add(inst)
+        listing.status = MARKETPLACE_STATUS_COMPLETED
+        listing.completed_at = moment
+        listing.final_payout_cents = final_total_c
+        listing.payout_note = note_clean
+        listing.resolved_by = actor
+        session.add(owner)
+        session.add(worker)
+        session.add(listing)
+        session.commit()
     set_admin_notice(
         request,
-        "Marketplace payouts are processed automatically now.",
-        "info",
+        f"Paid {usd(final_total_c)} to {html_escape(worker.name)} for {html_escape(listing.chore_name)}.",
+        "success",
     )
     return RedirectResponse(redirect_target, status_code=302)
 
@@ -10016,10 +10196,66 @@ def admin_marketplace_deny(
     redirect_target = (redirect or "").strip() or "/admin?section=payouts"
     if not redirect_target.startswith("/"):
         redirect_target = "/admin?section=payouts"
+    if (
+        auth_redirect := require_admin_permission(
+            request, "can_manage_payouts", redirect=redirect_target
+        )
+    ) is not None:
+        return auth_redirect
+    actor = admin_role(request) or "guardian"
+    with Session(engine) as session:
+        listing = session.get(MarketplaceListing, listing_id)
+        if not listing or listing.status != MARKETPLACE_STATUS_SUBMITTED:
+            set_admin_notice(request, "That marketplace submission is not pending.", "error")
+            return RedirectResponse(redirect_target, status_code=302)
+        owner = session.exec(select(Child).where(Child.kid_id == listing.owner_kid_id)).first()
+        if not owner:
+            set_admin_notice(request, "Could not locate the listing owner.", "error")
+            return RedirectResponse(redirect_target, status_code=302)
+        note_clean = (reason or "").strip() or None
+        moment = datetime.utcnow()
+        owner.balance_cents += listing.offer_cents
+        owner.updated_at = moment
+        session.add(
+            Event(
+                child_id=owner.kid_id,
+                change_cents=listing.offer_cents,
+                reason=f"Marketplace refund: {listing.chore_name}",
+            )
+        )
+        chore = session.get(Chore, listing.chore_id)
+        if chore:
+            chore_type = normalize_chore_type(chore.type)
+            period_key = (
+                "SPECIAL"
+                if chore_type == "special"
+                else period_key_for(chore_type, now_local())
+            )
+            query = select(ChoreInstance).where(ChoreInstance.chore_id == chore.id)
+            if chore_type != "special":
+                query = query.where(ChoreInstance.period_key == period_key)
+            inst = session.exec(query.order_by(desc(ChoreInstance.id))).first()
+            if inst:
+                inst.status = "available"
+                inst.completed_at = None
+                inst.paid_event_id = None
+                session.add(inst)
+        listing.status = MARKETPLACE_STATUS_REJECTED
+        listing.completed_at = moment
+        listing.final_payout_cents = 0
+        listing.payout_note = note_clean
+        listing.resolved_by = actor
+        listing.payout_event_id = None
+        session.add(owner)
+        session.add(listing)
+        session.commit()
+    msg = "Marketplace submission denied. Funds returned to the owner."
+    if note_clean:
+        msg = f"{msg} ({html_escape(note_clean)})"
     set_admin_notice(
         request,
-        "Marketplace payouts are handled automatically and cannot be denied.",
-        "info",
+        msg,
+        "success",
     )
     return RedirectResponse(redirect_target, status_code=302)
 

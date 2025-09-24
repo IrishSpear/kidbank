@@ -299,8 +299,10 @@ class ChoreListingStatus(str, Enum):
 
     OPEN = "open"
     CLAIMED = "claimed"
+    SUBMITTED = "submitted"
     COMPLETED = "completed"
     CANCELLED = "cancelled"
+    REJECTED = "rejected"
 
 
 @dataclass(slots=True)
@@ -315,7 +317,13 @@ class ChoreListing:
     status: ChoreListingStatus = field(default=ChoreListingStatus.OPEN)
     claimed_by: str | None = None
     claimed_at: datetime | None = None
+    submitted_at: datetime | None = None
     completed_at: datetime | None = None
+    cancelled_at: datetime | None = None
+    final_payout: Decimal | None = None
+    payout_note: str | None = None
+    resolved_by: str | None = None
+    pending_completion: ChoreCompletion | None = None
 
     def __post_init__(self) -> None:
         offer = Decimal(self.offer).quantize(Decimal("0.01"))
@@ -332,13 +340,14 @@ class ChoreListing:
         self.claimed_by = child_name
         self.claimed_at = when or datetime.utcnow()
 
-    def complete(self, child_name: str, *, when: datetime | None = None) -> None:
+    def submit(self, child_name: str, completion: ChoreCompletion) -> None:
         if self.status is not ChoreListingStatus.CLAIMED:
-            raise ValueError("Listing must be claimed before completion.")
+            raise ValueError("Listing must be claimed before submission.")
         if child_name != self.claimed_by:
-            raise ValueError("Only the child who claimed the listing can complete it.")
-        self.status = ChoreListingStatus.COMPLETED
-        self.completed_at = when or datetime.utcnow()
+            raise ValueError("Only the child who claimed the listing can submit it.")
+        self.status = ChoreListingStatus.SUBMITTED
+        self.submitted_at = completion.timestamp
+        self.pending_completion = completion
 
     def cancel(self, child_name: str, *, when: datetime | None = None) -> None:
         if child_name != self.owner:
@@ -346,11 +355,37 @@ class ChoreListing:
         if self.status is not ChoreListingStatus.OPEN:
             raise ValueError("Only open listings can be cancelled.")
         self.status = ChoreListingStatus.CANCELLED
-        self.completed_at = when or datetime.utcnow()
+        self.cancelled_at = when or datetime.utcnow()
+
+    def approve(self, *, payout: Decimal, resolved_by: str, note: str | None = None, when: datetime | None = None) -> None:
+        if self.status is not ChoreListingStatus.SUBMITTED:
+            raise ValueError("Listing must be submitted before approval.")
+        resolution_time = when or datetime.utcnow()
+        self.status = ChoreListingStatus.COMPLETED
+        self.completed_at = resolution_time
+        self.final_payout = Decimal(payout).quantize(Decimal("0.01"))
+        self.payout_note = note
+        self.resolved_by = resolved_by
+        self.pending_completion = None
+
+    def reject(self, *, resolved_by: str, note: str | None = None, when: datetime | None = None) -> None:
+        if self.status is not ChoreListingStatus.SUBMITTED:
+            raise ValueError("Listing must be submitted before it can be rejected.")
+        resolution_time = when or datetime.utcnow()
+        self.status = ChoreListingStatus.REJECTED
+        self.completed_at = resolution_time
+        self.final_payout = Decimal("0.00")
+        self.payout_note = note
+        self.resolved_by = resolved_by
+        self.pending_completion = None
 
     @property
     def is_active(self) -> bool:
-        return self.status in (ChoreListingStatus.OPEN, ChoreListingStatus.CLAIMED)
+        return self.status in (
+            ChoreListingStatus.OPEN,
+            ChoreListingStatus.CLAIMED,
+            ChoreListingStatus.SUBMITTED,
+        )
 
 
 class ChoreMarketplace:
@@ -387,14 +422,39 @@ class ChoreMarketplace:
         listing.claim(child_name, when=when)
         return listing
 
-    def complete(self, listing_id: str, child_name: str, *, when: datetime | None = None) -> ChoreListing:
+    def submit(self, listing_id: str, child_name: str, completion: ChoreCompletion) -> ChoreListing:
         listing = self.listing(listing_id)
-        listing.complete(child_name, when=when)
+        listing.submit(child_name, completion)
         return listing
 
     def cancel(self, listing_id: str, owner: str, *, when: datetime | None = None) -> ChoreListing:
         listing = self.listing(listing_id)
         listing.cancel(owner, when=when)
+        return listing
+
+    def approve(
+        self,
+        listing_id: str,
+        *,
+        payout: Decimal,
+        resolved_by: str,
+        note: str | None = None,
+        when: datetime | None = None,
+    ) -> ChoreListing:
+        listing = self.listing(listing_id)
+        listing.approve(payout=payout, resolved_by=resolved_by, note=note, when=when)
+        return listing
+
+    def reject(
+        self,
+        listing_id: str,
+        *,
+        resolved_by: str,
+        note: str | None = None,
+        when: datetime | None = None,
+    ) -> ChoreListing:
+        listing = self.listing(listing_id)
+        listing.reject(resolved_by=resolved_by, note=note, when=when)
         return listing
 
     def active_listing_for(self, owner: str, chore_name: str) -> Optional[ChoreListing]:
@@ -406,6 +466,13 @@ class ChoreMarketplace:
             ):
                 return listing
         return None
+
+    def submissions(self) -> Sequence[ChoreListing]:
+        return tuple(
+            listing
+            for listing in self._listings.values()
+            if listing.status is ChoreListingStatus.SUBMITTED
+        )
 
 
 class ChoreBoard:

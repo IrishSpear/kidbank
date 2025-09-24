@@ -222,6 +222,16 @@ def test_chore_marketplace_flow() -> None:
     total = bank.complete_marketplace_chore("Ben", listing.listing_id)
 
     assert total == Decimal("5.50")
+    assert bank.get_account("Ben").balance == Decimal("0.00")
+
+    pending = bank.pending_marketplace_submissions()
+    assert len(pending) == 1 and pending[0].status is ChoreListingStatus.SUBMITTED
+
+    approved_total = bank.approve_marketplace_submission(
+        listing.listing_id, approver="Parent"
+    )
+
+    assert approved_total == Decimal("5.50")
     assert bank.get_account("Ben").balance == Decimal("5.50")
     assert bank.marketplace_listings() == ()
 
@@ -257,6 +267,52 @@ def test_marketplace_completion_pays_offer_and_award() -> None:
     total = bank.complete_marketplace_chore("Ben", listing.listing_id)
 
     assert total == Decimal("5.00")
+    assert bank.get_account("Ben").balance == Decimal("0.00")
+
+    payout = bank.approve_marketplace_submission(
+        listing.listing_id, approver="Parent"
+    )
+
+    assert payout == Decimal("5.00")
     assert bank.get_account("Ben").balance == Decimal("5.00")
     # Owner started with $5, escrowed $2 for the offer and does not receive it back.
     assert bank.get_account("Ava").balance == Decimal("3.00")
+
+
+def test_marketplace_payout_override_adjusts_offer() -> None:
+    bank = KidBank()
+    bank.create_account("Ava", starting_balance=Decimal("5.00"))
+    bank.create_account("Ben")
+    bank.schedule_chore("Ava", name="Trash", value=Decimal("3.00"))
+
+    listing = bank.list_marketplace_chore("Ava", "Trash", offer=Decimal("2.00"))
+    bank.claim_marketplace_chore("Ben", listing.listing_id)
+    bank.complete_marketplace_chore("Ben", listing.listing_id)
+
+    payout = bank.approve_marketplace_submission(
+        listing.listing_id, approver="Parent", payout_override=Decimal("4.00"), note="Great work"
+    )
+
+    assert payout == Decimal("4.00")
+    # Worker receives the overridden payout.
+    assert bank.get_account("Ben").balance == Decimal("4.00")
+    # Owner escrowed $2, received $1 back because the final offer component was $1.
+    assert bank.get_account("Ava").balance == Decimal("4.00")
+
+
+def test_marketplace_rejection_refunds_offer() -> None:
+    bank = KidBank()
+    bank.create_account("Ava", starting_balance=Decimal("6.00"))
+    bank.create_account("Ben")
+    bank.schedule_chore("Ava", name="Trash", value=Decimal("2.00"))
+
+    listing = bank.list_marketplace_chore("Ava", "Trash", offer=Decimal("3.00"))
+    bank.claim_marketplace_chore("Ben", listing.listing_id)
+    bank.complete_marketplace_chore("Ben", listing.listing_id)
+
+    bank.reject_marketplace_submission(listing.listing_id, approver="Parent", note="Needs redo")
+
+    assert bank.get_account("Ava").balance == Decimal("6.00")
+    assert bank.get_account("Ben").balance == Decimal("0.00")
+    closed = bank.marketplace_listings(include_closed=True)
+    assert closed[0].status is ChoreListingStatus.REJECTED
