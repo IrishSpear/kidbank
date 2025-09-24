@@ -41,6 +41,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, Form, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse, JSONResponse, Response
 from sqlalchemy import inspect
+from sqlalchemy.exc import OperationalError, ProgrammingError
 from sqlmodel import Field, Session, SQLModel, create_engine, desc, select
 from starlette.middleware.sessions import SessionMiddleware
 
@@ -420,6 +421,45 @@ def create_db_and_tables() -> None:
 def _column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
     cur = conn.execute(f"PRAGMA table_info({table});")
     return any(row[1] == column for row in cur.fetchall())
+
+
+def _marketplace_error_needs_migration(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return "marketplacelisting" in message and (
+        "no such table" in message
+        or "no such column" in message
+        or "has no column" in message
+    )
+
+
+def _safe_marketplace_list(session: Session, query) -> List[MarketplaceListing]:
+    try:
+        return session.exec(query).all()
+    except (sqlite3.OperationalError, OperationalError, ProgrammingError) as exc:
+        if _marketplace_error_needs_migration(exc):
+            run_migrations()
+            try:
+                return session.exec(query).all()
+            except (sqlite3.OperationalError, OperationalError, ProgrammingError) as retry_exc:
+                if _marketplace_error_needs_migration(retry_exc):
+                    return []
+                raise
+        raise
+
+
+def _safe_marketplace_first(session: Session, query) -> Optional[MarketplaceListing]:
+    try:
+        return session.exec(query).first()
+    except (sqlite3.OperationalError, OperationalError, ProgrammingError) as exc:
+        if _marketplace_error_needs_migration(exc):
+            run_migrations()
+            try:
+                return session.exec(query).first()
+            except (sqlite3.OperationalError, OperationalError, ProgrammingError) as retry_exc:
+                if _marketplace_error_needs_migration(retry_exc):
+                    return None
+                raise
+        raise
 
 
 def run_migrations() -> None:
@@ -3420,22 +3460,25 @@ def kid_home(
                 .order_by(desc(GlobalChoreClaim.submitted_at))
                 .limit(30)
             ).all()
-            marketplace_my_listings = session.exec(
+            marketplace_my_listings = _safe_marketplace_list(
+                session,
                 select(MarketplaceListing)
                 .where(MarketplaceListing.owner_kid_id == kid_id)
-                .order_by(desc(MarketplaceListing.created_at))
-            ).all()
-            marketplace_claimed_by_me = session.exec(
+                .order_by(desc(MarketplaceListing.created_at)),
+            )
+            marketplace_claimed_by_me = _safe_marketplace_list(
+                session,
                 select(MarketplaceListing)
                 .where(MarketplaceListing.claimed_by == kid_id)
-                .order_by(desc(MarketplaceListing.created_at))
-            ).all()
-            marketplace_open_listings = session.exec(
+                .order_by(desc(MarketplaceListing.created_at)),
+            )
+            marketplace_open_listings = _safe_marketplace_list(
+                session,
                 select(MarketplaceListing)
                 .where(MarketplaceListing.status == MARKETPLACE_STATUS_OPEN)
                 .where(MarketplaceListing.owner_kid_id != kid_id)
-                .order_by(desc(MarketplaceListing.created_at))
-            ).all()
+                .order_by(desc(MarketplaceListing.created_at)),
+            )
             for claim in kid_global_claims:
                 if claim.chore_id not in global_chore_lookup:
                     chore_ref = session.get(Chore, claim.chore_id)
@@ -5096,7 +5139,8 @@ def kid_checkoff(request: Request, chore_id: int = Form(...)):
         if not chore or chore.kid_id != kid_id or not chore.active:
             set_kid_notice(request, "That chore isn't available right now.", "error")
             return RedirectResponse("/kid?section=chores", status_code=302)
-        active_listing = session.exec(
+        active_listing = _safe_marketplace_first(
+            session,
             select(MarketplaceListing)
             .where(MarketplaceListing.chore_id == chore.id)
             .where(MarketplaceListing.owner_kid_id == kid_id)
@@ -5104,8 +5148,8 @@ def kid_checkoff(request: Request, chore_id: int = Form(...)):
                 MarketplaceListing.status.in_(
                     [MARKETPLACE_STATUS_OPEN, MARKETPLACE_STATUS_CLAIMED]
                 )
-            )
-        ).first()
+            ),
+        )
         if active_listing:
             set_kid_notice(
                 request,
@@ -5425,7 +5469,8 @@ def kid_marketplace_list(
             set_kid_notice(request, "That chore isn't available to list today.", "error")
             return RedirectResponse("/kid?section=marketplace", status_code=302)
         listed_chore_name = chore.name
-        existing_listing = session.exec(
+        existing_listing = _safe_marketplace_first(
+            session,
             select(MarketplaceListing)
             .where(MarketplaceListing.chore_id == chore.id)
             .where(MarketplaceListing.owner_kid_id == kid_id)
@@ -5433,8 +5478,8 @@ def kid_marketplace_list(
                 MarketplaceListing.status.in_(
                     [MARKETPLACE_STATUS_OPEN, MARKETPLACE_STATUS_CLAIMED]
                 )
-            )
-        ).first()
+            ),
+        )
         if existing_listing:
             set_kid_notice(request, "That chore already has an active listing.", "error")
             return RedirectResponse("/kid?section=marketplace", status_code=302)
@@ -6769,9 +6814,10 @@ def admin_home(
             select(MoneyRequest).where(MoneyRequest.status == "pending")
         ).all()
         goals_all = session.exec(select(Goal)).all()
-        marketplace_listings = session.exec(
-            select(MarketplaceListing).order_by(desc(MarketplaceListing.created_at))
-        ).all()
+        marketplace_listings = _safe_marketplace_list(
+            session,
+            select(MarketplaceListing).order_by(desc(MarketplaceListing.created_at)),
+        )
     def _kid_allowed(identifier: Optional[str]) -> bool:
         if not identifier:
             return True
