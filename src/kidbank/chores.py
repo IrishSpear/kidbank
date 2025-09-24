@@ -305,6 +305,7 @@ class ChoreListingStatus(str, Enum):
     REJECTED = "rejected"
 
 
+
 @dataclass(slots=True)
 class ChoreListing:
     """A listing advertising a chore available for pickup by another child."""

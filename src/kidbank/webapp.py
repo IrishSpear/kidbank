@@ -276,6 +276,7 @@ MARKETPLACE_STATUS_CANCELLED = "cancelled"
 MARKETPLACE_STATUS_REJECTED = "rejected"
 
 
+
 class MarketplaceListing(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     owner_kid_id: str
@@ -294,6 +295,7 @@ class MarketplaceListing(SQLModel, table=True):
     payout_note: Optional[str] = None
     resolved_by: Optional[str] = None
     payout_event_id: Optional[int] = None
+
 
 
 class MetaKV(SQLModel, table=True):
@@ -659,6 +661,7 @@ def run_migrations() -> None:
                 payout_note TEXT,
                 resolved_by TEXT,
                 payout_event_id INTEGER
+
             );
             """
         )
@@ -674,6 +677,7 @@ def run_migrations() -> None:
             ON marketplacelisting(status);
             """
         )
+
         if not _column_exists(raw, "marketplacelisting", "submitted_at"):
             raw.execute(
                 "ALTER TABLE marketplacelisting ADD COLUMN submitted_at TEXT;"
@@ -694,6 +698,7 @@ def run_migrations() -> None:
             raw.execute(
                 "ALTER TABLE marketplacelisting ADD COLUMN payout_event_id INTEGER;"
             )
+
         raw.commit()
     finally:
         raw.close()
@@ -3481,6 +3486,7 @@ def kid_home(
                 .where(MarketplaceListing.owner_kid_id != kid_id)
                 .order_by(desc(MarketplaceListing.created_at)),
             )
+
             for claim in kid_global_claims:
                 if claim.chore_id not in global_chore_lookup:
                     chore_ref = session.get(Chore, claim.chore_id)
@@ -4385,6 +4391,7 @@ def kid_home(
                 MARKETPLACE_STATUS_OPEN,
                 MARKETPLACE_STATUS_CLAIMED,
             }
+
         }
         listing_options: List[str] = []
         for chore_obj, _ in chores_today:
@@ -4410,6 +4417,7 @@ def kid_home(
             listing_form_html = (
                 "<p class='muted' style='margin-top:8px;'>"
                 "All of today's chores are already listed or claimed."
+
                 "</p>"
             )
         status_styles = {
@@ -4419,6 +4427,7 @@ def kid_home(
             MARKETPLACE_STATUS_COMPLETED: ("Completed", "#dcfce7", "#166534"),
             MARKETPLACE_STATUS_CANCELLED: ("Cancelled", "#fee2e2", "#b91c1c"),
             MARKETPLACE_STATUS_REJECTED: ("Rejected", "#fee2e2", "#b91c1c"),
+
         }
         empty_action_html = "<span class='muted'>—</span>"
 
@@ -4487,6 +4496,7 @@ def kid_home(
                     f"<div class='muted'>Submitted by {claimer_name}</div>"
                     f"<div class='muted'>{_format_ts(listing.submitted_at)}</div>"
                 )
+
             elif listing.status == MARKETPLACE_STATUS_COMPLETED:
                 status_html += f"<div class='muted'>Completed {_format_ts(listing.completed_at)}</div>"
             elif listing.status == MARKETPLACE_STATUS_CANCELLED:
@@ -4496,6 +4506,7 @@ def kid_home(
                 status_html += f"<div class='muted'>Rejected {_format_ts(listing.completed_at)}</div>"
                 if note:
                     status_html += f"<div class='muted'>{note}</div>"
+
             actions_html = ""
             if listing.status == MARKETPLACE_STATUS_OPEN:
                 actions_html = (
@@ -4538,6 +4549,7 @@ def kid_home(
                 status_html += "<div class='muted'>Rejected by admin</div>"
                 if note:
                     status_html += f"<div class='muted'>{note}</div>"
+
             actions_html = ""
             if listing.status == MARKETPLACE_STATUS_CLAIMED and listing.claimed_by == kid_id:
                 actions_html = (
@@ -5162,6 +5174,7 @@ def kid_checkoff(request: Request, chore_id: int = Form(...)):
             return RedirectResponse("/kid?section=chores", status_code=302)
         active_listing = _safe_marketplace_first(
             session,
+
             select(MarketplaceListing)
             .where(MarketplaceListing.chore_id == chore.id)
             .where(MarketplaceListing.owner_kid_id == kid_id)
@@ -5175,6 +5188,7 @@ def kid_checkoff(request: Request, chore_id: int = Form(...)):
                 )
             ),
         )
+
         if active_listing:
             set_kid_notice(
                 request,
@@ -5496,6 +5510,7 @@ def kid_marketplace_list(
         listed_chore_name = chore.name
         existing_listing = _safe_marketplace_first(
             session,
+
             select(MarketplaceListing)
             .where(MarketplaceListing.chore_id == chore.id)
             .where(MarketplaceListing.owner_kid_id == kid_id)
@@ -5505,6 +5520,7 @@ def kid_marketplace_list(
                 )
             ),
         )
+
         if existing_listing:
             set_kid_notice(request, "That chore already has an active listing.", "error")
             return RedirectResponse("/kid?section=marketplace", status_code=302)
@@ -5622,11 +5638,13 @@ def kid_marketplace_complete(request: Request, listing_id: int = Form(...)):
         listing.payout_note = None
         listing.resolved_by = None
         listing.payout_event_id = None
+
         session.add(
             Event(
                 child_id=owner.kid_id,
                 change_cents=0,
                 reason=f"Marketplace helper {worker.name} submitted {listing.chore_name}",
+
             )
         )
         if chore:
@@ -5656,6 +5674,7 @@ def kid_marketplace_complete(request: Request, listing_id: int = Form(...)):
         "Marketplace chore submitted! A parent will review the payout soon.",
         "success",
     )
+
     return RedirectResponse("/kid?section=marketplace", status_code=302)
 
 
@@ -6832,6 +6851,7 @@ def admin_home(
             session,
             select(MarketplaceListing).order_by(desc(MarketplaceListing.created_at)),
         )
+
     def _kid_allowed(identifier: Optional[str]) -> bool:
         if not identifier:
             return True
@@ -8200,6 +8220,7 @@ def admin_home(
         + add_admin_form_html
         + "</div>"
     )
+
     def _market_status_badge(listing: MarketplaceListing) -> str:
         label, bg, fg = status_styles_market.get(
             listing.status, (listing.status.title(), "#e2e8f0", "#334155")
@@ -8227,6 +8248,7 @@ def admin_home(
             status_html += f"<div class='muted'>Submitted {_format_market_ts(listing.submitted_at)}</div>"
             if claimer_name:
                 status_html += f"<div class='muted'>By {claimer_name}</div>"
+
         elif listing.status == MARKETPLACE_STATUS_COMPLETED:
             status_html += f"<div class='muted'>Completed {_format_market_ts(listing.completed_at)}</div>"
         elif listing.status == MARKETPLACE_STATUS_CANCELLED:
@@ -8239,6 +8261,7 @@ def admin_home(
             listing.offer_cents + listing.chore_award_cents
         )
         total_value = usd(total_value_c)
+
         marketplace_rows.append(
             "<tr>"
             f"<td data-label='Created'>{_format_market_ts(listing.created_at)}</td>"
@@ -8257,6 +8280,7 @@ def admin_home(
         f" • Submitted {len(marketplace_submitted)}"
         f" • Completed {len(marketplace_completed)} • Cancelled {len(marketplace_cancelled)}"
         f" • Rejected {len(marketplace_rejected)}"
+
     )
     marketplace_card = (
         "<div class='card'>"

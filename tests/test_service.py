@@ -232,6 +232,7 @@ def test_chore_marketplace_flow() -> None:
     )
 
     assert approved_total == Decimal("5.50")
+
     assert bank.get_account("Ben").balance == Decimal("5.50")
     assert bank.marketplace_listings() == ()
 
@@ -316,3 +317,4 @@ def test_marketplace_rejection_refunds_offer() -> None:
     assert bank.get_account("Ben").balance == Decimal("0.00")
     closed = bank.marketplace_listings(include_closed=True)
     assert closed[0].status is ChoreListingStatus.REJECTED
+

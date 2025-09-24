@@ -594,6 +594,7 @@ class KidBank:
     ) -> Decimal:
         """Submit a marketplace chore completion for administrator approval."""
 
+
         self.get_account(child_name)
         listing = self._marketplace.listing(listing_id)
         if listing.status is not ChoreListingStatus.CLAIMED:
@@ -614,6 +615,7 @@ class KidBank:
         )
         self.evaluate_badges(listing.owner)
         return total
+
 
     def cancel_marketplace_listing(self, owner: str, listing_id: str) -> ChoreListing:
         """Cancel an open marketplace listing and refund the escrowed funds."""
