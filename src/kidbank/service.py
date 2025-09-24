@@ -14,8 +14,11 @@ from .api import ApiExporter, WebhookDispatcher
 from .chores import (
     Chore,
     ChoreBoard,
+    ChoreMarketplace,
     ChorePack,
     ChoreSchedule,
+    ChoreListing,
+    ChoreListingStatus,
     GlobalChore,
     GlobalChoreSubmission,
     TimeWindow,
@@ -76,6 +79,7 @@ class KidBank:
         "_next_allowance_eta",
         "_default_soft_limit",
         "_transfer_requests",
+        "_marketplace",
     )
 
     def __init__(self, *, soft_limit: AmountLike = Decimal("20")) -> None:
@@ -116,6 +120,7 @@ class KidBank:
         self._next_allowance_eta: Dict[str, Optional[datetime]] = {}
         self._default_soft_limit = to_decimal(soft_limit)
         self._transfer_requests: Dict[str, TransferRequest] = {}
+        self._marketplace = ChoreMarketplace()
 
     # ------------------------------------------------------------------
     # Core account operations
@@ -534,6 +539,115 @@ class KidBank:
             )
         self._audit_log.record(approved_by, "approve_global_chore", chore_name)
         return payouts
+
+    def marketplace_listings(self, *, include_closed: bool = False) -> Sequence[ChoreListing]:
+        """Return marketplace listings, optionally including closed ones."""
+
+        return self._marketplace.listings(include_closed=include_closed)
+
+    def list_marketplace_chore(
+        self,
+        owner: str,
+        chore_name: str,
+        *,
+        offer: AmountLike,
+    ) -> ChoreListing:
+        """Publish one of the owner's chores to the marketplace."""
+
+        self.get_account(owner)
+        board = self._chores[owner]
+        board.get(chore_name)
+        if self._marketplace.active_listing_for(owner, chore_name):
+            raise ValueError(f"Chore '{chore_name}' already has an active marketplace listing.")
+        offer_value = to_decimal(offer)
+        if offer_value <= Decimal("0.00"):
+            raise ValueError("Marketplace offer must be positive.")
+        escrow = self.withdraw(
+            owner,
+            offer_value,
+            f"Marketplace listing escrow: {chore_name}",
+            category=EventCategory.CHORE,
+            metadata={"marketplace": "escrow", "chore": chore_name},
+        )
+        listing = self._marketplace.create_listing(owner, chore_name, offer_value)
+        escrow.metadata["listing"] = listing.listing_id
+        self._audit_log.record(owner, "marketplace_list", f"{chore_name}:{offer_value}")
+        self._logger.log("marketplace_listed", owner=owner, chore=chore_name, offer=float(offer_value))
+        return listing
+
+    def claim_marketplace_chore(self, child_name: str, listing_id: str) -> ChoreListing:
+        """Allow another child to claim an open marketplace listing."""
+
+        self.get_account(child_name)
+        listing = self._marketplace.claim(listing_id, child_name)
+        self._audit_log.record(child_name, "marketplace_claim", listing.chore_name)
+        self._logger.log("marketplace_claimed", listing=listing_id, child=child_name)
+        return listing
+
+    def complete_marketplace_chore(
+        self,
+        child_name: str,
+        listing_id: str,
+        *,
+        proof: Optional[str] = None,
+        at: Optional[datetime] = None,
+    ) -> Decimal:
+        """Record the completion of a marketplace chore and pay the worker."""
+
+        self.get_account(child_name)
+        listing = self._marketplace.listing(listing_id)
+        if listing.status is not ChoreListingStatus.CLAIMED:
+            raise ValueError("Marketplace listing is not ready for completion.")
+        if listing.claimed_by != child_name:
+            raise ValueError("This marketplace listing was claimed by another child.")
+        board = self._chores[listing.owner]
+        completion = board.complete_chore(listing.chore_name, at=at, proof=proof)
+        self._marketplace.complete(listing_id, child_name, when=completion.timestamp)
+        payout = (completion.awarded_value + listing.offer).quantize(Decimal("0.01"))
+        metadata = {
+            "marketplace": "payout",
+            "listing": listing.listing_id,
+            "chore": listing.chore_name,
+            "owner": listing.owner,
+            "award": str(completion.awarded_value),
+            "bonus": str(listing.offer),
+        }
+        self.deposit(
+            child_name,
+            payout,
+            f"Marketplace chore completed: {listing.chore_name}",
+            category=EventCategory.CHORE,
+            metadata=metadata,
+        )
+        self._audit_log.record(child_name, "marketplace_complete", listing.chore_name)
+        self._logger.log(
+            "marketplace_completed",
+            listing=listing.listing_id,
+            worker=child_name,
+            owner=listing.owner,
+            payout=float(payout),
+        )
+        self.evaluate_badges(listing.owner)
+        return payout
+
+    def cancel_marketplace_listing(self, owner: str, listing_id: str) -> ChoreListing:
+        """Cancel an open marketplace listing and refund the escrowed funds."""
+
+        self.get_account(owner)
+        listing = self._marketplace.listing(listing_id)
+        if listing.owner != owner:
+            raise ValueError("Only the owner can cancel this marketplace listing.")
+        self._marketplace.cancel(listing_id, owner)
+        self.deposit(
+            owner,
+            listing.offer,
+            f"Marketplace listing cancelled: {listing.chore_name}",
+            category=EventCategory.CHORE,
+            metadata={"marketplace": "refund", "listing": listing.listing_id, "chore": listing.chore_name},
+        )
+        self._audit_log.record(owner, "marketplace_cancel", listing.chore_name)
+        self._logger.log("marketplace_cancelled", owner=owner, listing=listing.listing_id)
+        return listing
 
     def auto_republish_chores(self, *, at: Optional[datetime] = None) -> Dict[str, Sequence[str]]:
         republished: Dict[str, Sequence[str]] = {}
