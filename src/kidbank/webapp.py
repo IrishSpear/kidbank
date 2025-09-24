@@ -7021,6 +7021,56 @@ def admin_home(
             f"{goals_rows}</table>"
             "</div>"
         )
+    marketplace_open = [
+        listing for listing in marketplace_listings if listing.status == MARKETPLACE_STATUS_OPEN
+    ]
+    marketplace_claimed = [
+        listing for listing in marketplace_listings if listing.status == MARKETPLACE_STATUS_CLAIMED
+    ]
+    marketplace_submitted = [
+        listing for listing in marketplace_listings if listing.status == MARKETPLACE_STATUS_SUBMITTED
+    ]
+    marketplace_completed = [
+        listing for listing in marketplace_listings if listing.status == MARKETPLACE_STATUS_COMPLETED
+    ]
+    marketplace_cancelled = [
+        listing for listing in marketplace_listings if listing.status == MARKETPLACE_STATUS_CANCELLED
+    ]
+    marketplace_rejected = [
+        listing for listing in marketplace_listings if listing.status == MARKETPLACE_STATUS_REJECTED
+    ]
+    escrow_total_c = sum(
+        listing.offer_cents
+        for listing in marketplace_listings
+        if listing.status
+        in {
+            MARKETPLACE_STATUS_OPEN,
+            MARKETPLACE_STATUS_CLAIMED,
+            MARKETPLACE_STATUS_SUBMITTED,
+        }
+    )
+    payout_total_c = sum(
+        (listing.final_payout_cents or (listing.offer_cents + listing.chore_award_cents))
+        for listing in marketplace_listings
+        if listing.status == MARKETPLACE_STATUS_COMPLETED
+    )
+    status_styles_market = {
+        MARKETPLACE_STATUS_OPEN: ("Open", "#dbeafe", "#1d4ed8"),
+        MARKETPLACE_STATUS_CLAIMED: ("Claimed", "#fef3c7", "#b45309"),
+        MARKETPLACE_STATUS_SUBMITTED: ("Submitted", "#e0e7ff", "#4338ca"),
+        MARKETPLACE_STATUS_COMPLETED: ("Completed", "#dcfce7", "#166534"),
+        MARKETPLACE_STATUS_CANCELLED: ("Cancelled", "#fee2e2", "#b91c1c"),
+        MARKETPLACE_STATUS_REJECTED: ("Rejected", "#fee2e2", "#b91c1c"),
+    }
+
+    def _format_market_ts(value: Optional[datetime]) -> str:
+        if not value:
+            return "—"
+        try:
+            return value.strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            return str(value)
+
     pending_rows_parts: List[str] = []
     for inst, chore, child in pending:
         submitted = inst.completed_at.strftime("%Y-%m-%d %H:%M") if inst.completed_at else ""
@@ -8150,56 +8200,6 @@ def admin_home(
         + add_admin_form_html
         + "</div>"
     )
-    marketplace_open = [
-        listing for listing in marketplace_listings if listing.status == MARKETPLACE_STATUS_OPEN
-    ]
-    marketplace_claimed = [
-        listing for listing in marketplace_listings if listing.status == MARKETPLACE_STATUS_CLAIMED
-    ]
-    marketplace_submitted = [
-        listing for listing in marketplace_listings if listing.status == MARKETPLACE_STATUS_SUBMITTED
-    ]
-    marketplace_completed = [
-        listing for listing in marketplace_listings if listing.status == MARKETPLACE_STATUS_COMPLETED
-    ]
-    marketplace_cancelled = [
-        listing for listing in marketplace_listings if listing.status == MARKETPLACE_STATUS_CANCELLED
-    ]
-    marketplace_rejected = [
-        listing for listing in marketplace_listings if listing.status == MARKETPLACE_STATUS_REJECTED
-    ]
-    escrow_total_c = sum(
-        listing.offer_cents
-        for listing in marketplace_listings
-        if listing.status
-        in {
-            MARKETPLACE_STATUS_OPEN,
-            MARKETPLACE_STATUS_CLAIMED,
-            MARKETPLACE_STATUS_SUBMITTED,
-        }
-    )
-    payout_total_c = sum(
-        (listing.final_payout_cents or (listing.offer_cents + listing.chore_award_cents))
-        for listing in marketplace_listings
-        if listing.status == MARKETPLACE_STATUS_COMPLETED
-    )
-    status_styles_market = {
-        MARKETPLACE_STATUS_OPEN: ("Open", "#dbeafe", "#1d4ed8"),
-        MARKETPLACE_STATUS_CLAIMED: ("Claimed", "#fef3c7", "#b45309"),
-        MARKETPLACE_STATUS_SUBMITTED: ("Submitted", "#e0e7ff", "#4338ca"),
-        MARKETPLACE_STATUS_COMPLETED: ("Completed", "#dcfce7", "#166534"),
-        MARKETPLACE_STATUS_CANCELLED: ("Cancelled", "#fee2e2", "#b91c1c"),
-        MARKETPLACE_STATUS_REJECTED: ("Rejected", "#fee2e2", "#b91c1c"),
-    }
-
-    def _format_market_ts(value: Optional[datetime]) -> str:
-        if not value:
-            return "—"
-        try:
-            return value.strftime("%Y-%m-%d %H:%M")
-        except Exception:
-            return str(value)
-
     def _market_status_badge(listing: MarketplaceListing) -> str:
         label, bg, fg = status_styles_market.get(
             listing.status, (listing.status.title(), "#e2e8f0", "#334155")
