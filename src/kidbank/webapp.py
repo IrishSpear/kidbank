@@ -6123,7 +6123,15 @@ def kid_invest_home(
         <p class='muted' style='margin-top:10px;'><a href='/kid'>← Back to My Account</a></p>
         {chart_modal_html}
         """
-        return render_page(request, f"Investing — {instrument_label}", inner)
+        invest_styles = "<style>body[data-page='kid-invest']{overflow:hidden;}</style>"
+        body_attrs = f"{body_pref_attrs(request)} data-page='kid-invest'"
+        html = frame(
+            f"Investing — {instrument_label}",
+            inner,
+            head_extra=invest_styles,
+            body_attrs=body_attrs,
+        )
+        return HTMLResponse(html)
     except Exception:
         body = """
         <div class='card'>
