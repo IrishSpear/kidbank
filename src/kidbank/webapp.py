@@ -262,10 +262,13 @@ class ChoreInstance(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     chore_id: int
     period_key: str  # daily: YYYY-MM-DD; weekly: <SundayISO>-WEEK; special: SPECIAL
-    status: str = "available"  # available|pending|paid
+    status: str = "available"  # available|pending|pending_marketplace|paid
     completed_at: Optional[datetime] = None
     paid_event_id: Optional[int] = None
     created_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+CHORE_STATUS_PENDING_MARKETPLACE = "pending_marketplace"
 
 
 MARKETPLACE_STATUS_OPEN = "open"
@@ -1646,7 +1649,14 @@ def list_chore_instances_for_kid(
             elif chore_type == "monthly":
                 current = next((i for i in insts if i.period_key == pk_monthly), None)
             else:
-                current = next((i for i in insts if i.status in {"available", "pending"}), None)
+                current = next(
+                    (
+                        i
+                        for i in insts
+                        if i.status in {"available", "pending", CHORE_STATUS_PENDING_MARKETPLACE}
+                    ),
+                    None,
+                )
             output.append((chore, current))
         return output
 
@@ -3558,6 +3568,7 @@ def kid_home(
         status_lookup: Dict[str, Tuple[str, str]] = {
             "available": ("available", "Not started"),
             "pending": ("pending", "Awaiting review"),
+            CHORE_STATUS_PENDING_MARKETPLACE: ("pending", "Awaiting review"),
             "paid": ("paid", "Completed"),
         }
         chore_tiles: List[str] = []
@@ -3570,7 +3581,7 @@ def kid_home(
                     f"<input type='hidden' name='chore_id' value='{chore.id}'>"
                     "<button type='submit'>Mark complete</button></form>"
                 )
-            elif is_selected_today and status == "pending":
+            elif is_selected_today and status in {"pending", CHORE_STATUS_PENDING_MARKETPLACE}:
                 action_html = "<span class='pill status-pending'>Awaiting review</span>"
             elif is_selected_today and status == "paid":
                 action_html = "<span class='pill status-paid'>Completed</span>"
@@ -4073,7 +4084,11 @@ def kid_home(
         available_chore_count = sum(
             1 for _, inst in chores_today if not inst or inst.status == "available"
         )
-        pending_chore_count = sum(1 for _, inst in chores_today if inst and inst.status == "pending")
+        pending_chore_count = sum(
+            1
+            for _, inst in chores_today
+            if inst and inst.status in {"pending", CHORE_STATUS_PENDING_MARKETPLACE}
+        )
         open_global_count = sum(
             1 for info in global_infos if info["total_claims"] < info["chore"].max_claimants
         )
@@ -5216,7 +5231,7 @@ def kid_checkoff(request: Request, chore_id: int = Form(...)):
             session.add(inst)
             session.commit()
             set_kid_notice(request, f"Sent '{chore.name}' for approval!", "success")
-        elif inst.status == "pending":
+        elif inst.status in {"pending", CHORE_STATUS_PENDING_MARKETPLACE}:
             set_kid_notice(request, "That chore is already waiting for approval.", "error")
         else:
             set_kid_notice(request, "That chore has already been paid out.", "error")
@@ -5664,7 +5679,7 @@ def kid_marketplace_complete(request: Request, listing_id: int = Form(...)):
                     period_key=period_key,
                     status="available",
                 )
-            inst.status = "pending"
+            inst.status = CHORE_STATUS_PENDING_MARKETPLACE
             inst.completed_at = moment
             session.add(inst)
         session.add(listing)
