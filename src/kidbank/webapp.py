@@ -928,8 +928,9 @@ def kid_authed(request: Request) -> Optional[str]:
         child = session.exec(select(Child).where(Child.kid_id == remember_kid_id)).first()
         if not child:
             return None
-    request.session["kid_authed"] = remember_kid_id
-    request.state._kid_authed_cache = remember_kid_id  # type: ignore[attr-defined]
+        request.session["kid_authed"] = remember_kid_id
+        request.state._kid_authed_cache = remember_kid_id  # type: ignore[attr-defined]
+        _apply_persisted_ui_prefs(request, _ui_pref_key_for_kid(remember_kid_id), session)
     return remember_kid_id
 
 
@@ -966,6 +967,69 @@ def current_route_with_query(request: Request) -> str:
     return f"{request.url.path}?{query}" if query else request.url.path
 
 
+UI_FONT_CHOICES = {"default", "dyslexic"}
+UI_CONTRAST_CHOICES = {"standard", "high"}
+UI_PREF_META_PREFIX = "ui_pref:"
+
+
+def _normalize_font_pref(value: str) -> str:
+    cleaned = (value or "default").strip().lower()
+    return cleaned if cleaned in UI_FONT_CHOICES else "default"
+
+
+def _normalize_contrast_pref(value: str) -> str:
+    cleaned = (value or "standard").strip().lower()
+    return cleaned if cleaned in UI_CONTRAST_CHOICES else "standard"
+
+
+def _ui_pref_key_for_kid(kid_id: str) -> str:
+    cleaned = (kid_id or "").strip()
+    return f"{UI_PREF_META_PREFIX}kid:{cleaned}" if cleaned else ""
+
+
+def _ui_pref_key_for_admin(role: str) -> str:
+    normalized = (role or "").strip().lower()
+    return f"{UI_PREF_META_PREFIX}admin:{normalized}" if normalized else ""
+
+
+def _apply_ui_prefs_to_session(request: Request, font: str, contrast: str) -> None:
+    request.session["ui_font"] = _normalize_font_pref(font)
+    request.session["ui_contrast"] = _normalize_contrast_pref(contrast)
+
+
+def _load_persisted_ui_prefs(session: Session, key: str) -> Tuple[str, str]:
+    raw = MetaDAO.get(session, key)
+    if not raw:
+        return "default", "standard"
+    try:
+        data = json.loads(raw)
+    except Exception:
+        data = {}
+    font_pref = _normalize_font_pref(data.get("font") if isinstance(data, dict) else "default")
+    contrast_pref = _normalize_contrast_pref(data.get("contrast") if isinstance(data, dict) else "standard")
+    return font_pref, contrast_pref
+
+
+def _apply_persisted_ui_prefs(request: Request, scope_key: str, session: Session | None = None) -> None:
+    if not scope_key:
+        return
+    if session is None:
+        with Session(engine) as temp:
+            font_pref, contrast_pref = _load_persisted_ui_prefs(temp, scope_key)
+    else:
+        font_pref, contrast_pref = _load_persisted_ui_prefs(session, scope_key)
+    _apply_ui_prefs_to_session(request, font_pref, contrast_pref)
+
+
+def _persist_ui_preferences(scope_key: str, font: str, contrast: str) -> None:
+    if not scope_key:
+        return
+    payload = json.dumps({"font": _normalize_font_pref(font), "contrast": _normalize_contrast_pref(contrast)})
+    with Session(engine) as session:
+        MetaDAO.set(session, scope_key, payload)
+        session.commit()
+
+
 @app.post("/ui/preferences")
 def set_ui_preferences(
     request: Request,
@@ -973,10 +1037,17 @@ def set_ui_preferences(
     contrast: str = Form("standard"),
     redirect_to: str = Form("/"),
 ) -> RedirectResponse:
-    font_pref = font if font in {"default", "dyslexic"} else "default"
-    contrast_pref = contrast if contrast in {"standard", "high"} else "standard"
-    request.session["ui_font"] = font_pref
-    request.session["ui_contrast"] = contrast_pref
+    font_pref = _normalize_font_pref(font)
+    contrast_pref = _normalize_contrast_pref(contrast)
+    _apply_ui_prefs_to_session(request, font_pref, contrast_pref)
+    scope_key = ""
+    kid_session = request.session.get("kid_authed")
+    admin_session = request.session.get("admin_role") if not kid_session else None
+    if kid_session:
+        scope_key = _ui_pref_key_for_kid(str(kid_session))
+    elif admin_session:
+        scope_key = _ui_pref_key_for_admin(str(admin_session))
+    _persist_ui_preferences(scope_key, font_pref, contrast_pref)
     target = redirect_to if redirect_to.startswith("/") else "/"
     return RedirectResponse(target, status_code=302)
 
@@ -3344,7 +3415,9 @@ def kid_login(
         if not child or (child.kid_pin or "") != (kid_pin or ""):
             body = "<div class='card'><p style='color:#ff6b6b;'>Invalid kid_id or PIN.</p><p><a href='/'>Back</a></p></div>"
             return render_page(request, "Kid Login", body)
-    request.session["kid_authed"] = kid_id
+        request.session["kid_authed"] = kid_id
+        request.state._kid_authed_cache = kid_id  # type: ignore[attr-defined]
+        _apply_persisted_ui_prefs(request, _ui_pref_key_for_kid(kid_id), session)
     response = RedirectResponse("/kid", status_code=302)
     remember_flag = str(remember_me or "").strip().lower() in {"1", "true", "on", "yes"}
     if remember_flag:
@@ -5710,6 +5783,10 @@ def kid_marketplace_complete(request: Request, listing_id: int = Form(...)):
 @app.post("/kid/logout")
 def kid_logout(request: Request):
     request.session.pop("kid_authed", None)
+    request.session.pop("ui_font", None)
+    request.session.pop("ui_contrast", None)
+    if hasattr(request.state, "_kid_authed_cache"):
+        delattr(request.state, "_kid_authed_cache")
     response = RedirectResponse("/", status_code=302)
     response.delete_cookie(REMEMBER_COOKIE_NAME, path="/")
     return response
@@ -6766,10 +6843,11 @@ def admin_login_page(request: Request):
 def admin_login(request: Request, pin: str = Form(...)):
     with Session(engine) as session:
         role = resolve_admin_role(pin, session=session)
-    if not role:
-        body = "<div class='card'><p style='color:#ff6b6b;'>Incorrect PIN.</p><p><a href='/admin/login'>Try again</a></p></div>"
-        return render_page(request, "Parent Login", body)
-    request.session["admin_role"] = role
+        if not role:
+            body = "<div class='card'><p style='color:#ff6b6b;'>Incorrect PIN.</p><p><a href='/admin/login'>Try again</a></p></div>"
+            return render_page(request, "Parent Login", body)
+        request.session["admin_role"] = role
+        _apply_persisted_ui_prefs(request, _ui_pref_key_for_admin(role), session)
     return RedirectResponse("/admin", status_code=302)
 
 
