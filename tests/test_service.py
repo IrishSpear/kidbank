@@ -437,3 +437,34 @@ def test_missed_chore_penalty_handles_time_jump() -> None:
     account = bank.get_account("Ava")
     assert account.balance == Decimal("3.00")
 
+
+def test_missed_chore_penalty_respects_time_settings() -> None:
+    current_time = [datetime(2024, 1, 1, 8, 0)]
+
+    def provider() -> datetime:
+        return current_time[0]
+
+    bank = KidBank(time_provider=provider)
+    bank.create_account("Ava", starting_balance=Decimal("5.00"))
+    chore = bank.schedule_chore(
+        "Ava",
+        name="Tidy",
+        value=Decimal("1.00"),
+        penalty_on_miss=True,
+    )
+
+    chore.created_at = current_time[0] - timedelta(hours=1)
+
+    bank.auto_republish_chores()
+    account = bank.get_account("Ava")
+    assert account.balance == Decimal("5.00")
+
+    current_time[0] = datetime(2024, 1, 2, 8, 0)
+    bank.auto_republish_chores()
+
+    account = bank.get_account("Ava")
+    assert account.balance == Decimal("4.00")
+    penalty_tx = account.transactions[-1]
+    assert penalty_tx.description == "Missed chore penalty: Tidy"
+    assert penalty_tx.amount == Decimal("1.00")
+
