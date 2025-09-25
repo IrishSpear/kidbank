@@ -5645,6 +5645,10 @@ def kid_marketplace_complete(request: Request, listing_id: int = Form(...)):
             set_kid_notice(request, "Could not process that completion right now.", "error")
             return RedirectResponse("/kid?section=marketplace", status_code=302)
         award_cents = listing.chore_award_cents or (chore.award_cents if chore else 0)
+        if award_cents < 0:
+            award_cents = 0
+        if listing.chore_award_cents != award_cents:
+            listing.chore_award_cents = award_cents
         moment = datetime.utcnow()
         listing.status = MARKETPLACE_STATUS_SUBMITTED
         listing.submitted_at = moment
@@ -10138,11 +10142,15 @@ def admin_marketplace_payout(
             set_admin_notice(request, "Could not locate kids for that marketplace payout.", "error")
             return RedirectResponse(redirect_target, status_code=302)
         award_cents = listing.chore_award_cents or (chore.award_cents if chore else 0)
+        if award_cents < 0:
+            award_cents = 0
+        if listing.chore_award_cents != award_cents:
+            listing.chore_award_cents = award_cents
         default_total_c = listing.offer_cents + award_cents
         raw_amount = (amount or "").strip()
         if raw_amount:
             override_c = to_cents_from_dollars_str(raw_amount, default_total_c)
-            final_total_c = max(0, override_c)
+            final_total_c = default_total_c if override_c <= 0 else override_c
         else:
             final_total_c = default_total_c
         offer_component_c = max(final_total_c - award_cents, 0)

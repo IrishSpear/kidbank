@@ -63,6 +63,7 @@ def clean_database() -> None:
             Investment,
             KidMarketInstrument,
             GlobalChoreClaim,
+            MarketplaceListing,
             ChoreInstance,
             Chore,
             Certificate,
@@ -247,6 +248,136 @@ def test_marketplace_completion_skips_standard_pending_entry() -> None:
             .where(Chore.kid_id == Child.kid_id)
         ).all()
     assert not standard_pending
+
+
+def test_marketplace_payout_includes_award_and_offer() -> None:
+    owner_client = TestClient(app)
+    worker_client = TestClient(app)
+    admin_client = TestClient(app)
+    with Session(engine) as session:
+        owner = Child(kid_id="owner", name="Owner", balance_cents=5_000, kid_pin="1111")
+        worker = Child(kid_id="worker", name="Worker", balance_cents=0, kid_pin="2222")
+        chore = Chore(kid_id=owner.kid_id, name="Yardwork", type="special", award_cents=1_500)
+        session.add_all([owner, worker, chore])
+        session.commit()
+        session.refresh(chore)
+        chore_id = chore.id
+    login_owner = owner_client.post(
+        "/kid/login", data={"kid_id": "owner", "kid_pin": "1111"}, follow_redirects=False
+    )
+    assert login_owner.status_code == 302
+    listed = owner_client.post(
+        "/kid/marketplace/list",
+        data={"chore_id": chore_id, "offer": "5.50"},
+        follow_redirects=False,
+    )
+    assert listed.status_code == 302
+    with Session(engine) as session:
+        listing = session.exec(
+            select(MarketplaceListing)
+            .where(MarketplaceListing.chore_id == chore_id)
+            .where(MarketplaceListing.owner_kid_id == "owner")
+        ).first()
+        assert listing is not None and listing.id is not None
+        listing_id = listing.id
+    login_worker = worker_client.post(
+        "/kid/login", data={"kid_id": "worker", "kid_pin": "2222"}, follow_redirects=False
+    )
+    assert login_worker.status_code == 302
+    claim = worker_client.post(
+        "/kid/marketplace/claim", data={"listing_id": listing_id}, follow_redirects=False
+    )
+    assert claim.status_code == 302
+    complete = worker_client.post(
+        "/kid/marketplace/complete", data={"listing_id": listing_id}, follow_redirects=False
+    )
+    assert complete.status_code == 302
+    admin_login = admin_client.post(
+        "/admin/login", data={"pin": DAD_PIN}, follow_redirects=False
+    )
+    assert admin_login.status_code == 302
+    payout = admin_client.post(
+        "/admin/marketplace/payout",
+        data={"listing_id": listing_id, "redirect": "/admin?section=payouts"},
+        follow_redirects=False,
+    )
+    assert payout.status_code == 302
+    with Session(engine) as session:
+        owner = session.exec(select(Child).where(Child.kid_id == "owner")).first()
+        worker = session.exec(select(Child).where(Child.kid_id == "worker")).first()
+        listing = session.get(MarketplaceListing, listing_id)
+        events = session.exec(select(Event).where(Event.child_id == "worker")).all()
+    assert owner is not None and owner.balance_cents == 5_000 - 550
+    assert worker is not None and worker.balance_cents == 1_500 + 550
+    assert listing is not None and listing.final_payout_cents == 1_500 + 550
+    assert any(evt.change_cents == 1_500 + 550 for evt in events)
+
+
+def test_marketplace_payout_zero_override_defaults_to_total() -> None:
+    owner_client = TestClient(app)
+    worker_client = TestClient(app)
+    admin_client = TestClient(app)
+    with Session(engine) as session:
+        owner = Child(kid_id="owner", name="Owner", balance_cents=10_000, kid_pin="1111")
+        worker = Child(kid_id="helper", name="Helper", balance_cents=0, kid_pin="3333")
+        chore = Chore(kid_id=owner.kid_id, name="Garage", type="special", award_cents=2_000)
+        session.add_all([owner, worker, chore])
+        session.commit()
+        session.refresh(chore)
+        chore_id = chore.id
+    login_owner = owner_client.post(
+        "/kid/login", data={"kid_id": "owner", "kid_pin": "1111"}, follow_redirects=False
+    )
+    assert login_owner.status_code == 302
+    listed = owner_client.post(
+        "/kid/marketplace/list",
+        data={"chore_id": chore_id, "offer": "3.25"},
+        follow_redirects=False,
+    )
+    assert listed.status_code == 302
+    with Session(engine) as session:
+        listing = session.exec(
+            select(MarketplaceListing)
+            .where(MarketplaceListing.chore_id == chore_id)
+            .where(MarketplaceListing.owner_kid_id == "owner")
+        ).first()
+        assert listing is not None and listing.id is not None
+        listing_id = listing.id
+    login_worker = worker_client.post(
+        "/kid/login", data={"kid_id": "helper", "kid_pin": "3333"}, follow_redirects=False
+    )
+    assert login_worker.status_code == 302
+    claim = worker_client.post(
+        "/kid/marketplace/claim", data={"listing_id": listing_id}, follow_redirects=False
+    )
+    assert claim.status_code == 302
+    complete = worker_client.post(
+        "/kid/marketplace/complete", data={"listing_id": listing_id}, follow_redirects=False
+    )
+    assert complete.status_code == 302
+    admin_login = admin_client.post(
+        "/admin/login", data={"pin": DAD_PIN}, follow_redirects=False
+    )
+    assert admin_login.status_code == 302
+    payout = admin_client.post(
+        "/admin/marketplace/payout",
+        data={
+            "listing_id": listing_id,
+            "amount": "0",
+            "redirect": "/admin?section=payouts",
+        },
+        follow_redirects=False,
+    )
+    assert payout.status_code == 302
+    with Session(engine) as session:
+        owner = session.exec(select(Child).where(Child.kid_id == "owner")).first()
+        worker = session.exec(select(Child).where(Child.kid_id == "helper")).first()
+        listing = session.get(MarketplaceListing, listing_id)
+        events = session.exec(select(Event).where(Event.child_id == "helper")).all()
+    assert owner is not None and owner.balance_cents == 10_000 - 325
+    assert worker is not None and worker.balance_cents == 2_000 + 325
+    assert listing is not None and listing.final_payout_cents == 2_000 + 325
+    assert any(evt.change_cents == 2_000 + 325 for evt in events)
 
 
 def test_remember_me_cookie_prefills_username() -> None:
