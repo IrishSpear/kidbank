@@ -1278,7 +1278,7 @@ def base_styles() -> str:
       .help-icon:hover{filter:brightness(1.12);}
       .ui-pref-group{display:flex; gap:6px; align-items:center; flex-wrap:wrap;}
       .ui-pref-form{display:inline;}
-      .ui-pref-form button{padding:6px 10px; min-height:36px;}
+      .ui-pref-form button{padding:3px 10px; min-height:18px;}
       .ui-pref-form button[aria-pressed='true']{background:var(--accent); color:#fff;}
       .analytics-grid{display:grid; grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); gap:16px; margin-top:16px;}
       .trend-bars{display:flex; align-items:flex-end; gap:6px; height:120px; margin-top:12px;}
