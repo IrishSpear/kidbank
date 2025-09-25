@@ -1063,8 +1063,8 @@ def base_styles() -> str:
         font-family: system-ui,-apple-system,Segoe UI,Roboto,Arial;
         background:var(--bg); color:var(--text);
         max-width:1320px;
-        margin:24px auto;
-        padding:0 16px;
+        margin:0 auto;
+        padding:24px 16px;
       }
       .layout{display:grid; grid-template-columns:220px 1fr; gap:16px; align-items:flex-start;}
       .layout .content{min-width:0;}
@@ -1212,6 +1212,7 @@ def base_styles() -> str:
       .chart-toggle a{padding:6px 10px; border-radius:999px; text-decoration:none; background:rgba(148,163,184,0.16); color:var(--text); font-size:13px;}
       .chart-toggle a.active{background:var(--accent); color:#fff;}
       .investing-grid{grid-template-columns:repeat(auto-fit,minmax(260px,1fr)); gap:12px;}
+      .investing-grid > *{min-width:0;}
       .chart-popout{display:block; margin-top:12px; border-radius:14px; padding:12px; background:transparent; box-shadow:none; transition:transform .18s ease;}
       .chart-popout:hover,.chart-popout:focus{transform:scale(1.01);}
       .chart-popout svg{width:100%; height:auto; display:block;}
@@ -3080,8 +3081,12 @@ def compute_holdings_metrics(kid_id: str, symbol: str) -> dict:
 
 def sparkline_svg_from_history(hist: Iterable[dict], width: int = 320, height: int = 64, pad: int = 6) -> str:
     prices = [point.get("p") for point in hist if isinstance(point.get("p"), int)]
+    svg_attrs = (
+        f"class='chart chart--sparkline' viewBox='0 0 {width} {height}' "
+        "preserveAspectRatio='xMidYMid meet' style='width:100%;height:auto;'"
+    )
     if len(prices) < 2:
-        return f"<svg width='{width}' height='{height}'></svg>"
+        return f"<svg {svg_attrs}></svg>"
     pmin, pmax = min(prices), max(prices)
     rng = max(1, pmax - pmin)
     xs: List[float] = []
@@ -3095,8 +3100,7 @@ def sparkline_svg_from_history(hist: Iterable[dict], width: int = 320, height: i
     )
     color = "#16a34a" if prices[-1] >= prices[0] else "#dc2626"
     return (
-        f"<svg width='{width}' height='{height}' viewBox='0 0 {width} {height}' "
-        f"xmlns='http://www.w3.org/2000/svg' role='img' aria-label='7-day price sparkline'>"
+        f"<svg {svg_attrs} xmlns='http://www.w3.org/2000/svg' role='img' aria-label='7-day price sparkline'>"
         f"<path d='{path}' fill='none' stroke='{color}' stroke-width='2'/></svg>"
     )
 
@@ -3105,6 +3109,10 @@ def detailed_history_chart_svg(
     hist: Iterable[dict], *, width: int = 640, height: int = 240
 ) -> str:
     points: List[Tuple[datetime, int]] = []
+    base_attrs = (
+        f"class='chart chart--detail' viewBox='0 0 {width} {height}' "
+        "preserveAspectRatio='xMidYMid meet' style='width:100%;height:auto;'"
+    )
     for entry in hist:
         price_raw = entry.get("p")
         timestamp_raw = entry.get("t")
@@ -3124,9 +3132,7 @@ def detailed_history_chart_svg(
             continue
         points.append((moment, price_c))
     if len(points) < 2:
-        return (
-            f"<svg class='chart chart--detail' width='{width}' height='{height}'></svg>"
-        )
+        return f"<svg {base_attrs}></svg>"
     points.sort(key=lambda item: item[0])
     pad_left = 60.0
     pad_right = 16.0
@@ -3135,9 +3141,7 @@ def detailed_history_chart_svg(
     inner_width = width - pad_left - pad_right
     inner_height = height - pad_top - pad_bottom
     if inner_width <= 0 or inner_height <= 0:
-        return (
-            f"<svg class='chart chart--detail' width='{width}' height='{height}'></svg>"
-        )
+        return f"<svg {base_attrs}></svg>"
     start_time = points[0][0]
     offsets = [(point[0] - start_time).total_seconds() for point in points]
     span = offsets[-1]
@@ -3204,8 +3208,7 @@ def detailed_history_chart_svg(
             + "</text>"
         )
     return (
-        f"<svg class='chart chart--detail' width='{width}' height='{height}' "
-        f"viewBox='0 0 {width} {height}' xmlns='http://www.w3.org/2000/svg' "
+        f"<svg {base_attrs} xmlns='http://www.w3.org/2000/svg' "
         f"role='img' aria-label='Price history detailed chart'>"
         f"<rect x='{pad_left:.2f}' y='{pad_top:.2f}' width='{inner_width:.2f}' "
         f"height='{inner_height:.2f}' fill='none' stroke='rgba(148,163,184,0.18)' stroke-width='1'/>"
