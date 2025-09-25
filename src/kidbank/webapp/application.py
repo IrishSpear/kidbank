@@ -80,6 +80,116 @@ def now_local() -> datetime:
     return _time_provider()
 
 
+def _penalty_event_reason(chore_id: int, target_day: date) -> str:
+    return f"chore_penalty_missed:{chore_id}:{target_day.isoformat()}"
+
+
+def _chore_due_on_day(chore: Chore, day: date) -> bool:
+    if not chore.active:
+        return False
+    created_day = (chore.created_at or datetime.utcnow()).date()
+    if day < created_day:
+        return False
+    return is_chore_in_window(chore, day)
+
+
+def _chore_submission_before_deadline(
+    session: Session,
+    chore: Chore,
+    day: date,
+    deadline: datetime,
+) -> bool:
+    chore_type = normalize_chore_type(chore.type)
+    if chore_type == "special" or chore.id is None:
+        return False
+    period_moment = datetime.combine(day, datetime.min.time())
+    period_key = period_key_for(chore_type, period_moment)
+    query = select(ChoreInstance).where(ChoreInstance.chore_id == chore.id)
+    query = query.where(ChoreInstance.period_key == period_key)
+    instance = session.exec(query.order_by(desc(ChoreInstance.id))).first()
+    if not instance:
+        return False
+    if instance.status not in {"pending", "paid"}:
+        return False
+    if instance.completed_at and instance.completed_at > deadline:
+        return False
+    return True
+
+
+def apply_chore_penalties(moment: Optional[datetime] = None) -> None:
+    """Assess missed-chore penalties for all chores with an active penalty."""
+
+    evaluation_time = moment or now_local()
+    evaluation_day = evaluation_time.date() - timedelta(days=1)
+    with Session(engine) as session:
+        chores = session.exec(
+            select(Chore).where(Chore.penalty_cents > 0, Chore.active == True)
+        ).all()  # noqa: E712
+        if not chores:
+            return
+        child_cache: Dict[str, Child] = {}
+        for chore in chores:
+            if chore.kid_id == GLOBAL_CHORE_KID_ID:
+                continue
+            child = child_cache.get(chore.kid_id)
+            if child is None:
+                child = session.exec(
+                    select(Child).where(Child.kid_id == chore.kid_id)
+                ).first()
+                if child is None:
+                    continue
+                child_cache[chore.kid_id] = child
+            created_day = (chore.created_at or datetime.utcnow()).date()
+            first_day = max(
+                created_day,
+                chore.start_date or created_day,
+            )
+            if evaluation_day < first_day:
+                continue
+            anchor = first_day - timedelta(days=1)
+            last_processed = chore.penalty_last_date or anchor
+            if last_processed < anchor:
+                last_processed = anchor
+            current_day = last_processed + timedelta(days=1)
+            while current_day <= evaluation_day:
+                if chore.end_date and current_day > chore.end_date:
+                    break
+                if not _chore_due_on_day(chore, current_day):
+                    current_day += timedelta(days=1)
+                    continue
+                reason = _penalty_event_reason(chore.id or 0, current_day)
+                already_logged = session.exec(
+                    select(Event)
+                    .where(Event.child_id == chore.kid_id)
+                    .where(Event.reason == reason)
+                ).first()
+                if already_logged:
+                    current_day += timedelta(days=1)
+                    continue
+                deadline = datetime.combine(
+                    current_day + timedelta(days=1), datetime.min.time()
+                )
+                if not _chore_submission_before_deadline(
+                    session, chore, current_day, deadline
+                ):
+                    deduction = min(chore.penalty_cents, child.balance_cents)
+                    if deduction > 0:
+                        child.balance_cents -= deduction
+                        child.updated_at = datetime.utcnow()
+                        session.add(
+                            Event(
+                                child_id=child.kid_id,
+                                change_cents=-deduction,
+                                reason=reason,
+                            )
+                        )
+                        session.add(child)
+                current_day += timedelta(days=1)
+            chore.penalty_last_date = evaluation_day
+            session.add(chore)
+        session.commit()
+
+
 
 # ---------------------------------------------------------------------------
 # Money helpers
@@ -6250,6 +6360,7 @@ def admin_home(
     if (redirect := require_admin(request)) is not None:
         return redirect
     run_weekly_allowance_if_needed()
+    apply_chore_penalties()
     role = admin_role(request)
     selected_section = (section or "overview").strip().lower()
     selected_child = (child or "").strip()
@@ -10009,5 +10120,6 @@ __all__ = [
     "filter_events",
     "ensure_default_learning_content",
     "load_admin_privileges",
+    "apply_chore_penalties",
 ]
 __all__.extend(name for name in _persistence.__all__ if name not in __all__)
