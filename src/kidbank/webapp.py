@@ -1272,7 +1272,7 @@ def base_styles() -> str:
       body.touch-friendly select,
       body.touch-friendly textarea{min-height:48px;}
       body.font-dyslexic{font-family:'OpenDyslexic','Comic Sans MS','Trebuchet MS',Verdana,sans-serif; letter-spacing:0.03em;}
-      body.theme-high-contrast{--bg:#000814; --card:#001d3d; --muted:#e2e8f0; --accent:#FFB302; --text:#f8fafc; --good:#4ade80; --bad:#f87171;}
+      body.theme-high-contrast{--bg:#000814; --card:#001d3d; --muted:#e2e8f0; --accent:#FFC857; --text:#f8fafc; --good:#4ade80; --bad:#f87171;}
       body.theme-high-contrast .card{box-shadow:none; border:2px solid rgba(248,250,252,0.18);}
       .help-icon{display:inline-flex; align-items:center; justify-content:center; width:22px; height:22px; border-radius:999px; background:rgba(148,163,184,0.24); color:var(--text); font-size:12px; text-decoration:none; margin-left:6px;}
       .help-icon:hover{filter:brightness(1.12);}
@@ -4609,6 +4609,14 @@ def kid_home(
           </div>
         """
         money_content = (notifications_html if notifications_html else "") + money_card
+        pref_controls = preference_controls_html(request)
+        settings_content = (
+            "<div class='card'>"
+            "<h3>Display settings</h3>"
+            "<p class='muted'>Pick the font and contrast that feel best for this kiosk.</p>"
+            f"{pref_controls}"
+            "</div>"
+        )
         sections: List[Tuple[str, str, str]] = [
             ("overview", "Overview", overview_content),
             ("chores", "My Chores", chores_content),
@@ -4619,6 +4627,7 @@ def kid_home(
             ("money", "Send/Request", money_content),
             ("investing", "Investing", investing_card),
             ("activity", "Activity", activity_content),
+            ("settings", "Settings", settings_content),
         ]
         sections_map = {key: {"label": label, "content": content} for key, label, content in sections}
         if selected_section not in sections_map:
@@ -4633,7 +4642,6 @@ def kid_home(
             requests_badge = (
                 f"<span class='pill' style='background:#f59e0b; color:#78350f;'>Requests: {incoming_count}</span>"
             )
-        pref_controls = preference_controls_html(request)
         topbar = (
             "<div class='topbar'><h3>Kid Kiosk</h3><div style='display:flex; flex-direction:column; gap:6px; align-items:flex-end;'>"
             "<div style='display:flex; gap:8px; align-items:center; flex-wrap:wrap;'>"
@@ -4641,7 +4649,6 @@ def kid_home(
             + requests_badge
             + "<form method='post' action='/kid/logout' style='display:inline-block;'><button type='submit' class='pill'>Logout</button></form>"
             + "</div>"
-            + pref_controls
             + "</div></div>"
         )
         inner = (
@@ -8349,6 +8356,14 @@ def admin_home(
         "</form>"
         "</div>"
     )
+    admin_pref_controls = preference_controls_html(request)
+    settings_card = (
+        "<div class='card'>"
+        "<h3>Display settings</h3>"
+        "<p class='muted'>Adjust the font and contrast used in the admin portal.</p>"
+        f"{admin_pref_controls}"
+        "</div>"
+    )
     sections: List[Tuple[str, str, str, str]] = [
         ("overview", "Command center", overview_content, ""),
         ("goals", "Goals needing action", goals_card, ""),
@@ -8363,6 +8378,7 @@ def admin_home(
         ("rules", "Allowance rules", rules_card, ""),
         ("time", "Time controls", time_card, ""),
         ("admins", "Parent admins", parent_admins_card, ""),
+        ("settings", "Settings", settings_card, ""),
     ]
     sections_map = {key: {"label": label, "content": content, "extra": extra} for key, label, content, extra in sections}
     if selected_section not in sections_map:
@@ -8377,14 +8393,12 @@ def admin_home(
     if notice_html:
         selected_content = notice_html + selected_content
     extra_html = sections_map[selected_section].get("extra", "")
-    admin_pref_controls = preference_controls_html(request)
     inner = (
         "<div class='topbar'><h3>Admin Portal</h3><div style='display:flex; flex-direction:column; gap:6px; align-items:flex-end;'>"
         + "<div>"
         + _role_badge(role)
         + "<form method='post' action='/admin/logout' style='display:inline-block; margin-left:8px;'><button type='submit' class='pill'>Logout</button></form>"
         + "</div>"
-        + admin_pref_controls
         + "</div></div>"
         + "<div class='layout'><nav class='sidebar'>"
         + sidebar_links
