@@ -74,7 +74,7 @@ stock-investing simulator described in the feature list.
 1. Install the optional web dependencies:
 
    ```bash
-   pip install fastapi uvicorn sqlmodel python-dotenv
+   pip install -r requirements-web.txt
    ```
 
 2. (Optional) create a `.env` file with custom PINs and session secret:

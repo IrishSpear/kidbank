@@ -1,0 +1,7 @@
+fastapi>=0.100
+uvicorn>=0.22
+sqlmodel>=0.0.8
+python-dotenv>=1.0
+itsdangerous>=2.1
+httpx>=0.24
+python-multipart>=0.0.6
