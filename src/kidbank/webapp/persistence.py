@@ -88,6 +88,7 @@ class Chore(SQLModel, table=True):
     name: str
     type: str  # daily|weekly|special|global
     award_cents: int
+    penalty_cents: int = 0
     notes: Optional[str] = None
     active: bool = True
     start_date: Optional[date] = None
@@ -342,6 +343,8 @@ def run_migrations() -> None:
             raw.execute("ALTER TABLE chore ADD COLUMN weekdays TEXT;")
         if not _column_exists(raw, "chore", "specific_dates"):
             raw.execute("ALTER TABLE chore ADD COLUMN specific_dates TEXT;")
+        if not _column_exists(raw, "chore", "penalty_cents"):
+            raw.execute("ALTER TABLE chore ADD COLUMN penalty_cents INTEGER DEFAULT 0;")
         if not _column_exists(raw, "certificate", "term_days"):
             raw.execute("ALTER TABLE certificate ADD COLUMN term_days INTEGER DEFAULT 0;")
             raw.execute(

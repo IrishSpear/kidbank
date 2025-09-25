@@ -7788,6 +7788,7 @@ def admin_home(
         "<div class='grid' style='grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:8px;'>"
         "<div><label>Type</label><select name='type'><option value='daily'>Daily</option><option value='weekly'>Weekly</option><option value='monthly'>Monthly</option><option value='special'>Special</option></select></div>"
         "<div><label>Award (dollars)</label><input name='award' type='text' data-money value='0.50'></div>"
+        "<div><label>Penalty if missed</label><div style='display:flex; align-items:center; gap:6px; margin-top:4px;'><label style='display:flex; align-items:center; gap:4px; font-weight:400;'><input type='checkbox' name='penalty_enabled' value='1'> Apply</label><input name='penalty_amount' type='text' data-money value='0.00' placeholder='penalty $'></div></div>"
         "<div><label>Max claimants (global)</label><input name='max_claimants' type='number' min='1' value='1'></div>"
         "</div>"
         "<div class='grid' style='grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:8px;'>"
@@ -8013,6 +8014,9 @@ def admin_manage_chores(request: Request, kid_id: str = Query(...)):
             f"<option value='{opt}' {'selected' if chore_type == opt else ''}>{opt}</option>"
             for opt in type_options
         )
+        penalty_cents = getattr(chore, "penalty_cents", 0) or 0
+        penalty_checked = " checked" if penalty_cents > 0 else ""
+        penalty_value = dollars_value(penalty_cents)
         action_items = [f"<button type='submit' form='{form_id}'>Save</button>"]
         if not is_global_chore:
             action_items.append(
@@ -8041,6 +8045,7 @@ def admin_manage_chores(request: Request, kid_id: str = Query(...)):
             f"<input name='name' value='{name_value}' form='{form_id}'></td>"
             f"<td data-label='Type'><select name='type' form='{form_id}'>{type_select}</select></td>"
             f"<td data-label='Award ($)' class='right'><input name='award' type='text' data-money value='{dollars_value(chore.award_cents)}' form='{form_id}' class='chore-field--compact'></td>"
+            f"<td data-label='Penalty ($)' class='right'><div style='display:flex; align-items:center; justify-content:flex-end; gap:6px;'><label style='display:flex; align-items:center; gap:4px; font-weight:400;'><input type='checkbox' name='penalty_enabled' value='1'{penalty_checked} form='{form_id}'> Apply</label><input name='penalty_amount' type='text' data-money value='{penalty_value}' form='{form_id}' class='chore-field--compact'></div></td>"
             f"<td data-label='Max Spots'><input name='max_claimants' type='number' min='1' value='{max(1, chore.max_claimants)}' form='{form_id}' class='chore-field--compact'></td>"
             f"<td data-label='Schedule'>{schedule_html}</td>"
             f"<td data-label='Notes'><input name='notes' value='{notes_value}' form='{form_id}'></td>"
@@ -8048,7 +8053,7 @@ def admin_manage_chores(request: Request, kid_id: str = Query(...)):
             f"<td data-label='Actions' class='right'>{action_html}</td>"
             "</tr>"
         )
-    rows = "".join(rows_parts) or "<tr><td colspan='8' class='muted'>(no chores yet)</td></tr>"
+    rows = "".join(rows_parts) or "<tr><td colspan='9' class='muted'>(no chores yet)</td></tr>"
     if is_global:
         heading = "Manage Global Chores"
         badge = f"<span class='pill' style='margin-left:8px;'>{GLOBAL_CHORE_KID_ID}</span>"
@@ -8060,7 +8065,7 @@ def admin_manage_chores(request: Request, kid_id: str = Query(...)):
     chores_table = f"""
     <div class='card'>
       <table class='chore-table'>
-        <tr><th>Name</th><th>Type</th><th>Award ($)</th><th>Max Spots</th><th>Schedule</th><th>Notes</th><th>Status</th><th>Actions</th></tr>
+        <tr><th>Name</th><th>Type</th><th>Award ($)</th><th>Penalty ($)</th><th>Max Spots</th><th>Schedule</th><th>Notes</th><th>Status</th><th>Actions</th></tr>
         {rows}
       </table>
       {note_html}
@@ -8161,6 +8166,8 @@ def admin_chore_create(
     name: str = Form(...),
     type: str = Form(...),
     award: str = Form(...),
+    penalty_enabled: Optional[str] = Form(None),
+    penalty_amount: str = Form("0.00"),
     max_claimants: str = Form("1"),
     start_date: Optional[str] = Form(None),
     end_date: Optional[str] = Form(None),
@@ -8175,6 +8182,9 @@ def admin_chore_create(
     ) is not None:
         return redirect
     award_c = to_cents_from_dollars_str(award, 0)
+    penalty_c = to_cents_from_dollars_str(penalty_amount, 0)
+    if not penalty_enabled or penalty_c <= 0:
+        penalty_c = 0
     try:
         max_claims_value = int((max_claimants or "1").strip())
     except ValueError:
@@ -8202,6 +8212,7 @@ def admin_chore_create(
             name=name.strip(),
             type=normalized_type,
             award_cents=award_c,
+            penalty_cents=penalty_c,
             notes=notes.strip() or None,
             start_date=date.fromisoformat(start_date) if start_date else None,
             end_date=date.fromisoformat(end_date) if end_date else None,
@@ -8226,6 +8237,8 @@ def admin_chore_update(
     name: str = Form(...),
     type: str = Form(...),
     award: str = Form(...),
+    penalty_enabled: Optional[str] = Form(None),
+    penalty_amount: str = Form("0.00"),
     max_claimants: str = Form("1"),
     start_date: Optional[str] = Form(None),
     end_date: Optional[str] = Form(None),
@@ -8240,6 +8253,9 @@ def admin_chore_update(
     ) is not None:
         return redirect
     award_c = to_cents_from_dollars_str(award, 0)
+    penalty_c = to_cents_from_dollars_str(penalty_amount, 0)
+    if not penalty_enabled or penalty_c <= 0:
+        penalty_c = 0
     try:
         max_claims_value = int((max_claimants or "1").strip())
     except ValueError:
@@ -8263,6 +8279,7 @@ def admin_chore_update(
         chore.name = name.strip()
         chore.type = normalized_type
         chore.award_cents = award_c
+        chore.penalty_cents = penalty_c
         chore.notes = notes.strip() or None
         chore.start_date = date.fromisoformat(start_date) if start_date else None
         chore.end_date = date.fromisoformat(end_date) if end_date else None
