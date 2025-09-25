@@ -1212,8 +1212,8 @@ def base_styles() -> str:
       .chart-toggle a{padding:6px 10px; border-radius:999px; text-decoration:none; background:rgba(148,163,184,0.16); color:var(--text); font-size:13px;}
       .chart-toggle a.active{background:var(--accent); color:#fff;}
       .investing-grid{grid-template-columns:repeat(auto-fit,minmax(260px,1fr)); gap:12px;}
-      .chart-popout{display:block; margin-top:12px; border-radius:14px; background:rgba(148,163,184,0.08); padding:12px; box-shadow:inset 0 0 0 1px rgba(148,163,184,0.12); transition:transform .18s ease, box-shadow .18s ease;}
-      .chart-popout:hover,.chart-popout:focus{transform:scale(1.01); box-shadow:inset 0 0 0 1px rgba(148,163,184,0.24);}
+      .chart-popout{display:block; margin-top:12px; border-radius:14px; padding:12px; background:transparent; box-shadow:none; transition:transform .18s ease;}
+      .chart-popout:hover,.chart-popout:focus{transform:scale(1.01);}
       .chart-popout svg{width:100%; height:auto; display:block;}
       .chart-hint{margin-top:6px; font-size:12px; color:var(--muted);}
       .chart-modal__card{max-width:960px;}
