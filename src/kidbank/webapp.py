@@ -6056,7 +6056,7 @@ def kid_invest_home(
         """
 
         inner = f"""
-        {notice_html}{search_card_html}
+        {notice_html}<div style='margin-bottom:10px;'><a href='/kid' class='button-link secondary'>← Back to My Account</a></div>{search_card_html}
         {tabs_html}
         <div class='card'>
           <h3>Investing — {instrument_label}</h3>
