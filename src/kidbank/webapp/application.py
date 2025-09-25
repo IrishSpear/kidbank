@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal, ROUND_HALF_UP
 from datetime import date, datetime, timedelta
 from html import escape as html_escape
-from typing import Any, Callable, Dict, Iterable, List, Literal, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Literal, Mapping, Optional, Sequence, Set, Tuple
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request as URLRequest, urlopen
@@ -82,6 +82,34 @@ def now_local() -> datetime:
 
 def _penalty_event_reason(chore_id: int, target_day: date) -> str:
     return f"chore_penalty_missed:{chore_id}:{target_day.isoformat()}"
+
+
+_PENALTY_REASON_PATTERN = re.compile(r"^chore_penalty_missed:(\d+):(\d{4}-\d{2}-\d{2})$")
+
+
+def format_event_reason(
+    event: Event, chore_lookup: Optional[Mapping[int, Chore]] = None
+) -> str:
+    """Return a human-friendly description for an event reason."""
+
+    raw_reason = event.reason or ""
+    match = _PENALTY_REASON_PATTERN.match(raw_reason)
+    if match:
+        chore_id = int(match.group(1))
+        day_iso = match.group(2)
+        chore_name: Optional[str] = None
+        if chore_lookup:
+            chore = chore_lookup.get(chore_id)
+            if chore:
+                chore_name = chore.name
+        chore_label = chore_name or f"chore #{chore_id}"
+        try:
+            day_value = date.fromisoformat(day_iso)
+            day_label = day_value.strftime("%b %d, %Y")
+        except ValueError:
+            day_label = day_iso
+        return f"Missed chore penalty for {chore_label} on {day_label}"
+    return raw_reason
 
 
 def _chore_due_on_day(chore: Chore, day: date) -> bool:
@@ -2963,6 +2991,7 @@ def kid_home(
     marketplace_open_listings: List[MarketplaceListing] = []
     marketplace_my_listings: List[MarketplaceListing] = []
     marketplace_claimed_by_me: List[MarketplaceListing] = []
+    penalty_chore_lookup: Dict[int, Chore] = {}
     try:
         others: List[Child] = []
         incoming_requests: List[MoneyRequest] = []
@@ -2984,6 +3013,11 @@ def kid_home(
                 .order_by(desc(Event.timestamp))
                 .limit(event_limit)
             ).all()
+            penalty_event_chore_ids: Set[int] = set()
+            for event in events:
+                match = _PENALTY_REASON_PATTERN.match(event.reason or "")
+                if match:
+                    penalty_event_chore_ids.add(int(match.group(1)))
             goals = session.exec(
                 select(Goal)
                 .where(Goal.kid_id == kid_id)
@@ -3058,6 +3092,14 @@ def kid_home(
                     chore_ref = session.get(Chore, claim.chore_id)
                     if chore_ref:
                         global_chore_lookup[chore_ref.id] = chore_ref
+            if penalty_event_chore_ids:
+                penalty_chore_lookup = {
+                    chore.id: chore
+                    for chore in session.exec(
+                        select(Chore).where(Chore.id.in_(penalty_event_chore_ids))
+                    ).all()
+                    if chore.id is not None
+                }
             for gchore in global_chores:
                 if not is_chore_in_window(gchore, today):
                     continue
@@ -3085,7 +3127,7 @@ def kid_home(
         event_rows = "".join(
             f"<tr><td data-label='When'>{event.timestamp.strftime('%Y-%m-%d %H:%M')}</td>"
             f"<td data-label='Δ Amount' class='right'>{'+' if event.change_cents>=0 else ''}{usd(event.change_cents)}</td>"
-            f"<td data-label='Reason'>{html_escape(event.reason)}</td></tr>"
+            f"<td data-label='Reason'>{html_escape(format_event_reason(event, penalty_chore_lookup))}</td></tr>"
             for event in filtered_events
         ) or "<tr><td colspan='3' class='muted'>No activity matched your filters.</td></tr>"
         filter_summary_html = ""
@@ -3774,7 +3816,9 @@ def kid_home(
             )
         biggest_event = max(recent_events, key=lambda ev: abs(ev.change_cents), default=None)
         if biggest_event:
-            biggest_reason = html_escape(biggest_event.reason or "Activity")
+            biggest_reason = html_escape(
+                format_event_reason(biggest_event, penalty_chore_lookup) or "Activity"
+            )
             biggest_amount = usd(biggest_event.change_cents)
             biggest_when = biggest_event.timestamp.strftime("%b %d")
             biggest_line = f"Top move: {biggest_amount} for {biggest_reason} on {biggest_when}."
@@ -3904,7 +3948,7 @@ def kid_home(
                 + " • "
                 + change_text
                 + " for "
-                + html_escape(last_event.reason)
+                + html_escape(format_event_reason(last_event, penalty_chore_lookup))
                 + "</li>"
             )
         if not highlight_items:
@@ -6380,6 +6424,7 @@ def admin_home(
             else "background:#dcfce7; border-left:4px solid #86efac; color:#166534;"
         )
         notice_html = f"<div class='card' style='margin-bottom:12px; {style}'><div>{html_escape(notice_msg)}</div></div>"
+    penalty_chore_lookup: Dict[int, Chore] = {}
     with Session(engine) as session:
         kids = session.exec(select(Child).order_by(Child.name)).all()
         all_kids = list(kids)
@@ -6392,6 +6437,12 @@ def admin_home(
         analytics_events = session.exec(
             select(Event).order_by(desc(Event.timestamp)).limit(240)
         ).all()
+        penalty_event_chore_ids: Set[int] = set()
+        for collection in (events, analytics_events):
+            for event in collection:
+                match = _PENALTY_REASON_PATTERN.match(event.reason or "")
+                if match:
+                    penalty_event_chore_ids.add(int(match.group(1)))
         pending = session.exec(
             select(ChoreInstance, Chore, Child)
             .where(ChoreInstance.status == "pending")
@@ -6435,6 +6486,14 @@ def admin_home(
             entry["role"]: load_admin_privileges(session, entry["role"])
             for entry in parent_admins
         }
+        if penalty_event_chore_ids:
+            penalty_chore_lookup = {
+                chore.id: chore
+                for chore in session.exec(
+                    select(Chore).where(Chore.id.in_(penalty_event_chore_ids))
+                ).all()
+                if chore.id is not None
+            }
         approved_global_claims = session.exec(
             select(GlobalChoreClaim)
             .where(GlobalChoreClaim.status == GLOBAL_CHORE_STATUS_APPROVED)
@@ -7298,7 +7357,7 @@ def admin_home(
             + ("+" if event.change_cents >= 0 else "")
             + usd(event.change_cents)
             + "</td><td data-label='Reason'>"
-            + html_escape(event.reason)
+            + html_escape(format_event_reason(event, penalty_chore_lookup))
             + "</td></tr>"
         )
         for event in filtered_admin_events
@@ -7971,6 +8030,7 @@ def admin_home(
 def admin_kiosk(request: Request, kid_id: str = Query(...)):
     if (redirect := require_admin(request)) is not None:
         return redirect
+    penalty_chore_lookup: Dict[int, Chore] = {}
     with Session(engine) as session:
         child = session.exec(select(Child).where(Child.kid_id == kid_id)).first()
         if not child:
@@ -7982,10 +8042,21 @@ def admin_kiosk(request: Request, kid_id: str = Query(...)):
             .order_by(desc(Event.timestamp))
             .limit(10)
         ).all()
+        penalty_ids: Set[int] = set()
+        for event in events:
+            match = _PENALTY_REASON_PATTERN.match(event.reason or "")
+            if match:
+                penalty_ids.add(int(match.group(1)))
+        if penalty_ids:
+            penalty_chore_lookup = {
+                chore.id: chore
+                for chore in session.exec(select(Chore).where(Chore.id.in_(penalty_ids))).all()
+                if chore.id is not None
+            }
     event_rows = "".join(
         f"<tr><td data-label='When'>{event.timestamp.strftime('%b %d, %I:%M %p')}</td>"
         f"<td data-label='Δ Amount' class='right'>{'+' if event.change_cents>=0 else ''}{usd(event.change_cents)}</td>"
-        f"<td data-label='Reason'>{event.reason}</td></tr>"
+        f"<td data-label='Reason'>{html_escape(format_event_reason(event, penalty_chore_lookup))}</td></tr>"
         for event in events
     ) or "<tr><td>(no events)</td></tr>"
     chore_cards = "".join(
@@ -8720,6 +8791,7 @@ def admin_statement(request: Request, kid_id: str = Query(...)):
     if (redirect := require_admin(request)) is not None:
         return redirect
     cd_rates_bps = {code: DEFAULT_CD_RATE_BPS for code, _, _ in CD_TERM_OPTIONS}
+    penalty_chore_lookup: Dict[int, Chore] = {}
     with Session(engine) as session:
         child = session.exec(select(Child).where(Child.kid_id == kid_id)).first()
         if not child:
@@ -8730,6 +8802,17 @@ def admin_statement(request: Request, kid_id: str = Query(...)):
             .order_by(desc(Event.timestamp))
             .limit(50)
         ).all()
+        penalty_ids: Set[int] = set()
+        for event in events:
+            match = _PENALTY_REASON_PATTERN.match(event.reason or "")
+            if match:
+                penalty_ids.add(int(match.group(1)))
+        if penalty_ids:
+            penalty_chore_lookup = {
+                chore.id: chore
+                for chore in session.exec(select(Chore).where(Chore.id.in_(penalty_ids))).all()
+                if chore.id is not None
+            }
         goals = session.exec(select(Goal).where(Goal.kid_id == kid_id).order_by(desc(Goal.created_at))).all()
         certificates = session.exec(
             select(Certificate)
@@ -8779,7 +8862,7 @@ def admin_statement(request: Request, kid_id: str = Query(...)):
     activity_rows = "".join(
         f"<tr><td data-label='When'>{event.timestamp.strftime('%Y-%m-%d %H:%M')}</td>"
         f"<td data-label='Δ Amount' class='right'>{'+' if event.change_cents>=0 else ''}{usd(event.change_cents)}</td>"
-        f"<td data-label='Reason'>{event.reason}</td></tr>"
+        f"<td data-label='Reason'>{html_escape(format_event_reason(event, penalty_chore_lookup))}</td></tr>"
         for event in events
     ) or "<tr><td>(no events)</td></tr>"
     def fmt_signed(value: int) -> str:
@@ -10059,7 +10142,8 @@ def admin_time_settings(
         offset_minutes = 0
     manual_value = (manual_datetime or "").strip()
     set_time_settings(mode, offset_minutes, manual_value)
-    return RedirectResponse("/admin", status_code=302)
+    set_admin_notice(request, "Updated time settings.", "success")
+    return RedirectResponse("/admin?section=time", status_code=303)
 
 
 @app.get("/admin/audit", response_class=HTMLResponse)
