@@ -1272,7 +1272,7 @@ def base_styles() -> str:
       body.touch-friendly select,
       body.touch-friendly textarea{min-height:48px;}
       body.font-dyslexic{font-family:'OpenDyslexic','Comic Sans MS','Trebuchet MS',Verdana,sans-serif; letter-spacing:0.03em;}
-      body.theme-high-contrast{--bg:#000814; --card:#001d3d; --muted:#e2e8f0; --accent:#ffd60a; --text:#f8fafc; --good:#4ade80; --bad:#f87171;}
+      body.theme-high-contrast{--bg:#000814; --card:#001d3d; --muted:#e2e8f0; --accent:#FFC857; --text:#f8fafc; --good:#4ade80; --bad:#f87171;}
       body.theme-high-contrast .card{box-shadow:none; border:2px solid rgba(248,250,252,0.18);}
       .help-icon{display:inline-flex; align-items:center; justify-content:center; width:22px; height:22px; border-radius:999px; background:rgba(148,163,184,0.24); color:var(--text); font-size:12px; text-decoration:none; margin-left:6px;}
       .help-icon:hover{filter:brightness(1.12);}
