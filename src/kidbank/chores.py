@@ -67,6 +67,15 @@ class ChoreSchedule:
             due_today = True
         return due_today and (self.window is None or self.window.includes(moment))
 
+    def is_due_on_date(self, target: date) -> bool:
+        """Return whether the schedule expects the chore on ``target``."""
+
+        if self.specific_dates is not None:
+            return target in self.specific_dates
+        if self.weekdays:
+            return Weekday(target.weekday()) in self.weekdays
+        return True
+
     @classmethod
     def daily(cls) -> "ChoreSchedule":
         return cls(weekdays=frozenset(Weekday), window=None)
@@ -106,6 +115,7 @@ class Chore:
     history: List[ChoreCompletion] = field(default_factory=list)
     penalty_value: Decimal | None = None
     last_missed: date | None = None
+    created_at: datetime = field(default_factory=datetime.utcnow)
 
     def __post_init__(self) -> None:
         if self.requires_proof and not self.proof_type:
@@ -198,24 +208,48 @@ class Chore:
     def collect_missed_penalties(self, *, at: Optional[datetime] = None) -> int:
         """Return the number of fully elapsed days to penalize."""
 
-        if self.penalty_value is None or not self.pending_since:
+        if self.penalty_value is None:
             return 0
 
         moment = at or datetime.utcnow()
-        pending_day = self.pending_since.date()
-
-        # We only want to apply a penalty once a full day has completed. Anchor
-        # that evaluation to the day that just ended relative to ``moment`` so a
-        # run shortly after midnight still charges for the previous day.
         evaluation_day = (moment - timedelta(days=1)).date()
-        if evaluation_day < pending_day:
+        created_day = self.created_at.date()
+        if evaluation_day < created_day:
             return 0
 
-        last_processed = self.last_missed or (pending_day - timedelta(days=1))
-        if evaluation_day <= last_processed:
+        pending_day = self.pending_since.date() if self.pending_since else None
+
+        anchor_candidates: list[date] = [created_day - timedelta(days=1)]
+        if pending_day is not None:
+            anchor_candidates.append(pending_day - timedelta(days=1))
+        if self.last_completed is not None:
+            anchor_candidates.append(self.last_completed.date())
+        if self.last_missed is not None:
+            anchor_candidates.append(self.last_missed)
+
+        anchor_day = max(anchor_candidates)
+        if evaluation_day <= anchor_day:
             return 0
 
-        missed_days = (evaluation_day - last_processed).days
+        start_day = anchor_day + timedelta(days=1)
+
+        missed_days = 0
+        first_missed_day: date | None = None
+        current_day = start_day
+        while current_day <= evaluation_day:
+            if self.schedule.is_due_on_date(current_day):
+                missed_days += 1
+                if first_missed_day is None:
+                    first_missed_day = current_day
+            current_day += timedelta(days=1)
+
+        if missed_days == 0:
+            return 0
+
+        if first_missed_day is not None:
+            if not self.pending_since or self.pending_since.date() > first_missed_day:
+                self.pending_since = datetime.combine(first_missed_day, time())
+
         self.last_missed = evaluation_day
         return missed_days
 

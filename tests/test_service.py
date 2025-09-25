@@ -322,7 +322,7 @@ def test_marketplace_rejection_refunds_offer() -> None:
 def test_missed_chore_penalty_withdraws_balance() -> None:
     bank = KidBank()
     bank.create_account("Ava", starting_balance=Decimal("10.00"))
-    bank.schedule_chore(
+    chore = bank.schedule_chore(
         "Ava",
         name="Dishes",
         value=Decimal("2.00"),
@@ -331,6 +331,8 @@ def test_missed_chore_penalty_withdraws_balance() -> None:
 
     first_day = datetime(2024, 1, 1, 8, 0)
     next_day = datetime(2024, 1, 2, 8, 0)
+
+    chore.created_at = first_day - timedelta(hours=1)
 
     bank.auto_republish_chores(at=first_day)
     bank.auto_republish_chores(at=next_day)
@@ -346,7 +348,7 @@ def test_missed_chore_penalty_withdraws_balance() -> None:
 def test_missed_chore_penalty_waits_until_midnight() -> None:
     bank = KidBank()
     bank.create_account("Ava", starting_balance=Decimal("5.00"))
-    bank.schedule_chore(
+    chore = bank.schedule_chore(
         "Ava",
         name="Laundry",
         value=Decimal("1.00"),
@@ -356,6 +358,8 @@ def test_missed_chore_penalty_waits_until_midnight() -> None:
     first_day = datetime(2024, 1, 1, 9, 0)
     before_midnight = datetime(2024, 1, 1, 23, 59)
     after_midnight = datetime(2024, 1, 2, 0, 1)
+
+    chore.created_at = first_day - timedelta(hours=1)
 
     bank.auto_republish_chores(at=first_day)
     bank.auto_republish_chores(at=before_midnight)
@@ -373,7 +377,7 @@ def test_missed_chore_penalty_waits_until_midnight() -> None:
 def test_missed_chore_penalty_accumulates_each_day() -> None:
     bank = KidBank()
     bank.create_account("Ava", starting_balance=Decimal("10.00"))
-    bank.schedule_chore(
+    chore = bank.schedule_chore(
         "Ava",
         name="Room",
         value=Decimal("1.50"),
@@ -382,6 +386,8 @@ def test_missed_chore_penalty_accumulates_each_day() -> None:
 
     first_day = datetime(2024, 1, 1, 8, 0)
     fourth_day = datetime(2024, 1, 4, 8, 0)
+
+    chore.created_at = first_day - timedelta(hours=1)
 
     bank.auto_republish_chores(at=first_day)
     bank.auto_republish_chores(at=fourth_day)
@@ -392,4 +398,42 @@ def test_missed_chore_penalty_accumulates_each_day() -> None:
     penalty_tx = account.transactions[-1]
     assert penalty_tx.description == "Missed chore penalty: Room"
     assert penalty_tx.amount == Decimal("4.50")
+
+
+def test_missed_chore_penalty_handles_time_jump() -> None:
+    bank = KidBank()
+    bank.create_account("Ava", starting_balance=Decimal("6.00"))
+    chore = bank.schedule_chore(
+        "Ava",
+        name="Tidy",
+        value=Decimal("1.00"),
+        penalty_on_miss=True,
+    )
+
+    # Anchor the creation time so the chore clearly exists before the window we evaluate.
+    chore.created_at = datetime(2024, 1, 1, 8, 0)
+
+    # Jump straight to January 4th without running the job for the earlier days.
+    bank.auto_republish_chores(at=datetime(2024, 1, 4, 9, 0))
+
+    account = bank.get_account("Ava")
+    # Missed January 1st, 2nd, and 3rd despite the job only running once.
+    assert account.balance == Decimal("3.00")
+    penalty_tx = account.transactions[-1]
+    assert penalty_tx.description == "Missed chore penalty: Tidy"
+    assert penalty_tx.amount == Decimal("3.00")
+
+    # A chore created later should not receive retroactive penalties.
+    later_chore = bank.schedule_chore(
+        "Ava",
+        name="Desk",
+        value=Decimal("1.00"),
+        penalty_on_miss=True,
+    )
+    later_chore.created_at = datetime(2024, 1, 4, 12, 0)
+
+    # Run again later the same day—no additional deductions because the chore is too new.
+    bank.auto_republish_chores(at=datetime(2024, 1, 4, 23, 0))
+    account = bank.get_account("Ava")
+    assert account.balance == Decimal("3.00")
 
