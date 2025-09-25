@@ -468,3 +468,32 @@ def test_missed_chore_penalty_respects_time_settings() -> None:
     assert penalty_tx.description == "Missed chore penalty: Tidy"
     assert penalty_tx.amount == Decimal("1.00")
 
+
+def test_missed_chore_penalty_does_not_repeat_processed_days() -> None:
+    bank = KidBank()
+    bank.create_account("Ava", starting_balance=Decimal("10.00"))
+    chore = bank.schedule_chore(
+        "Ava",
+        name="Dust",
+        value=Decimal("2.00"),
+        penalty_on_miss=True,
+    )
+
+    chore.created_at = datetime(2024, 1, 1, 7, 0)
+    chore.pending_since = datetime(2024, 1, 1, 0, 0)
+
+    first_run = datetime(2024, 1, 2, 8, 0)
+    bank.auto_republish_chores(at=first_run)
+
+    account = bank.get_account("Ava")
+    assert account.balance == Decimal("8.00")
+
+    chore.last_missed = None
+    chore.pending_since = datetime(2024, 1, 1, 0, 0)
+
+    bank.auto_republish_chores(at=datetime(2024, 1, 2, 20, 0))
+    assert account.balance == Decimal("8.00")
+
+    bank.auto_republish_chores(at=datetime(2024, 1, 3, 8, 0))
+    assert account.balance == Decimal("6.00")
+

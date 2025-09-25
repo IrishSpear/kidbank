@@ -115,6 +115,7 @@ class Chore:
     history: List[ChoreCompletion] = field(default_factory=list)
     penalty_value: Decimal | None = None
     last_missed: date | None = None
+    penalty_last_date: date | None = None
     created_at: datetime = field(default_factory=datetime.utcnow)
 
     def __post_init__(self) -> None:
@@ -226,9 +227,13 @@ class Chore:
             anchor_candidates.append(self.last_completed.date())
         if self.last_missed is not None:
             anchor_candidates.append(self.last_missed)
+        if self.penalty_last_date is not None:
+            anchor_candidates.append(self.penalty_last_date)
 
         anchor_day = max(anchor_candidates)
         if evaluation_day <= anchor_day:
+            if self.penalty_last_date is None or evaluation_day > self.penalty_last_date:
+                self.penalty_last_date = evaluation_day
             return 0
 
         start_day = anchor_day + timedelta(days=1)
@@ -242,6 +247,8 @@ class Chore:
                 if first_missed_day is None:
                     first_missed_day = current_day
             current_day += timedelta(days=1)
+
+        self.penalty_last_date = evaluation_day
 
         if missed_days == 0:
             return 0
