@@ -342,3 +342,54 @@ def test_missed_chore_penalty_withdraws_balance() -> None:
     assert penalty_tx.category is EventCategory.PENALTY
     assert penalty_tx.amount == Decimal("2.00")
 
+
+def test_missed_chore_penalty_waits_until_midnight() -> None:
+    bank = KidBank()
+    bank.create_account("Ava", starting_balance=Decimal("5.00"))
+    bank.schedule_chore(
+        "Ava",
+        name="Laundry",
+        value=Decimal("1.00"),
+        penalty_on_miss=True,
+    )
+
+    first_day = datetime(2024, 1, 1, 9, 0)
+    before_midnight = datetime(2024, 1, 1, 23, 59)
+    after_midnight = datetime(2024, 1, 2, 0, 1)
+
+    bank.auto_republish_chores(at=first_day)
+    bank.auto_republish_chores(at=before_midnight)
+    assert bank.get_account("Ava").balance == Decimal("5.00")
+
+    bank.auto_republish_chores(at=after_midnight)
+
+    account = bank.get_account("Ava")
+    assert account.balance == Decimal("4.00")
+    penalty_tx = account.transactions[-1]
+    assert penalty_tx.description == "Missed chore penalty: Laundry"
+    assert penalty_tx.amount == Decimal("1.00")
+
+
+def test_missed_chore_penalty_accumulates_each_day() -> None:
+    bank = KidBank()
+    bank.create_account("Ava", starting_balance=Decimal("10.00"))
+    bank.schedule_chore(
+        "Ava",
+        name="Room",
+        value=Decimal("1.50"),
+        penalty_on_miss=True,
+    )
+
+    first_day = datetime(2024, 1, 1, 8, 0)
+    fourth_day = datetime(2024, 1, 4, 8, 0)
+
+    bank.auto_republish_chores(at=first_day)
+    bank.auto_republish_chores(at=fourth_day)
+
+    account = bank.get_account("Ava")
+    # Missed January 1st, 2nd, and 3rd for three penalties total.
+    assert account.balance == Decimal("5.50")
+    penalty_tx = account.transactions[-1]
+    assert penalty_tx.description == "Missed chore penalty: Room"
+    assert penalty_tx.amount == Decimal("4.50")
+

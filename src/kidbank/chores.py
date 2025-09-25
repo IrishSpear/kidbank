@@ -196,20 +196,27 @@ class Chore:
         return moment - self.pending_since >= timedelta(hours=hours)
 
     def collect_missed_penalties(self, *, at: Optional[datetime] = None) -> int:
+        """Return the number of fully elapsed days to penalize."""
+
         if self.penalty_value is None or not self.pending_since:
             return 0
+
         moment = at or datetime.utcnow()
-        current_day = moment.date()
         pending_day = self.pending_since.date()
-        if current_day <= pending_day:
+
+        # We only want to apply a penalty once a full day has completed. Anchor
+        # that evaluation to the day that just ended relative to ``moment`` so a
+        # run shortly after midnight still charges for the previous day.
+        evaluation_day = (moment - timedelta(days=1)).date()
+        if evaluation_day < pending_day:
             return 0
-        start_day = pending_day
-        if self.last_missed and self.last_missed >= start_day:
-            start_day = self.last_missed + timedelta(days=1)
-        if start_day >= current_day:
+
+        last_processed = self.last_missed or (pending_day - timedelta(days=1))
+        if evaluation_day <= last_processed:
             return 0
-        missed_days = (current_day - start_day).days
-        self.last_missed = current_day - timedelta(days=1)
+
+        missed_days = (evaluation_day - last_processed).days
+        self.last_missed = evaluation_day
         return missed_days
 
 
