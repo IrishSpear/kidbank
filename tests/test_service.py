@@ -318,3 +318,27 @@ def test_marketplace_rejection_refunds_offer() -> None:
     closed = bank.marketplace_listings(include_closed=True)
     assert closed[0].status is ChoreListingStatus.REJECTED
 
+
+def test_missed_chore_penalty_withdraws_balance() -> None:
+    bank = KidBank()
+    bank.create_account("Ava", starting_balance=Decimal("10.00"))
+    bank.schedule_chore(
+        "Ava",
+        name="Dishes",
+        value=Decimal("2.00"),
+        penalty_on_miss=True,
+    )
+
+    first_day = datetime(2024, 1, 1, 8, 0)
+    next_day = datetime(2024, 1, 2, 8, 0)
+
+    bank.auto_republish_chores(at=first_day)
+    bank.auto_republish_chores(at=next_day)
+
+    account = bank.get_account("Ava")
+    assert account.balance == Decimal("8.00")
+    penalty_tx = account.transactions[-1]
+    assert penalty_tx.description == "Missed chore penalty: Dishes"
+    assert penalty_tx.category is EventCategory.PENALTY
+    assert penalty_tx.amount == Decimal("2.00")
+

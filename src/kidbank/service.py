@@ -356,6 +356,8 @@ class KidBank:
         before: Optional[Tuple[int, int]] = None,
         requires_proof: bool = False,
         proof_type: str | None = None,
+        penalty_on_miss: bool = False,
+        penalty_amount: AmountLike | None = None,
     ) -> Chore:
         board = self._chores[child_name]
         if dates is not None:
@@ -389,6 +391,10 @@ class KidBank:
             window = TimeWindow(start=start, end=end)
         else:
             window = None
+        penalty_value = None
+        if penalty_on_miss:
+            penalty_source = penalty_amount if penalty_amount is not None else value
+            penalty_value = to_decimal(penalty_source)
         chore = Chore(
             name=name,
             value=to_decimal(value),
@@ -399,6 +405,7 @@ class KidBank:
             ),
             requires_proof=requires_proof,
             proof_type=proof_type,
+            penalty_value=penalty_value,
         )
         board.add_chore(chore)
         self._audit_log.record("guardian", "add_chore", f"{child_name}:{name}")
@@ -763,8 +770,39 @@ class KidBank:
 
     def auto_republish_chores(self, *, at: Optional[datetime] = None) -> Dict[str, Sequence[str]]:
         republished: Dict[str, Sequence[str]] = {}
+        moment = at or datetime.utcnow()
         for child, board in self._chores.items():
-            refreshed = board.auto_republish(at=at)
+            penalties = board.missed_penalties(at=moment)
+            for chore, missed_days in penalties:
+                penalty_value = chore.penalty_value
+                if penalty_value is None:
+                    continue
+                total_penalty = (penalty_value * missed_days).quantize(Decimal("0.01"))
+                if total_penalty <= Decimal("0.00"):
+                    continue
+                account = self.get_account(child)
+                deduction = min(total_penalty, account.balance)
+                if deduction <= Decimal("0.00"):
+                    continue
+                transaction = self.withdraw(
+                    child,
+                    deduction,
+                    f"Missed chore penalty: {chore.name}",
+                    category=EventCategory.PENALTY,
+                    metadata={
+                        "chore": chore.name,
+                        "missed_days": str(missed_days),
+                        "penalty_expected": str(total_penalty),
+                    },
+                )
+                self._logger.log(
+                    "chore_missed_penalty",
+                    child=child,
+                    chore=chore.name,
+                    penalty=float(transaction.amount),
+                    missed_days=missed_days,
+                )
+            refreshed = board.auto_republish(at=moment)
             if refreshed:
                 republished[child] = refreshed
         if republished:
