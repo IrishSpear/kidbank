@@ -1048,6 +1048,28 @@ def chore_specific_dates(chore: Chore) -> Set[date]:
     return _chore_specific_dates(chore.specific_dates)
 
 
+def _chore_specific_month_days(raw: Optional[str]) -> Set[int]:
+    days: Set[int] = set()
+    if not raw:
+        return days
+    for token in raw.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            value = int(token)
+        except ValueError:
+            continue
+        if 1 <= value <= 31:
+            days.add(value)
+    return days
+
+
+def chore_specific_month_days(chore: Chore) -> Set[int]:
+    raw = getattr(chore, "specific_month_days", None)
+    return _chore_specific_month_days(raw)
+
+
 WEEKDAY_OPTIONS: Tuple[Tuple[int, str], ...] = (
     (0, "Mon"),
     (1, "Tue"),
@@ -1094,6 +1116,27 @@ def format_weekdays(days: Set[int]) -> str:
     return ", ".join(labels)
 
 
+def format_month_days(days: Set[int]) -> str:
+    return ", ".join(str(day) for day in sorted(days))
+
+
+def serialize_specific_month_days(raw: str) -> Optional[str]:
+    values: Set[int] = set()
+    for token in re.split(r"[\s,]+", (raw or "").replace("/", ",")):
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            value = int(token)
+        except ValueError:
+            continue
+        if 1 <= value <= 31:
+            values.add(value)
+    if not values:
+        return None
+    return ",".join(str(value) for value in sorted(values))
+
+
 def normalize_chore_type(value: str, *, is_global: bool = False) -> str:
     normalized = (value or "").lower()
     if normalized == "global":
@@ -1128,6 +1171,26 @@ def is_chore_in_window(chore: Chore, today: date) -> bool:
         return False
     specific_dates = chore_specific_dates(chore)
     if specific_dates and today not in specific_dates:
+        return False
+    month_days = chore_specific_month_days(chore)
+    if month_days and today.day not in month_days:
+        return False
+    return True
+
+
+def is_one_time_special(chore: Chore) -> bool:
+    normalized_type = normalize_chore_type(
+        chore.type, is_global=chore.kid_id == GLOBAL_CHORE_KID_ID
+    )
+    if normalized_type != "special":
+        return False
+    if chore.start_date or chore.end_date:
+        return False
+    if chore_weekdays(chore):
+        return False
+    if chore_specific_dates(chore):
+        return False
+    if chore_specific_month_days(chore):
         return False
     return True
 
@@ -3198,6 +3261,9 @@ def kid_home(
                 schedule_bits.append(
                     "Dates: " + ", ".join(sorted(d.isoformat() for d in specific_dates))
                 )
+            month_days = chore_specific_month_days(chore)
+            if month_days:
+                schedule_bits.append(f"Month days: {format_month_days(month_days)}")
             schedule_line = (
                 f"<div class='muted chore-item__schedule'>{' • '.join(schedule_bits)}</div>"
                 if schedule_bits
@@ -3327,6 +3393,9 @@ def kid_home(
                     "Dates: "
                     + ", ".join(sorted(d.isoformat() for d in specific_dates))
                 )
+            month_days = chore_specific_month_days(chore)
+            if month_days:
+                schedule_bits.append(f"Month days: {format_month_days(month_days)}")
             schedule_line = (
                 f"<div class='muted' style='margin-top:4px;'>{' • '.join(schedule_bits)}</div>"
                 if schedule_bits
@@ -7956,7 +8025,7 @@ def admin_home(
         f"<label>kid_id</label><select name='kid_id' required>{kid_options_html}<option value='{GLOBAL_CHORE_KID_ID}'>Global (Free-for-all)</option></select>"
         "<label>Name</label><input name='name' placeholder='Take out trash' required>"
         "<div class='grid' style='grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:8px;'>"
-        "<div><label>Type</label><select name='type' id='chore-create-type'><option value='daily'>Daily</option><option value='weekly'>Weekly</option><option value='monthly'>Monthly</option><option value='special'>Special</option></select></div>"
+        "<div><label>Type</label><select name='type' id='chore-create-type' class='chore-type-select' data-schedule-root='chore-create-schedule'><option value='daily'>Daily</option><option value='weekly'>Weekly</option><option value='monthly'>Monthly</option><option value='special'>Special</option></select></div>"
         "<div><label>Award (dollars)</label><input name='award' type='text' data-money value='0.50'></div>"
         "<div><label>Penalty if missed</label><div style='display:flex; align-items:center; gap:6px; margin-top:4px;'><label style='display:flex; align-items:center; gap:4px; font-weight:400;'><input type='checkbox' name='penalty_enabled' value='1'> Apply</label><input name='penalty_amount' type='text' data-money value='0.00' placeholder='penalty $'></div></div>"
         "<div><label>Max claimants (global)</label><input name='max_claimants' type='number' min='1' value='1'></div>"
@@ -7965,15 +8034,18 @@ def admin_home(
         "<div><label>Start Date (optional)</label><input name='start_date' type='date'></div>"
         "<div><label>End Date (optional)</label><input name='end_date' type='date'></div>"
         "</div>"
-        "<div class='chore-schedule-selector' style='margin-top:6px; display:none;'><div class='muted' style='margin-bottom:4px;'>Weekdays (optional)</div><div>"
+        "<div id='chore-create-schedule'>"
+        "<div class='chore-schedule-selector chore-schedule-selector--weekly' data-schedule-group='weekly' style='margin-top:6px; display:none;'><div class='muted' style='margin-bottom:4px;'>Weekdays (optional)</div><div>"
         f"{weekday_selector}"
         "</div></div>"
-        "<div class='chore-schedule-selector' style='display:none;'><label>Specific dates (comma separated)</label><input name='specific_dates' placeholder='YYYY-MM-DD,YYYY-MM-DD'></div>"
+        "<div class='chore-schedule-selector chore-schedule-selector--monthly' data-schedule-group='monthly' style='display:none;'><label>Specific days (comma separated)</label><input name='specific_month_days' placeholder='1,15'></div>"
+        "<div class='chore-schedule-selector chore-schedule-selector--special' data-schedule-group='special' style='display:none;'><label>Specific dates (comma separated)</label><input name='specific_dates' placeholder='YYYY-MM-DD,YYYY-MM-DD'></div>"
+        "</div>"
         "<label>Notes</label><input name='notes' placeholder='Any details'>"
         "<p class='muted'>Global chores appear for all kids under “Free-for-all”. Use max claimants to set how many kids can share the reward per period.</p>"
         "<button type='submit'>Add Chore</button>"
         "</form>"
-        "<script>(function(){var typeSel=document.getElementById('chore-create-type');if(!typeSel){return;}var selectors=document.querySelectorAll('.chore-schedule-selector');var update=function(){var value=(typeSel.value||'').toLowerCase();var show=value==='weekly'||value==='special';selectors.forEach(function(el){el.style.display=show?'':'none';});};typeSel.addEventListener('change',update);update();})();</script>"
+        "<script>(function(){function applySchedule(select){var rootId=select.getAttribute('data-schedule-root');if(!rootId){return;}var root=document.getElementById(rootId);if(!root){return;}var value=(select.value||'').toLowerCase();root.querySelectorAll('[data-schedule-group]').forEach(function(el){var group=el.getAttribute('data-schedule-group');var show=false;if(group==='weekly'){show=value==='weekly';}else if(group==='monthly'){show=value==='monthly';}else if(group==='special'){show=value==='special';}el.style.display=show?'':'none';});}var selects=document.querySelectorAll('.chore-type-select');selects.forEach(function(select){var handler=function(){applySchedule(select);};select.addEventListener('change',handler);handler();});})();</script>"
         "</div>"
     )
     admin_pref_controls = preference_controls_html(request)
@@ -8173,22 +8245,28 @@ def admin_manage_chores(request: Request, kid_id: str = Query(...)):
             for day, label in WEEKDAY_OPTIONS
         )
         specific_value = html_escape(chore.specific_dates or "")
+        specific_month_value = html_escape(getattr(chore, "specific_month_days", "") or "")
         start_value = chore.start_date.isoformat() if chore.start_date else ""
         end_value = chore.end_date.isoformat() if chore.end_date else ""
         name_value = html_escape(chore.name)
         notes_value = html_escape(chore.notes or "")
+        is_global_chore = chore.kid_id == GLOBAL_CHORE_KID_ID
+        chore_type = normalize_chore_type(chore.type, is_global=is_global_chore)
+        weekly_style = "" if chore_type == "weekly" else "display:none;"
+        monthly_style = "" if chore_type == "monthly" else "display:none;"
+        special_style = "" if chore_type == "special" else "display:none;"
+        schedule_id = f"chore-schedule-{chore.id}"
         schedule_html = (
-            "<div class='chore-schedule'>"
+            f"<div class='chore-schedule' id='{schedule_id}'>"
             "<div class='chore-schedule__dates'>"
             f"<input name='start_date' type='date' value='{start_value}' form='{form_id}'>"
             f"<input name='end_date' type='date' value='{end_value}' form='{form_id}'>"
             "</div>"
-            f"<div class='chore-schedule__weekdays'>{weekday_controls}</div>"
-            f"<input name='specific_dates' placeholder='YYYY-MM-DD,YYYY-MM-DD' value='{specific_value}' form='{form_id}'>"
+            f"<div class='chore-schedule__weekdays chore-schedule-selector chore-schedule-selector--weekly' data-schedule-group='weekly' style='{weekly_style}'>{weekday_controls}</div>"
+            f"<div class='chore-schedule-selector chore-schedule-selector--monthly' data-schedule-group='monthly' style='{monthly_style}'><label>Specific days (comma separated)</label><input name='specific_month_days' placeholder='1,15' value='{specific_month_value}' form='{form_id}'></div>"
+            f"<div class='chore-schedule-selector chore-schedule-selector--special' data-schedule-group='special' style='{special_style}'><label>Specific dates (comma separated)</label><input name='specific_dates' placeholder='YYYY-MM-DD,YYYY-MM-DD' value='{specific_value}' form='{form_id}'></div>"
             "</div>"
         )
-        is_global_chore = chore.kid_id == GLOBAL_CHORE_KID_ID
-        chore_type = normalize_chore_type(chore.type, is_global=is_global_chore)
         if is_global_chore:
             type_options = ["daily", "weekly", "monthly"]
         else:
@@ -8226,7 +8304,7 @@ def admin_manage_chores(request: Request, kid_id: str = Query(...)):
             f"<td data-label='Name'><form id='{form_id}' method='post' action='/admin/chores/update'></form>"
             f"<input type='hidden' name='chore_id' value='{chore.id}' form='{form_id}'>"
             f"<input name='name' value='{name_value}' form='{form_id}'></td>"
-            f"<td data-label='Type'><select name='type' form='{form_id}'>{type_select}</select></td>"
+            f"<td data-label='Type'><select name='type' form='{form_id}' class='chore-type-select' data-schedule-root='{schedule_id}'>{type_select}</select></td>"
             f"<td data-label='Award ($)' class='right'><input name='award' type='text' data-money value='{dollars_value(chore.award_cents)}' form='{form_id}' class='chore-field--compact'></td>"
             f"<td data-label='Penalty ($)' class='right'><div style='display:flex; align-items:center; justify-content:flex-end; gap:6px;'><label style='display:flex; align-items:center; gap:4px; font-weight:400;'><input type='checkbox' name='penalty_enabled' value='1'{penalty_checked} form='{form_id}'> Apply</label><input name='penalty_amount' type='text' data-money value='{penalty_value}' form='{form_id}' class='chore-field--compact'></div></td>"
             f"<td data-label='Max Spots'><input name='max_claimants' type='number' min='1' value='{max(1, chore.max_claimants)}' form='{form_id}' class='chore-field--compact'></td>"
@@ -8357,6 +8435,7 @@ def admin_chore_create(
     notes: str = Form(""),
     weekdays: List[str] = Form([]),
     specific_dates: str = Form(""),
+    specific_month_days: str = Form(""),
 ):
     if (
         redirect := require_admin_permission(
@@ -8375,6 +8454,7 @@ def admin_chore_create(
     max_claims_value = max(1, max_claims_value)
     weekday_csv = serialize_weekday_selection(weekdays) if weekdays else None
     dates_csv = serialize_specific_dates(specific_dates) if specific_dates else None
+    month_days_csv = serialize_specific_month_days(specific_month_days)
     kid_value = (kid_id or "").strip()
     if kid_value and kid_value != GLOBAL_CHORE_KID_ID:
         if (
@@ -8384,6 +8464,12 @@ def admin_chore_create(
         ) is not None:
             return denied
     normalized_type = normalize_chore_type(type, is_global=kid_value == GLOBAL_CHORE_KID_ID)
+    if normalized_type != "weekly":
+        weekday_csv = None
+    if normalized_type != "special":
+        dates_csv = None
+    if normalized_type != "monthly":
+        month_days_csv = None
     kid_label = "Free-for-all" if kid_value == GLOBAL_CHORE_KID_ID else kid_value or "Unknown"
     with Session(engine) as session:
         if kid_value and kid_value != GLOBAL_CHORE_KID_ID:
@@ -8402,6 +8488,7 @@ def admin_chore_create(
             max_claimants=max_claims_value,
             weekdays=weekday_csv,
             specific_dates=dates_csv,
+            specific_month_days=month_days_csv,
         )
         session.add(chore)
         session.commit()
@@ -8428,6 +8515,7 @@ def admin_chore_update(
     notes: str = Form(""),
     weekdays: List[str] = Form([]),
     specific_dates: str = Form(""),
+    specific_month_days: str = Form(""),
 ):
     if (
         redirect := require_admin_permission(
@@ -8446,6 +8534,7 @@ def admin_chore_update(
     max_claims_value = max(1, max_claims_value)
     weekday_csv = serialize_weekday_selection(weekdays) if weekdays else None
     dates_csv = serialize_specific_dates(specific_dates) if specific_dates else None
+    month_days_csv = serialize_specific_month_days(specific_month_days)
     with Session(engine) as session:
         chore = session.get(Chore, chore_id)
         if not chore:
@@ -8458,6 +8547,12 @@ def admin_chore_update(
             ) is not None:
                 return denied
         normalized_type = normalize_chore_type(type, is_global=chore.kid_id == GLOBAL_CHORE_KID_ID)
+        if normalized_type != "weekly":
+            weekday_csv = None
+        if normalized_type != "special":
+            dates_csv = None
+        if normalized_type != "monthly":
+            month_days_csv = None
         target_kid = chore.kid_id
         chore.name = name.strip()
         chore.type = normalized_type
@@ -8469,6 +8564,7 @@ def admin_chore_update(
         chore.max_claimants = max_claims_value
         chore.weekdays = weekday_csv
         chore.specific_dates = dates_csv
+        chore.specific_month_days = month_days_csv
         session.add(chore)
         session.commit()
     return RedirectResponse(f"/admin/chores?kid_id={target_kid}", status_code=302)
@@ -9781,6 +9877,9 @@ def admin_chore_payout(
         instance.status = "paid"
         instance.paid_event_id = event.id
         session.add(instance)
+        if is_one_time_special(chore):
+            chore.active = False
+            session.add(chore)
         session.commit()
         child_name = child.name
         chore_name = chore.name

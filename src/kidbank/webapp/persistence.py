@@ -97,6 +97,7 @@ class Chore(SQLModel, table=True):
     max_claimants: int = 1
     weekdays: Optional[str] = None
     specific_dates: Optional[str] = None
+    specific_month_days: Optional[str] = None
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
 
@@ -344,6 +345,8 @@ def run_migrations() -> None:
             raw.execute("ALTER TABLE chore ADD COLUMN weekdays TEXT;")
         if not _column_exists(raw, "chore", "specific_dates"):
             raw.execute("ALTER TABLE chore ADD COLUMN specific_dates TEXT;")
+        if not _column_exists(raw, "chore", "specific_month_days"):
+            raw.execute("ALTER TABLE chore ADD COLUMN specific_month_days TEXT;")
         if not _column_exists(raw, "chore", "penalty_cents"):
             raw.execute("ALTER TABLE chore ADD COLUMN penalty_cents INTEGER DEFAULT 0;")
         if not _column_exists(raw, "chore", "penalty_last_date"):

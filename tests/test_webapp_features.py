@@ -824,3 +824,58 @@ def test_apply_chore_penalties_catches_multiple_days_and_is_idempotent() -> None
         refreshed = session.get(Chore, chore_id)
         assert refreshed is not None
         assert refreshed.penalty_last_date == date(2024, 1, 3)
+
+
+def test_serialize_specific_month_days_filters_invalid_tokens() -> None:
+    from kidbank.webapp.application import serialize_specific_month_days
+
+    assert serialize_specific_month_days("15, 1, 0, 32, 5") == "1,5,15"
+    assert serialize_specific_month_days("2/10") == "2,10"
+    assert serialize_specific_month_days("   ") is None
+
+
+def test_one_time_special_chore_deactivates_after_payout() -> None:
+    client = TestClient(app)
+    with Session(engine) as session:
+        child = Child(kid_id="solo", name="Solo", balance_cents=0, kid_pin="0000")
+        session.add(child)
+        session.commit()
+        session.refresh(child)
+        chore = Chore(
+            kid_id=child.kid_id,
+            name="Build volcano",
+            type="special",
+            award_cents=700,
+        )
+        session.add(chore)
+        session.commit()
+        session.refresh(chore)
+        instance = ChoreInstance(
+            chore_id=chore.id,
+            period_key="SPECIAL",
+            status="pending",
+            completed_at=datetime.utcnow(),
+        )
+        session.add(instance)
+        session.commit()
+        session.refresh(instance)
+        instance_id = instance.id
+        chore_id = chore.id
+
+    login = client.post("/admin/login", data={"pin": DAD_PIN}, follow_redirects=False)
+    assert login.status_code == 302
+    payout = client.post(
+        "/admin/chore_payout",
+        data={"instance_id": instance_id, "redirect": "/admin?section=payouts"},
+        follow_redirects=False,
+    )
+    assert payout.status_code == 302
+    assert payout.headers["location"] == "/admin?section=payouts"
+
+    with Session(engine) as session:
+        updated_chore = session.get(Chore, chore_id)
+        assert updated_chore is not None
+        assert updated_chore.active is False
+        refreshed_instance = session.get(ChoreInstance, instance_id)
+        assert refreshed_instance is not None
+        assert refreshed_instance.status == "paid"
