@@ -1063,8 +1063,8 @@ def base_styles() -> str:
         font-family: system-ui,-apple-system,Segoe UI,Roboto,Arial;
         background:var(--bg); color:var(--text);
         max-width:1320px;
-        margin:24px auto;
-        padding:0 16px;
+        margin:0 auto;
+        padding:24px 16px;
       }
       .layout{display:grid; grid-template-columns:220px 1fr; gap:16px; align-items:flex-start;}
       .layout .content{min-width:0;}
