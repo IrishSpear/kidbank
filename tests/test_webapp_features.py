@@ -1,7 +1,7 @@
 import json
 import sys
 import types
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
 import pytest
 try:  # pragma: no cover - allow running without FastAPI installed
@@ -16,6 +16,7 @@ dotenv_stub.load_dotenv = lambda: None  # type: ignore[attr-defined]
 sys.modules.setdefault("dotenv", dotenv_stub)
 
 from kidbank.webapp import (  # noqa: E402
+    apply_chore_penalties,
     CHORE_STATUS_PENDING_MARKETPLACE,
     DAD_PIN,
     GLOBAL_CHORE_KID_ID,
@@ -704,3 +705,177 @@ def test_kid_lesson_quiz_awards_bonus_once() -> None:
         ).all()
     assert child_after is not None and child_after.balance_cents == 150
     assert len(attempts_after) == 2
+
+
+def test_apply_chore_penalties_charges_for_missed_daily_chore() -> None:
+    with Session(engine) as session:
+        child = Child(kid_id="casey", name="Casey", balance_cents=500, kid_pin="1111")
+        session.add(child)
+        session.commit()
+        session.refresh(child)
+        chore = Chore(
+            kid_id=child.kid_id,
+            name="Dishes",
+            type="daily",
+            award_cents=100,
+            penalty_cents=200,
+            created_at=datetime(2024, 1, 1, 8, 0),
+        )
+        session.add(chore)
+        session.commit()
+        session.refresh(chore)
+        kid_id = child.kid_id
+        chore_id = chore.id
+
+    apply_chore_penalties(moment=datetime(2024, 1, 2, 1, 0))
+
+    with Session(engine) as session:
+        updated_child = session.exec(select(Child).where(Child.kid_id == kid_id)).first()
+        assert updated_child is not None
+        assert updated_child.balance_cents == 300
+        reason = f"chore_penalty_missed:{chore_id}:2024-01-01"
+        events = session.exec(select(Event).where(Event.child_id == kid_id)).all()
+        assert any(evt.reason == reason for evt in events)
+        refreshed = session.get(Chore, chore_id)
+        assert refreshed is not None
+        assert refreshed.penalty_last_date == date(2024, 1, 1)
+
+
+def test_apply_chore_penalties_ignores_submitted_chore() -> None:
+    with Session(engine) as session:
+        child = Child(kid_id="blake", name="Blake", balance_cents=400, kid_pin="2222")
+        session.add(child)
+        session.commit()
+        session.refresh(child)
+        chore = Chore(
+            kid_id=child.kid_id,
+            name="Laundry",
+            type="daily",
+            award_cents=100,
+            penalty_cents=200,
+            created_at=datetime(2024, 1, 1, 8, 0),
+        )
+        session.add(chore)
+        session.commit()
+        session.refresh(chore)
+        instance = ChoreInstance(
+            chore_id=chore.id,
+            period_key="2024-01-01",
+            status="pending",
+            completed_at=datetime(2024, 1, 1, 21, 0),
+        )
+        session.add(instance)
+        session.commit()
+        kid_id = child.kid_id
+        chore_id = chore.id
+
+    apply_chore_penalties(moment=datetime(2024, 1, 2, 9, 0))
+
+    with Session(engine) as session:
+        updated_child = session.exec(select(Child).where(Child.kid_id == kid_id)).first()
+        assert updated_child is not None
+        assert updated_child.balance_cents == 400
+        reason = f"chore_penalty_missed:{chore_id}:2024-01-01"
+        penalty_events = session.exec(
+            select(Event).where(Event.child_id == kid_id, Event.reason == reason)
+        ).all()
+        assert penalty_events == []
+        refreshed = session.get(Chore, chore_id)
+        assert refreshed is not None
+        assert refreshed.penalty_last_date == date(2024, 1, 1)
+
+
+def test_apply_chore_penalties_catches_multiple_days_and_is_idempotent() -> None:
+    with Session(engine) as session:
+        child = Child(kid_id="jules", name="Jules", balance_cents=1_000, kid_pin="3333")
+        session.add(child)
+        session.commit()
+        session.refresh(child)
+        chore = Chore(
+            kid_id=child.kid_id,
+            name="Room",
+            type="daily",
+            award_cents=150,
+            penalty_cents=150,
+            created_at=datetime(2024, 1, 1, 8, 0),
+        )
+        session.add(chore)
+        session.commit()
+        session.refresh(chore)
+        kid_id = child.kid_id
+        chore_id = chore.id
+
+    apply_chore_penalties(moment=datetime(2024, 1, 4, 8, 0))
+    apply_chore_penalties(moment=datetime(2024, 1, 4, 23, 0))
+
+    with Session(engine) as session:
+        updated_child = session.exec(select(Child).where(Child.kid_id == kid_id)).first()
+        assert updated_child is not None
+        # Missed January 1st, 2nd, and 3rd
+        assert updated_child.balance_cents == 550
+        reasons = {
+            f"chore_penalty_missed:{chore_id}:2024-01-01",
+            f"chore_penalty_missed:{chore_id}:2024-01-02",
+            f"chore_penalty_missed:{chore_id}:2024-01-03",
+        }
+        logged = session.exec(select(Event).where(Event.child_id == kid_id)).all()
+        assert reasons.issubset({evt.reason for evt in logged})
+        assert len([evt for evt in logged if evt.reason in reasons]) == 3
+        refreshed = session.get(Chore, chore_id)
+        assert refreshed is not None
+        assert refreshed.penalty_last_date == date(2024, 1, 3)
+
+
+def test_serialize_specific_month_days_filters_invalid_tokens() -> None:
+    from kidbank.webapp.application import serialize_specific_month_days
+
+    assert serialize_specific_month_days("15, 1, 0, 32, 5") == "1,5,15"
+    assert serialize_specific_month_days("2/10") == "2,10"
+    assert serialize_specific_month_days("   ") is None
+
+
+def test_one_time_special_chore_deactivates_after_payout() -> None:
+    client = TestClient(app)
+    with Session(engine) as session:
+        child = Child(kid_id="solo", name="Solo", balance_cents=0, kid_pin="0000")
+        session.add(child)
+        session.commit()
+        session.refresh(child)
+        chore = Chore(
+            kid_id=child.kid_id,
+            name="Build volcano",
+            type="special",
+            award_cents=700,
+        )
+        session.add(chore)
+        session.commit()
+        session.refresh(chore)
+        instance = ChoreInstance(
+            chore_id=chore.id,
+            period_key="SPECIAL",
+            status="pending",
+            completed_at=datetime.utcnow(),
+        )
+        session.add(instance)
+        session.commit()
+        session.refresh(instance)
+        instance_id = instance.id
+        chore_id = chore.id
+
+    login = client.post("/admin/login", data={"pin": DAD_PIN}, follow_redirects=False)
+    assert login.status_code == 302
+    payout = client.post(
+        "/admin/chore_payout",
+        data={"instance_id": instance_id, "redirect": "/admin?section=payouts"},
+        follow_redirects=False,
+    )
+    assert payout.status_code == 302
+    assert payout.headers["location"] == "/admin?section=payouts"
+
+    with Session(engine) as session:
+        updated_chore = session.get(Chore, chore_id)
+        assert updated_chore is not None
+        assert updated_chore.active is False
+        refreshed_instance = session.get(ChoreInstance, instance_id)
+        assert refreshed_instance is not None
+        assert refreshed_instance.status == "paid"

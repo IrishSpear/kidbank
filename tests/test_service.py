@@ -318,3 +318,182 @@ def test_marketplace_rejection_refunds_offer() -> None:
     closed = bank.marketplace_listings(include_closed=True)
     assert closed[0].status is ChoreListingStatus.REJECTED
 
+
+def test_missed_chore_penalty_withdraws_balance() -> None:
+    bank = KidBank()
+    bank.create_account("Ava", starting_balance=Decimal("10.00"))
+    chore = bank.schedule_chore(
+        "Ava",
+        name="Dishes",
+        value=Decimal("2.00"),
+        penalty_on_miss=True,
+    )
+
+    first_day = datetime(2024, 1, 1, 8, 0)
+    next_day = datetime(2024, 1, 2, 8, 0)
+
+    chore.created_at = first_day - timedelta(hours=1)
+
+    bank.auto_republish_chores(at=first_day)
+    bank.auto_republish_chores(at=next_day)
+
+    account = bank.get_account("Ava")
+    assert account.balance == Decimal("8.00")
+    penalty_tx = account.transactions[-1]
+    assert penalty_tx.description == "Missed chore penalty: Dishes"
+    assert penalty_tx.category is EventCategory.PENALTY
+    assert penalty_tx.amount == Decimal("2.00")
+
+
+def test_missed_chore_penalty_waits_until_midnight() -> None:
+    bank = KidBank()
+    bank.create_account("Ava", starting_balance=Decimal("5.00"))
+    chore = bank.schedule_chore(
+        "Ava",
+        name="Laundry",
+        value=Decimal("1.00"),
+        penalty_on_miss=True,
+    )
+
+    first_day = datetime(2024, 1, 1, 9, 0)
+    before_midnight = datetime(2024, 1, 1, 23, 59)
+    after_midnight = datetime(2024, 1, 2, 0, 1)
+
+    chore.created_at = first_day - timedelta(hours=1)
+
+    bank.auto_republish_chores(at=first_day)
+    bank.auto_republish_chores(at=before_midnight)
+    assert bank.get_account("Ava").balance == Decimal("5.00")
+
+    bank.auto_republish_chores(at=after_midnight)
+
+    account = bank.get_account("Ava")
+    assert account.balance == Decimal("4.00")
+    penalty_tx = account.transactions[-1]
+    assert penalty_tx.description == "Missed chore penalty: Laundry"
+    assert penalty_tx.amount == Decimal("1.00")
+
+
+def test_missed_chore_penalty_accumulates_each_day() -> None:
+    bank = KidBank()
+    bank.create_account("Ava", starting_balance=Decimal("10.00"))
+    chore = bank.schedule_chore(
+        "Ava",
+        name="Room",
+        value=Decimal("1.50"),
+        penalty_on_miss=True,
+    )
+
+    first_day = datetime(2024, 1, 1, 8, 0)
+    fourth_day = datetime(2024, 1, 4, 8, 0)
+
+    chore.created_at = first_day - timedelta(hours=1)
+
+    bank.auto_republish_chores(at=first_day)
+    bank.auto_republish_chores(at=fourth_day)
+
+    account = bank.get_account("Ava")
+    # Missed January 1st, 2nd, and 3rd for three penalties total.
+    assert account.balance == Decimal("5.50")
+    penalty_tx = account.transactions[-1]
+    assert penalty_tx.description == "Missed chore penalty: Room"
+    assert penalty_tx.amount == Decimal("4.50")
+
+
+def test_missed_chore_penalty_handles_time_jump() -> None:
+    bank = KidBank()
+    bank.create_account("Ava", starting_balance=Decimal("6.00"))
+    chore = bank.schedule_chore(
+        "Ava",
+        name="Tidy",
+        value=Decimal("1.00"),
+        penalty_on_miss=True,
+    )
+
+    # Anchor the creation time so the chore clearly exists before the window we evaluate.
+    chore.created_at = datetime(2024, 1, 1, 8, 0)
+
+    # Jump straight to January 4th without running the job for the earlier days.
+    bank.auto_republish_chores(at=datetime(2024, 1, 4, 9, 0))
+
+    account = bank.get_account("Ava")
+    # Missed January 1st, 2nd, and 3rd despite the job only running once.
+    assert account.balance == Decimal("3.00")
+    penalty_tx = account.transactions[-1]
+    assert penalty_tx.description == "Missed chore penalty: Tidy"
+    assert penalty_tx.amount == Decimal("3.00")
+
+    # A chore created later should not receive retroactive penalties.
+    later_chore = bank.schedule_chore(
+        "Ava",
+        name="Desk",
+        value=Decimal("1.00"),
+        penalty_on_miss=True,
+    )
+    later_chore.created_at = datetime(2024, 1, 4, 12, 0)
+
+    # Run again later the same day—no additional deductions because the chore is too new.
+    bank.auto_republish_chores(at=datetime(2024, 1, 4, 23, 0))
+    account = bank.get_account("Ava")
+    assert account.balance == Decimal("3.00")
+
+
+def test_missed_chore_penalty_respects_time_settings() -> None:
+    current_time = [datetime(2024, 1, 1, 8, 0)]
+
+    def provider() -> datetime:
+        return current_time[0]
+
+    bank = KidBank(time_provider=provider)
+    bank.create_account("Ava", starting_balance=Decimal("5.00"))
+    chore = bank.schedule_chore(
+        "Ava",
+        name="Tidy",
+        value=Decimal("1.00"),
+        penalty_on_miss=True,
+    )
+
+    chore.created_at = current_time[0] - timedelta(hours=1)
+
+    bank.auto_republish_chores()
+    account = bank.get_account("Ava")
+    assert account.balance == Decimal("5.00")
+
+    current_time[0] = datetime(2024, 1, 2, 8, 0)
+    bank.auto_republish_chores()
+
+    account = bank.get_account("Ava")
+    assert account.balance == Decimal("4.00")
+    penalty_tx = account.transactions[-1]
+    assert penalty_tx.description == "Missed chore penalty: Tidy"
+    assert penalty_tx.amount == Decimal("1.00")
+
+
+def test_missed_chore_penalty_does_not_repeat_processed_days() -> None:
+    bank = KidBank()
+    bank.create_account("Ava", starting_balance=Decimal("10.00"))
+    chore = bank.schedule_chore(
+        "Ava",
+        name="Dust",
+        value=Decimal("2.00"),
+        penalty_on_miss=True,
+    )
+
+    chore.created_at = datetime(2024, 1, 1, 7, 0)
+    chore.pending_since = datetime(2024, 1, 1, 0, 0)
+
+    first_run = datetime(2024, 1, 2, 8, 0)
+    bank.auto_republish_chores(at=first_run)
+
+    account = bank.get_account("Ava")
+    assert account.balance == Decimal("8.00")
+
+    chore.last_missed = None
+    chore.pending_since = datetime(2024, 1, 1, 0, 0)
+
+    bank.auto_republish_chores(at=datetime(2024, 1, 2, 20, 0))
+    assert account.balance == Decimal("8.00")
+
+    bank.auto_republish_chores(at=datetime(2024, 1, 3, 8, 0))
+    assert account.balance == Decimal("6.00")
+

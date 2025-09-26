@@ -80,9 +80,15 @@ class KidBank:
         "_default_soft_limit",
         "_transfer_requests",
         "_marketplace",
+        "_time_provider",
     )
 
-    def __init__(self, *, soft_limit: AmountLike = Decimal("20")) -> None:
+    def __init__(
+        self,
+        *,
+        soft_limit: AmountLike = Decimal("20"),
+        time_provider: Callable[[], datetime] | None = None,
+    ) -> None:
         self._accounts: Dict[str, Account] = {}
         self._chores: Dict[str, ChoreBoard] = {}
         self._global_chores: Dict[str, GlobalChore] = {}
@@ -121,6 +127,10 @@ class KidBank:
         self._default_soft_limit = to_decimal(soft_limit)
         self._transfer_requests: Dict[str, TransferRequest] = {}
         self._marketplace = ChoreMarketplace()
+        self._time_provider = time_provider or datetime.utcnow
+
+    def _now(self) -> datetime:
+        return self._time_provider()
 
     # ------------------------------------------------------------------
     # Core account operations
@@ -268,7 +278,7 @@ class KidBank:
         if responder != request.sender:
             raise PermissionError("Only the requested sender may respond.")
         if approve:
-            request.approve(responder)
+            request.approve(responder, when=self._now())
             self.transfer(
                 request.sender,
                 request.recipient,
@@ -278,7 +288,7 @@ class KidBank:
             )
             self._audit_log.record(responder, "approve_transfer_request", request_id)
         else:
-            request.decline(responder)
+            request.decline(responder, when=self._now())
             self._audit_log.record(responder, "decline_transfer_request", request_id)
         return request
 
@@ -356,6 +366,8 @@ class KidBank:
         before: Optional[Tuple[int, int]] = None,
         requires_proof: bool = False,
         proof_type: str | None = None,
+        penalty_on_miss: bool = False,
+        penalty_amount: AmountLike | None = None,
     ) -> Chore:
         board = self._chores[child_name]
         if dates is not None:
@@ -382,13 +394,22 @@ class KidBank:
         elif after or before:
             start = None
             end = None
+            reference = self._now()
             if isinstance(after, tuple):
-                start = datetime.utcnow().replace(hour=after[0], minute=after[1], second=0, microsecond=0).time()
+                start = reference.replace(
+                    hour=after[0], minute=after[1], second=0, microsecond=0
+                ).time()
             if isinstance(before, tuple):
-                end = datetime.utcnow().replace(hour=before[0], minute=before[1], second=0, microsecond=0).time()
+                end = reference.replace(
+                    hour=before[0], minute=before[1], second=0, microsecond=0
+                ).time()
             window = TimeWindow(start=start, end=end)
         else:
             window = None
+        penalty_value = None
+        if penalty_on_miss:
+            penalty_source = penalty_amount if penalty_amount is not None else value
+            penalty_value = to_decimal(penalty_source)
         chore = Chore(
             name=name,
             value=to_decimal(value),
@@ -399,7 +420,9 @@ class KidBank:
             ),
             requires_proof=requires_proof,
             proof_type=proof_type,
+            penalty_value=penalty_value,
         )
+        chore.created_at = self._now()
         board.add_chore(chore)
         self._audit_log.record("guardian", "add_chore", f"{child_name}:{name}")
         self._logger.log("chore_created", child=child_name, chore=name, value=float(chore.value))
@@ -665,7 +688,7 @@ class KidBank:
         award_value = completion.awarded_value
         offer_component = max(final_total - award_value, Decimal("0.00"))
         offer_delta = offer_component - listing.offer
-        resolution_time = datetime.utcnow()
+        resolution_time = self._now()
         if offer_delta > Decimal("0.00"):
             # Withdraw additional funds from the owner if the payout exceeds the escrowed offer.
             self.withdraw(
@@ -737,7 +760,7 @@ class KidBank:
         listing = self._marketplace.listing(listing_id)
         if listing.status is not ChoreListingStatus.SUBMITTED:
             raise ValueError("Marketplace submission is not awaiting approval.")
-        resolution_time = datetime.utcnow()
+        resolution_time = self._now()
         if listing.offer > Decimal("0.00"):
             self.deposit(
                 listing.owner,
@@ -763,8 +786,39 @@ class KidBank:
 
     def auto_republish_chores(self, *, at: Optional[datetime] = None) -> Dict[str, Sequence[str]]:
         republished: Dict[str, Sequence[str]] = {}
+        moment = at or self._now()
         for child, board in self._chores.items():
-            refreshed = board.auto_republish(at=at)
+            penalties = board.missed_penalties(at=moment)
+            for chore, missed_days in penalties:
+                penalty_value = chore.penalty_value
+                if penalty_value is None:
+                    continue
+                total_penalty = (penalty_value * missed_days).quantize(Decimal("0.01"))
+                if total_penalty <= Decimal("0.00"):
+                    continue
+                account = self.get_account(child)
+                deduction = min(total_penalty, account.balance)
+                if deduction <= Decimal("0.00"):
+                    continue
+                transaction = self.withdraw(
+                    child,
+                    deduction,
+                    f"Missed chore penalty: {chore.name}",
+                    category=EventCategory.PENALTY,
+                    metadata={
+                        "chore": chore.name,
+                        "missed_days": str(missed_days),
+                        "penalty_expected": str(total_penalty),
+                    },
+                )
+                self._logger.log(
+                    "chore_missed_penalty",
+                    child=child,
+                    chore=chore.name,
+                    penalty=float(transaction.amount),
+                    missed_days=missed_days,
+                )
+            refreshed = board.auto_republish(at=moment)
             if refreshed:
                 republished[child] = refreshed
         if republished:
@@ -778,8 +832,9 @@ class KidBank:
         at: Optional[datetime] = None,
     ) -> Sequence[Notification]:
         alerts: list[Notification] = []
+        moment = at or self._now()
         for child, board in self._chores.items():
-            overdue = board.pending_overdue(hours, at=at)
+            overdue = board.pending_overdue(hours, at=moment)
             if not overdue:
                 continue
             contact = self._parent_contacts.get(child, {})
@@ -921,7 +976,7 @@ class KidBank:
                 description=description,
                 created_by=requested_by,
                 status=PayoutStatus.APPROVED,
-                resolved_at=datetime.utcnow(),
+                resolved_at=self._now(),
                 resolved_by="system",
             )
         request = PayoutRequest(
@@ -938,7 +993,7 @@ class KidBank:
 
     def approve_payout(self, request_id: str, *, approver: str) -> PayoutRequest:
         request = self._pending_payouts[request_id]
-        request.approve(approver)
+        request.approve(approver, when=self._now())
         self.withdraw(
             request.child_name,
             request.amount,
@@ -952,7 +1007,7 @@ class KidBank:
 
     def reject_payout(self, request_id: str, *, approver: str) -> PayoutRequest:
         request = self._pending_payouts[request_id]
-        request.reject(approver)
+        request.reject(approver, when=self._now())
         self._audit_log.record(approver, "reject_payout", request.child_name)
         self._pending_payouts.pop(request_id, None)
         return request

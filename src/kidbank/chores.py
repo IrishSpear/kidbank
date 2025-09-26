@@ -67,6 +67,15 @@ class ChoreSchedule:
             due_today = True
         return due_today and (self.window is None or self.window.includes(moment))
 
+    def is_due_on_date(self, target: date) -> bool:
+        """Return whether the schedule expects the chore on ``target``."""
+
+        if self.specific_dates is not None:
+            return target in self.specific_dates
+        if self.weekdays:
+            return Weekday(target.weekday()) in self.weekdays
+        return True
+
     @classmethod
     def daily(cls) -> "ChoreSchedule":
         return cls(weekdays=frozenset(Weekday), window=None)
@@ -104,11 +113,20 @@ class Chore:
     last_completed: Optional[datetime] = None
     streak: int = 0
     history: List[ChoreCompletion] = field(default_factory=list)
+    penalty_value: Decimal | None = None
+    last_missed: date | None = None
+    penalty_last_date: date | None = None
+    created_at: datetime = field(default_factory=datetime.utcnow)
 
     def __post_init__(self) -> None:
         if self.requires_proof and not self.proof_type:
             raise ValueError("Proof type must be provided for special chores.")
         self.value = Decimal(self.value).quantize(Decimal("0.01"))
+        if self.penalty_value is not None:
+            penalty = Decimal(self.penalty_value)
+            if penalty <= Decimal("0"):
+                raise ValueError("Penalty value must be positive.")
+            object.__setattr__(self, "penalty_value", penalty.quantize(Decimal("0.01")))
 
     def multiplier(self) -> Decimal:
         """Return the multiplier associated with the current streak."""
@@ -161,6 +179,7 @@ class Chore:
         self.history.append(completion)
         self.last_completed = moment
         self.pending_since = None
+        self.last_missed = None
         return completion
 
     def advance_day(self, *, at: Optional[datetime] = None) -> bool:
@@ -178,6 +197,7 @@ class Chore:
             # reset pending flag if outside schedule
             if self.pending_since and self.pending_since.date() < moment.date():
                 self.pending_since = None
+                self.last_missed = None
         return False
 
     def pending_for_hours(self, hours: int, *, at: Optional[datetime] = None) -> bool:
@@ -185,6 +205,60 @@ class Chore:
             return False
         moment = at or datetime.utcnow()
         return moment - self.pending_since >= timedelta(hours=hours)
+
+    def collect_missed_penalties(self, *, at: Optional[datetime] = None) -> int:
+        """Return the number of fully elapsed days to penalize."""
+
+        if self.penalty_value is None:
+            return 0
+
+        moment = at or datetime.utcnow()
+        evaluation_day = (moment - timedelta(days=1)).date()
+        created_day = self.created_at.date()
+        if evaluation_day < created_day:
+            return 0
+
+        pending_day = self.pending_since.date() if self.pending_since else None
+
+        anchor_candidates: list[date] = [created_day - timedelta(days=1)]
+        if pending_day is not None:
+            anchor_candidates.append(pending_day - timedelta(days=1))
+        if self.last_completed is not None:
+            anchor_candidates.append(self.last_completed.date())
+        if self.last_missed is not None:
+            anchor_candidates.append(self.last_missed)
+        if self.penalty_last_date is not None:
+            anchor_candidates.append(self.penalty_last_date)
+
+        anchor_day = max(anchor_candidates)
+        if evaluation_day <= anchor_day:
+            if self.penalty_last_date is None or evaluation_day > self.penalty_last_date:
+                self.penalty_last_date = evaluation_day
+            return 0
+
+        start_day = anchor_day + timedelta(days=1)
+
+        missed_days = 0
+        first_missed_day: date | None = None
+        current_day = start_day
+        while current_day <= evaluation_day:
+            if self.schedule.is_due_on_date(current_day):
+                missed_days += 1
+                if first_missed_day is None:
+                    first_missed_day = current_day
+            current_day += timedelta(days=1)
+
+        self.penalty_last_date = evaluation_day
+
+        if missed_days == 0:
+            return 0
+
+        if first_missed_day is not None:
+            if not self.pending_since or self.pending_since.date() > first_missed_day:
+                self.pending_since = datetime.combine(first_missed_day, time())
+
+        self.last_missed = evaluation_day
+        return missed_days
 
 
 @dataclass(slots=True)
@@ -556,6 +630,15 @@ class ChoreBoard:
             if chore.advance_day(at=moment):
                 republished.append(chore.name)
         return tuple(republished)
+
+    def missed_penalties(self, *, at: Optional[datetime] = None) -> Sequence[tuple[Chore, int]]:
+        moment = at or datetime.utcnow()
+        penalties: List[tuple[Chore, int]] = []
+        for chore in self._chores.values():
+            missed = chore.collect_missed_penalties(at=moment)
+            if missed:
+                penalties.append((chore, missed))
+        return tuple(penalties)
 
     def pending(self, *, at: Optional[datetime] = None) -> Sequence[Chore]:
         moment = at or datetime.utcnow()

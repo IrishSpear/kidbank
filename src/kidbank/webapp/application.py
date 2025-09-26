@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal, ROUND_HALF_UP
 from datetime import date, datetime, timedelta
 from html import escape as html_escape
-from typing import Any, Callable, Dict, Iterable, List, Literal, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Literal, Mapping, Optional, Sequence, Set, Tuple
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request as URLRequest, urlopen
@@ -78,6 +78,144 @@ def now_local() -> datetime:
     """Return naive local time using the configured provider."""
 
     return _time_provider()
+
+
+def _penalty_event_reason(chore_id: int, target_day: date) -> str:
+    return f"chore_penalty_missed:{chore_id}:{target_day.isoformat()}"
+
+
+_PENALTY_REASON_PATTERN = re.compile(r"^chore_penalty_missed:(\d+):(\d{4}-\d{2}-\d{2})$")
+
+
+def format_event_reason(
+    event: Event, chore_lookup: Optional[Mapping[int, Chore]] = None
+) -> str:
+    """Return a human-friendly description for an event reason."""
+
+    raw_reason = event.reason or ""
+    match = _PENALTY_REASON_PATTERN.match(raw_reason)
+    if match:
+        chore_id = int(match.group(1))
+        day_iso = match.group(2)
+        chore_name: Optional[str] = None
+        if chore_lookup:
+            chore = chore_lookup.get(chore_id)
+            if chore:
+                chore_name = chore.name
+        chore_label = chore_name or f"chore #{chore_id}"
+        try:
+            day_value = date.fromisoformat(day_iso)
+            day_label = day_value.strftime("%b %d, %Y")
+        except ValueError:
+            day_label = day_iso
+        return f"Missed chore penalty for {chore_label} on {day_label}"
+    return raw_reason
+
+
+def _chore_due_on_day(chore: Chore, day: date) -> bool:
+    if not chore.active:
+        return False
+    created_day = (chore.created_at or datetime.utcnow()).date()
+    if day < created_day:
+        return False
+    return is_chore_in_window(chore, day)
+
+
+def _chore_submission_before_deadline(
+    session: Session,
+    chore: Chore,
+    day: date,
+    deadline: datetime,
+) -> bool:
+    chore_type = normalize_chore_type(chore.type)
+    if chore_type == "special" or chore.id is None:
+        return False
+    period_moment = datetime.combine(day, datetime.min.time())
+    period_key = period_key_for(chore_type, period_moment)
+    query = select(ChoreInstance).where(ChoreInstance.chore_id == chore.id)
+    query = query.where(ChoreInstance.period_key == period_key)
+    instance = session.exec(query.order_by(desc(ChoreInstance.id))).first()
+    if not instance:
+        return False
+    if instance.status not in {"pending", "paid"}:
+        return False
+    if instance.completed_at and instance.completed_at > deadline:
+        return False
+    return True
+
+
+def apply_chore_penalties(moment: Optional[datetime] = None) -> None:
+    """Assess missed-chore penalties for all chores with an active penalty."""
+
+    evaluation_time = moment or now_local()
+    evaluation_day = evaluation_time.date() - timedelta(days=1)
+    with Session(engine) as session:
+        chores = session.exec(
+            select(Chore).where(Chore.penalty_cents > 0, Chore.active == True)
+        ).all()  # noqa: E712
+        if not chores:
+            return
+        child_cache: Dict[str, Child] = {}
+        for chore in chores:
+            if chore.kid_id == GLOBAL_CHORE_KID_ID:
+                continue
+            child = child_cache.get(chore.kid_id)
+            if child is None:
+                child = session.exec(
+                    select(Child).where(Child.kid_id == chore.kid_id)
+                ).first()
+                if child is None:
+                    continue
+                child_cache[chore.kid_id] = child
+            created_day = (chore.created_at or datetime.utcnow()).date()
+            first_day = max(
+                created_day,
+                chore.start_date or created_day,
+            )
+            if evaluation_day < first_day:
+                continue
+            anchor = first_day - timedelta(days=1)
+            last_processed = chore.penalty_last_date or anchor
+            if last_processed < anchor:
+                last_processed = anchor
+            current_day = last_processed + timedelta(days=1)
+            while current_day <= evaluation_day:
+                if chore.end_date and current_day > chore.end_date:
+                    break
+                if not _chore_due_on_day(chore, current_day):
+                    current_day += timedelta(days=1)
+                    continue
+                reason = _penalty_event_reason(chore.id or 0, current_day)
+                already_logged = session.exec(
+                    select(Event)
+                    .where(Event.child_id == chore.kid_id)
+                    .where(Event.reason == reason)
+                ).first()
+                if already_logged:
+                    current_day += timedelta(days=1)
+                    continue
+                deadline = datetime.combine(
+                    current_day + timedelta(days=1), datetime.min.time()
+                )
+                if not _chore_submission_before_deadline(
+                    session, chore, current_day, deadline
+                ):
+                    deduction = min(chore.penalty_cents, child.balance_cents)
+                    if deduction > 0:
+                        child.balance_cents -= deduction
+                        child.updated_at = datetime.utcnow()
+                        session.add(
+                            Event(
+                                child_id=child.kid_id,
+                                change_cents=-deduction,
+                                reason=reason,
+                            )
+                        )
+                        session.add(child)
+                current_day += timedelta(days=1)
+            chore.penalty_last_date = evaluation_day
+            session.add(chore)
+        session.commit()
 
 
 
@@ -910,6 +1048,28 @@ def chore_specific_dates(chore: Chore) -> Set[date]:
     return _chore_specific_dates(chore.specific_dates)
 
 
+def _chore_specific_month_days(raw: Optional[str]) -> Set[int]:
+    days: Set[int] = set()
+    if not raw:
+        return days
+    for token in raw.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            value = int(token)
+        except ValueError:
+            continue
+        if 1 <= value <= 31:
+            days.add(value)
+    return days
+
+
+def chore_specific_month_days(chore: Chore) -> Set[int]:
+    raw = getattr(chore, "specific_month_days", None)
+    return _chore_specific_month_days(raw)
+
+
 WEEKDAY_OPTIONS: Tuple[Tuple[int, str], ...] = (
     (0, "Mon"),
     (1, "Tue"),
@@ -956,6 +1116,27 @@ def format_weekdays(days: Set[int]) -> str:
     return ", ".join(labels)
 
 
+def format_month_days(days: Set[int]) -> str:
+    return ", ".join(str(day) for day in sorted(days))
+
+
+def serialize_specific_month_days(raw: str) -> Optional[str]:
+    values: Set[int] = set()
+    for token in re.split(r"[\s,]+", (raw or "").replace("/", ",")):
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            value = int(token)
+        except ValueError:
+            continue
+        if 1 <= value <= 31:
+            values.add(value)
+    if not values:
+        return None
+    return ",".join(str(value) for value in sorted(values))
+
+
 def normalize_chore_type(value: str, *, is_global: bool = False) -> str:
     normalized = (value or "").lower()
     if normalized == "global":
@@ -990,6 +1171,26 @@ def is_chore_in_window(chore: Chore, today: date) -> bool:
         return False
     specific_dates = chore_specific_dates(chore)
     if specific_dates and today not in specific_dates:
+        return False
+    month_days = chore_specific_month_days(chore)
+    if month_days and today.day not in month_days:
+        return False
+    return True
+
+
+def is_one_time_special(chore: Chore) -> bool:
+    normalized_type = normalize_chore_type(
+        chore.type, is_global=chore.kid_id == GLOBAL_CHORE_KID_ID
+    )
+    if normalized_type != "special":
+        return False
+    if chore.start_date or chore.end_date:
+        return False
+    if chore_weekdays(chore):
+        return False
+    if chore_specific_dates(chore):
+        return False
+    if chore_specific_month_days(chore):
         return False
     return True
 
@@ -2853,6 +3054,7 @@ def kid_home(
     marketplace_open_listings: List[MarketplaceListing] = []
     marketplace_my_listings: List[MarketplaceListing] = []
     marketplace_claimed_by_me: List[MarketplaceListing] = []
+    penalty_chore_lookup: Dict[int, Chore] = {}
     try:
         others: List[Child] = []
         incoming_requests: List[MoneyRequest] = []
@@ -2874,6 +3076,11 @@ def kid_home(
                 .order_by(desc(Event.timestamp))
                 .limit(event_limit)
             ).all()
+            penalty_event_chore_ids: Set[int] = set()
+            for event in events:
+                match = _PENALTY_REASON_PATTERN.match(event.reason or "")
+                if match:
+                    penalty_event_chore_ids.add(int(match.group(1)))
             goals = session.exec(
                 select(Goal)
                 .where(Goal.kid_id == kid_id)
@@ -2948,6 +3155,14 @@ def kid_home(
                     chore_ref = session.get(Chore, claim.chore_id)
                     if chore_ref:
                         global_chore_lookup[chore_ref.id] = chore_ref
+            if penalty_event_chore_ids:
+                penalty_chore_lookup = {
+                    chore.id: chore
+                    for chore in session.exec(
+                        select(Chore).where(Chore.id.in_(penalty_event_chore_ids))
+                    ).all()
+                    if chore.id is not None
+                }
             for gchore in global_chores:
                 if not is_chore_in_window(gchore, today):
                     continue
@@ -2975,7 +3190,7 @@ def kid_home(
         event_rows = "".join(
             f"<tr><td data-label='When'>{event.timestamp.strftime('%Y-%m-%d %H:%M')}</td>"
             f"<td data-label='Δ Amount' class='right'>{'+' if event.change_cents>=0 else ''}{usd(event.change_cents)}</td>"
-            f"<td data-label='Reason'>{html_escape(event.reason)}</td></tr>"
+            f"<td data-label='Reason'>{html_escape(format_event_reason(event, penalty_chore_lookup))}</td></tr>"
             for event in filtered_events
         ) or "<tr><td colspan='3' class='muted'>No activity matched your filters.</td></tr>"
         filter_summary_html = ""
@@ -3046,6 +3261,9 @@ def kid_home(
                 schedule_bits.append(
                     "Dates: " + ", ".join(sorted(d.isoformat() for d in specific_dates))
                 )
+            month_days = chore_specific_month_days(chore)
+            if month_days:
+                schedule_bits.append(f"Month days: {format_month_days(month_days)}")
             schedule_line = (
                 f"<div class='muted chore-item__schedule'>{' • '.join(schedule_bits)}</div>"
                 if schedule_bits
@@ -3175,6 +3393,9 @@ def kid_home(
                     "Dates: "
                     + ", ".join(sorted(d.isoformat() for d in specific_dates))
                 )
+            month_days = chore_specific_month_days(chore)
+            if month_days:
+                schedule_bits.append(f"Month days: {format_month_days(month_days)}")
             schedule_line = (
                 f"<div class='muted' style='margin-top:4px;'>{' • '.join(schedule_bits)}</div>"
                 if schedule_bits
@@ -3664,7 +3885,9 @@ def kid_home(
             )
         biggest_event = max(recent_events, key=lambda ev: abs(ev.change_cents), default=None)
         if biggest_event:
-            biggest_reason = html_escape(biggest_event.reason or "Activity")
+            biggest_reason = html_escape(
+                format_event_reason(biggest_event, penalty_chore_lookup) or "Activity"
+            )
             biggest_amount = usd(biggest_event.change_cents)
             biggest_when = biggest_event.timestamp.strftime("%b %d")
             biggest_line = f"Top move: {biggest_amount} for {biggest_reason} on {biggest_when}."
@@ -3794,7 +4017,7 @@ def kid_home(
                 + " • "
                 + change_text
                 + " for "
-                + html_escape(last_event.reason)
+                + html_escape(format_event_reason(last_event, penalty_chore_lookup))
                 + "</li>"
             )
         if not highlight_items:
@@ -6250,6 +6473,7 @@ def admin_home(
     if (redirect := require_admin(request)) is not None:
         return redirect
     run_weekly_allowance_if_needed()
+    apply_chore_penalties()
     role = admin_role(request)
     selected_section = (section or "overview").strip().lower()
     selected_child = (child or "").strip()
@@ -6269,6 +6493,7 @@ def admin_home(
             else "background:#dcfce7; border-left:4px solid #86efac; color:#166534;"
         )
         notice_html = f"<div class='card' style='margin-bottom:12px; {style}'><div>{html_escape(notice_msg)}</div></div>"
+    penalty_chore_lookup: Dict[int, Chore] = {}
     with Session(engine) as session:
         kids = session.exec(select(Child).order_by(Child.name)).all()
         all_kids = list(kids)
@@ -6281,6 +6506,12 @@ def admin_home(
         analytics_events = session.exec(
             select(Event).order_by(desc(Event.timestamp)).limit(240)
         ).all()
+        penalty_event_chore_ids: Set[int] = set()
+        for collection in (events, analytics_events):
+            for event in collection:
+                match = _PENALTY_REASON_PATTERN.match(event.reason or "")
+                if match:
+                    penalty_event_chore_ids.add(int(match.group(1)))
         pending = session.exec(
             select(ChoreInstance, Chore, Child)
             .where(ChoreInstance.status == "pending")
@@ -6324,6 +6555,14 @@ def admin_home(
             entry["role"]: load_admin_privileges(session, entry["role"])
             for entry in parent_admins
         }
+        if penalty_event_chore_ids:
+            penalty_chore_lookup = {
+                chore.id: chore
+                for chore in session.exec(
+                    select(Chore).where(Chore.id.in_(penalty_event_chore_ids))
+                ).all()
+                if chore.id is not None
+            }
         approved_global_claims = session.exec(
             select(GlobalChoreClaim)
             .where(GlobalChoreClaim.status == GLOBAL_CHORE_STATUS_APPROVED)
@@ -7187,7 +7426,7 @@ def admin_home(
             + ("+" if event.change_cents >= 0 else "")
             + usd(event.change_cents)
             + "</td><td data-label='Reason'>"
-            + html_escape(event.reason)
+            + html_escape(format_event_reason(event, penalty_chore_lookup))
             + "</td></tr>"
         )
         for event in filtered_admin_events
@@ -7786,22 +8025,27 @@ def admin_home(
         f"<label>kid_id</label><select name='kid_id' required>{kid_options_html}<option value='{GLOBAL_CHORE_KID_ID}'>Global (Free-for-all)</option></select>"
         "<label>Name</label><input name='name' placeholder='Take out trash' required>"
         "<div class='grid' style='grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:8px;'>"
-        "<div><label>Type</label><select name='type'><option value='daily'>Daily</option><option value='weekly'>Weekly</option><option value='monthly'>Monthly</option><option value='special'>Special</option></select></div>"
+        "<div><label>Type</label><select name='type' id='chore-create-type' class='chore-type-select' data-schedule-root='chore-create-schedule'><option value='daily'>Daily</option><option value='weekly'>Weekly</option><option value='monthly'>Monthly</option><option value='special'>Special</option></select></div>"
         "<div><label>Award (dollars)</label><input name='award' type='text' data-money value='0.50'></div>"
+        "<div><label>Penalty if missed</label><div style='display:flex; align-items:center; gap:6px; margin-top:4px;'><label style='display:flex; align-items:center; gap:4px; font-weight:400;'><input type='checkbox' name='penalty_enabled' value='1'> Apply</label><input name='penalty_amount' type='text' data-money value='0.00' placeholder='penalty $'></div></div>"
         "<div><label>Max claimants (global)</label><input name='max_claimants' type='number' min='1' value='1'></div>"
         "</div>"
         "<div class='grid' style='grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:8px;'>"
         "<div><label>Start Date (optional)</label><input name='start_date' type='date'></div>"
         "<div><label>End Date (optional)</label><input name='end_date' type='date'></div>"
         "</div>"
-        "<div style='margin-top:6px;'><div class='muted' style='margin-bottom:4px;'>Weekdays (optional)</div><div>"
+        "<div id='chore-create-schedule'>"
+        "<div class='chore-schedule-selector chore-schedule-selector--weekly' data-schedule-group='weekly' style='margin-top:6px; display:none;'><div class='muted' style='margin-bottom:4px;'>Weekdays (optional)</div><div>"
         f"{weekday_selector}"
         "</div></div>"
-        "<label>Specific dates (comma separated)</label><input name='specific_dates' placeholder='YYYY-MM-DD,YYYY-MM-DD'>"
+        "<div class='chore-schedule-selector chore-schedule-selector--monthly' data-schedule-group='monthly' style='display:none;'><label>Specific days (comma separated)</label><input name='specific_month_days' placeholder='1,15'></div>"
+        "<div class='chore-schedule-selector chore-schedule-selector--special' data-schedule-group='special' style='display:none;'><label>Specific dates (comma separated)</label><input name='specific_dates' placeholder='YYYY-MM-DD,YYYY-MM-DD'></div>"
+        "</div>"
         "<label>Notes</label><input name='notes' placeholder='Any details'>"
         "<p class='muted'>Global chores appear for all kids under “Free-for-all”. Use max claimants to set how many kids can share the reward per period.</p>"
         "<button type='submit'>Add Chore</button>"
         "</form>"
+        "<script>(function(){function applySchedule(select){var rootId=select.getAttribute('data-schedule-root');if(!rootId){return;}var root=document.getElementById(rootId);if(!root){return;}var value=(select.value||'').toLowerCase();root.querySelectorAll('[data-schedule-group]').forEach(function(el){var group=el.getAttribute('data-schedule-group');var show=false;if(group==='weekly'){show=value==='weekly';}else if(group==='monthly'){show=value==='monthly';}else if(group==='special'){show=value==='special';}el.style.display=show?'':'none';});}var selects=document.querySelectorAll('.chore-type-select');selects.forEach(function(select){var handler=function(){applySchedule(select);};select.addEventListener('change',handler);handler();});})();</script>"
         "</div>"
     )
     admin_pref_controls = preference_controls_html(request)
@@ -7859,6 +8103,7 @@ def admin_home(
 def admin_kiosk(request: Request, kid_id: str = Query(...)):
     if (redirect := require_admin(request)) is not None:
         return redirect
+    penalty_chore_lookup: Dict[int, Chore] = {}
     with Session(engine) as session:
         child = session.exec(select(Child).where(Child.kid_id == kid_id)).first()
         if not child:
@@ -7870,10 +8115,21 @@ def admin_kiosk(request: Request, kid_id: str = Query(...)):
             .order_by(desc(Event.timestamp))
             .limit(10)
         ).all()
+        penalty_ids: Set[int] = set()
+        for event in events:
+            match = _PENALTY_REASON_PATTERN.match(event.reason or "")
+            if match:
+                penalty_ids.add(int(match.group(1)))
+        if penalty_ids:
+            penalty_chore_lookup = {
+                chore.id: chore
+                for chore in session.exec(select(Chore).where(Chore.id.in_(penalty_ids))).all()
+                if chore.id is not None
+            }
     event_rows = "".join(
         f"<tr><td data-label='When'>{event.timestamp.strftime('%b %d, %I:%M %p')}</td>"
         f"<td data-label='Δ Amount' class='right'>{'+' if event.change_cents>=0 else ''}{usd(event.change_cents)}</td>"
-        f"<td data-label='Reason'>{event.reason}</td></tr>"
+        f"<td data-label='Reason'>{html_escape(format_event_reason(event, penalty_chore_lookup))}</td></tr>"
         for event in events
     ) or "<tr><td>(no events)</td></tr>"
     chore_cards = "".join(
@@ -7989,22 +8245,28 @@ def admin_manage_chores(request: Request, kid_id: str = Query(...)):
             for day, label in WEEKDAY_OPTIONS
         )
         specific_value = html_escape(chore.specific_dates or "")
+        specific_month_value = html_escape(getattr(chore, "specific_month_days", "") or "")
         start_value = chore.start_date.isoformat() if chore.start_date else ""
         end_value = chore.end_date.isoformat() if chore.end_date else ""
         name_value = html_escape(chore.name)
         notes_value = html_escape(chore.notes or "")
+        is_global_chore = chore.kid_id == GLOBAL_CHORE_KID_ID
+        chore_type = normalize_chore_type(chore.type, is_global=is_global_chore)
+        weekly_style = "" if chore_type == "weekly" else "display:none;"
+        monthly_style = "" if chore_type == "monthly" else "display:none;"
+        special_style = "" if chore_type == "special" else "display:none;"
+        schedule_id = f"chore-schedule-{chore.id}"
         schedule_html = (
-            "<div class='chore-schedule'>"
+            f"<div class='chore-schedule' id='{schedule_id}'>"
             "<div class='chore-schedule__dates'>"
             f"<input name='start_date' type='date' value='{start_value}' form='{form_id}'>"
             f"<input name='end_date' type='date' value='{end_value}' form='{form_id}'>"
             "</div>"
-            f"<div class='chore-schedule__weekdays'>{weekday_controls}</div>"
-            f"<input name='specific_dates' placeholder='YYYY-MM-DD,YYYY-MM-DD' value='{specific_value}' form='{form_id}'>"
+            f"<div class='chore-schedule__weekdays chore-schedule-selector chore-schedule-selector--weekly' data-schedule-group='weekly' style='{weekly_style}'>{weekday_controls}</div>"
+            f"<div class='chore-schedule-selector chore-schedule-selector--monthly' data-schedule-group='monthly' style='{monthly_style}'><label>Specific days (comma separated)</label><input name='specific_month_days' placeholder='1,15' value='{specific_month_value}' form='{form_id}'></div>"
+            f"<div class='chore-schedule-selector chore-schedule-selector--special' data-schedule-group='special' style='{special_style}'><label>Specific dates (comma separated)</label><input name='specific_dates' placeholder='YYYY-MM-DD,YYYY-MM-DD' value='{specific_value}' form='{form_id}'></div>"
             "</div>"
         )
-        is_global_chore = chore.kid_id == GLOBAL_CHORE_KID_ID
-        chore_type = normalize_chore_type(chore.type, is_global=is_global_chore)
         if is_global_chore:
             type_options = ["daily", "weekly", "monthly"]
         else:
@@ -8013,6 +8275,9 @@ def admin_manage_chores(request: Request, kid_id: str = Query(...)):
             f"<option value='{opt}' {'selected' if chore_type == opt else ''}>{opt}</option>"
             for opt in type_options
         )
+        penalty_cents = getattr(chore, "penalty_cents", 0) or 0
+        penalty_checked = " checked" if penalty_cents > 0 else ""
+        penalty_value = dollars_value(penalty_cents)
         action_items = [f"<button type='submit' form='{form_id}'>Save</button>"]
         if not is_global_chore:
             action_items.append(
@@ -8039,8 +8304,9 @@ def admin_manage_chores(request: Request, kid_id: str = Query(...)):
             f"<td data-label='Name'><form id='{form_id}' method='post' action='/admin/chores/update'></form>"
             f"<input type='hidden' name='chore_id' value='{chore.id}' form='{form_id}'>"
             f"<input name='name' value='{name_value}' form='{form_id}'></td>"
-            f"<td data-label='Type'><select name='type' form='{form_id}'>{type_select}</select></td>"
+            f"<td data-label='Type'><select name='type' form='{form_id}' class='chore-type-select' data-schedule-root='{schedule_id}'>{type_select}</select></td>"
             f"<td data-label='Award ($)' class='right'><input name='award' type='text' data-money value='{dollars_value(chore.award_cents)}' form='{form_id}' class='chore-field--compact'></td>"
+            f"<td data-label='Penalty ($)' class='right'><div style='display:flex; align-items:center; justify-content:flex-end; gap:6px;'><label style='display:flex; align-items:center; gap:4px; font-weight:400;'><input type='checkbox' name='penalty_enabled' value='1'{penalty_checked} form='{form_id}'> Apply</label><input name='penalty_amount' type='text' data-money value='{penalty_value}' form='{form_id}' class='chore-field--compact'></div></td>"
             f"<td data-label='Max Spots'><input name='max_claimants' type='number' min='1' value='{max(1, chore.max_claimants)}' form='{form_id}' class='chore-field--compact'></td>"
             f"<td data-label='Schedule'>{schedule_html}</td>"
             f"<td data-label='Notes'><input name='notes' value='{notes_value}' form='{form_id}'></td>"
@@ -8048,7 +8314,7 @@ def admin_manage_chores(request: Request, kid_id: str = Query(...)):
             f"<td data-label='Actions' class='right'>{action_html}</td>"
             "</tr>"
         )
-    rows = "".join(rows_parts) or "<tr><td colspan='8' class='muted'>(no chores yet)</td></tr>"
+    rows = "".join(rows_parts) or "<tr><td colspan='9' class='muted'>(no chores yet)</td></tr>"
     if is_global:
         heading = "Manage Global Chores"
         badge = f"<span class='pill' style='margin-left:8px;'>{GLOBAL_CHORE_KID_ID}</span>"
@@ -8060,7 +8326,7 @@ def admin_manage_chores(request: Request, kid_id: str = Query(...)):
     chores_table = f"""
     <div class='card'>
       <table class='chore-table'>
-        <tr><th>Name</th><th>Type</th><th>Award ($)</th><th>Max Spots</th><th>Schedule</th><th>Notes</th><th>Status</th><th>Actions</th></tr>
+        <tr><th>Name</th><th>Type</th><th>Award ($)</th><th>Penalty ($)</th><th>Max Spots</th><th>Schedule</th><th>Notes</th><th>Status</th><th>Actions</th></tr>
         {rows}
       </table>
       {note_html}
@@ -8161,12 +8427,15 @@ def admin_chore_create(
     name: str = Form(...),
     type: str = Form(...),
     award: str = Form(...),
+    penalty_enabled: Optional[str] = Form(None),
+    penalty_amount: str = Form("0.00"),
     max_claimants: str = Form("1"),
     start_date: Optional[str] = Form(None),
     end_date: Optional[str] = Form(None),
     notes: str = Form(""),
     weekdays: List[str] = Form([]),
     specific_dates: str = Form(""),
+    specific_month_days: str = Form(""),
 ):
     if (
         redirect := require_admin_permission(
@@ -8175,6 +8444,9 @@ def admin_chore_create(
     ) is not None:
         return redirect
     award_c = to_cents_from_dollars_str(award, 0)
+    penalty_c = to_cents_from_dollars_str(penalty_amount, 0)
+    if not penalty_enabled or penalty_c <= 0:
+        penalty_c = 0
     try:
         max_claims_value = int((max_claimants or "1").strip())
     except ValueError:
@@ -8182,6 +8454,7 @@ def admin_chore_create(
     max_claims_value = max(1, max_claims_value)
     weekday_csv = serialize_weekday_selection(weekdays) if weekdays else None
     dates_csv = serialize_specific_dates(specific_dates) if specific_dates else None
+    month_days_csv = serialize_specific_month_days(specific_month_days)
     kid_value = (kid_id or "").strip()
     if kid_value and kid_value != GLOBAL_CHORE_KID_ID:
         if (
@@ -8191,6 +8464,12 @@ def admin_chore_create(
         ) is not None:
             return denied
     normalized_type = normalize_chore_type(type, is_global=kid_value == GLOBAL_CHORE_KID_ID)
+    if normalized_type != "weekly":
+        weekday_csv = None
+    if normalized_type != "special":
+        dates_csv = None
+    if normalized_type != "monthly":
+        month_days_csv = None
     kid_label = "Free-for-all" if kid_value == GLOBAL_CHORE_KID_ID else kid_value or "Unknown"
     with Session(engine) as session:
         if kid_value and kid_value != GLOBAL_CHORE_KID_ID:
@@ -8202,12 +8481,14 @@ def admin_chore_create(
             name=name.strip(),
             type=normalized_type,
             award_cents=award_c,
+            penalty_cents=penalty_c,
             notes=notes.strip() or None,
             start_date=date.fromisoformat(start_date) if start_date else None,
             end_date=date.fromisoformat(end_date) if end_date else None,
             max_claimants=max_claims_value,
             weekdays=weekday_csv,
             specific_dates=dates_csv,
+            specific_month_days=month_days_csv,
         )
         session.add(chore)
         session.commit()
@@ -8226,12 +8507,15 @@ def admin_chore_update(
     name: str = Form(...),
     type: str = Form(...),
     award: str = Form(...),
+    penalty_enabled: Optional[str] = Form(None),
+    penalty_amount: str = Form("0.00"),
     max_claimants: str = Form("1"),
     start_date: Optional[str] = Form(None),
     end_date: Optional[str] = Form(None),
     notes: str = Form(""),
     weekdays: List[str] = Form([]),
     specific_dates: str = Form(""),
+    specific_month_days: str = Form(""),
 ):
     if (
         redirect := require_admin_permission(
@@ -8240,6 +8524,9 @@ def admin_chore_update(
     ) is not None:
         return redirect
     award_c = to_cents_from_dollars_str(award, 0)
+    penalty_c = to_cents_from_dollars_str(penalty_amount, 0)
+    if not penalty_enabled or penalty_c <= 0:
+        penalty_c = 0
     try:
         max_claims_value = int((max_claimants or "1").strip())
     except ValueError:
@@ -8247,6 +8534,7 @@ def admin_chore_update(
     max_claims_value = max(1, max_claims_value)
     weekday_csv = serialize_weekday_selection(weekdays) if weekdays else None
     dates_csv = serialize_specific_dates(specific_dates) if specific_dates else None
+    month_days_csv = serialize_specific_month_days(specific_month_days)
     with Session(engine) as session:
         chore = session.get(Chore, chore_id)
         if not chore:
@@ -8259,16 +8547,24 @@ def admin_chore_update(
             ) is not None:
                 return denied
         normalized_type = normalize_chore_type(type, is_global=chore.kid_id == GLOBAL_CHORE_KID_ID)
+        if normalized_type != "weekly":
+            weekday_csv = None
+        if normalized_type != "special":
+            dates_csv = None
+        if normalized_type != "monthly":
+            month_days_csv = None
         target_kid = chore.kid_id
         chore.name = name.strip()
         chore.type = normalized_type
         chore.award_cents = award_c
+        chore.penalty_cents = penalty_c
         chore.notes = notes.strip() or None
         chore.start_date = date.fromisoformat(start_date) if start_date else None
         chore.end_date = date.fromisoformat(end_date) if end_date else None
         chore.max_claimants = max_claims_value
         chore.weekdays = weekday_csv
         chore.specific_dates = dates_csv
+        chore.specific_month_days = month_days_csv
         session.add(chore)
         session.commit()
     return RedirectResponse(f"/admin/chores?kid_id={target_kid}", status_code=302)
@@ -8592,6 +8888,7 @@ def admin_statement(request: Request, kid_id: str = Query(...)):
     if (redirect := require_admin(request)) is not None:
         return redirect
     cd_rates_bps = {code: DEFAULT_CD_RATE_BPS for code, _, _ in CD_TERM_OPTIONS}
+    penalty_chore_lookup: Dict[int, Chore] = {}
     with Session(engine) as session:
         child = session.exec(select(Child).where(Child.kid_id == kid_id)).first()
         if not child:
@@ -8602,6 +8899,17 @@ def admin_statement(request: Request, kid_id: str = Query(...)):
             .order_by(desc(Event.timestamp))
             .limit(50)
         ).all()
+        penalty_ids: Set[int] = set()
+        for event in events:
+            match = _PENALTY_REASON_PATTERN.match(event.reason or "")
+            if match:
+                penalty_ids.add(int(match.group(1)))
+        if penalty_ids:
+            penalty_chore_lookup = {
+                chore.id: chore
+                for chore in session.exec(select(Chore).where(Chore.id.in_(penalty_ids))).all()
+                if chore.id is not None
+            }
         goals = session.exec(select(Goal).where(Goal.kid_id == kid_id).order_by(desc(Goal.created_at))).all()
         certificates = session.exec(
             select(Certificate)
@@ -8651,7 +8959,7 @@ def admin_statement(request: Request, kid_id: str = Query(...)):
     activity_rows = "".join(
         f"<tr><td data-label='When'>{event.timestamp.strftime('%Y-%m-%d %H:%M')}</td>"
         f"<td data-label='Δ Amount' class='right'>{'+' if event.change_cents>=0 else ''}{usd(event.change_cents)}</td>"
-        f"<td data-label='Reason'>{event.reason}</td></tr>"
+        f"<td data-label='Reason'>{html_escape(format_event_reason(event, penalty_chore_lookup))}</td></tr>"
         for event in events
     ) or "<tr><td>(no events)</td></tr>"
     def fmt_signed(value: int) -> str:
@@ -9569,6 +9877,9 @@ def admin_chore_payout(
         instance.status = "paid"
         instance.paid_event_id = event.id
         session.add(instance)
+        if is_one_time_special(chore):
+            chore.active = False
+            session.add(chore)
         session.commit()
         child_name = child.name
         chore_name = chore.name
@@ -9931,7 +10242,8 @@ def admin_time_settings(
         offset_minutes = 0
     manual_value = (manual_datetime or "").strip()
     set_time_settings(mode, offset_minutes, manual_value)
-    return RedirectResponse("/admin", status_code=302)
+    set_admin_notice(request, "Updated time settings.", "success")
+    return RedirectResponse("/admin?section=time", status_code=303)
 
 
 @app.get("/admin/audit", response_class=HTMLResponse)
@@ -9992,5 +10304,6 @@ __all__ = [
     "filter_events",
     "ensure_default_learning_content",
     "load_admin_privileges",
+    "apply_chore_penalties",
 ]
 __all__.extend(name for name in _persistence.__all__ if name not in __all__)
