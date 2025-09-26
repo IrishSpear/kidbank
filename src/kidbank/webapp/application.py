@@ -31,8 +31,8 @@ from urllib.request import Request as URLRequest, urlopen
 
 from fastapi import FastAPI, Form, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse, JSONResponse, Response
-from sqlalchemy import inspect
-from sqlmodel import Session, desc, select, delete
+from sqlalchemy import delete, inspect
+from sqlmodel import Session, desc, select
 from starlette.middleware.sessions import SessionMiddleware
 
 from .config import (
