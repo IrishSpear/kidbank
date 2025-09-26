@@ -5790,7 +5790,7 @@ def _kid_invest_dashboard_inner(
         chart=CHART_VIEW_DETAIL,
     )
     chart_toggle_html = (
-        "<div class='chart-toggle'>Chart: ""
+        "<div class='chart-toggle'>Chart: "
         + f"<a href='{compact_url}' class='{'active' if chart_mode == CHART_VIEW_COMPACT else ''}'>Compact</a>"
         + f"<a href='{detail_url}' class='{'active' if chart_mode == CHART_VIEW_DETAIL else ''}'>Detailed</a>"
         + "</div>"
