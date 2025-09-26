@@ -26,13 +26,13 @@ from datetime import date, datetime, timedelta
 from html import escape as html_escape
 from typing import Any, Callable, Dict, Iterable, List, Literal, Mapping, Optional, Sequence, Set, Tuple
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote
+from urllib.parse import quote, urlencode, parse_qsl
 from urllib.request import Request as URLRequest, urlopen
 
 from fastapi import FastAPI, Form, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse, JSONResponse, Response
 from sqlalchemy import inspect
-from sqlmodel import Session, desc, select
+from sqlmodel import Session, desc, select, delete
 from starlette.middleware.sessions import SessionMiddleware
 
 from .config import (
@@ -457,6 +457,40 @@ def pop_kid_notice(request: Request) -> Tuple[Optional[str], str]:
     message = request.session.pop("kid_notice", None)
     kind = request.session.pop("kid_notice_kind", "info")
     return message, kind
+
+
+def _invest_base_config(base_path: str) -> Tuple[str, Dict[str, str]]:
+    base, _, query = base_path.partition("?")
+    base_url = base or "/kid/invest"
+    base_query = dict(parse_qsl(query, keep_blank_values=True)) if query else {}
+    return base_url, base_query
+
+
+def _invest_build_url(
+    base_url: str, base_query: Mapping[str, str], **params: Optional[str]
+) -> str:
+    query: Dict[str, str] = dict(base_query)
+    for key, value in params.items():
+        if value is None:
+            query.pop(key, None)
+        else:
+            query[key] = str(value)
+    query_string = urlencode(query)
+    return f"{base_url}?{query_string}" if query_string else base_url
+
+
+def _invest_hidden_inputs(base_query: Mapping[str, str]) -> str:
+    return "".join(
+        f"<input type='hidden' name='{html_escape(key)}' value='{html_escape(value)}'>"
+        for key, value in base_query.items()
+    )
+
+
+def _safe_invest_redirect(target: Optional[str], fallback: str) -> str:
+    candidate = (target or "").strip()
+    if candidate and candidate.startswith("/kid"):
+        return candidate
+    return fallback
 
 
 def set_admin_notice(request: Request, message: str, kind: str = "info") -> None:
@@ -2953,6 +2987,7 @@ def landing(request: Request) -> HTMLResponse:
         return RedirectResponse("/kid", status_code=302)
     remembered_kid = html_escape(request.cookies.get(REMEMBER_NAME_COOKIE, "") or "")
     kid_prefill_attr = f" value='{remembered_kid}'" if remembered_kid else ""
+    remember_checked = " checked" if remembered_kid else ""
     inner = """
     <div class='grid'>
       <div class='card'>
@@ -2960,7 +2995,7 @@ def landing(request: Request) -> HTMLResponse:
         <form method='post' action='/kid/login'>
           <label>kid_id</label><input name='kid_id' placeholder='e.g. alex01'""" + kid_prefill_attr + """ required>
           <label style='margin-top:8px;'>PIN</label><input name='kid_pin' placeholder='your PIN' required>
-          <label class='checkbox' style='margin-top:8px; display:flex; align-items:center; gap:6px;'><input type='checkbox' name='remember_me' value='1'> <span>Remember me</span></label>
+          <label class='checkbox' style='margin-top:8px; display:flex; align-items:center; gap:6px;'><input type='checkbox' name='remember_me' value='1'{remember_checked}> <span>Remember me</span></label>
           <button type='submit' style='margin-top:10px;'>View My Account</button>
         </form>
       </div>
@@ -3639,7 +3674,6 @@ def kid_home(
           </div>
         """
         investing_snapshot = _kid_investing_snapshot(kid_id)
-        investing_card = _safe_investing_card(kid_id, snapshot=investing_snapshot)
         notice_msg, notice_kind = pop_kid_notice(request)
         notice_html = ""
         if notice_msg:
@@ -3650,6 +3684,42 @@ def kid_home(
             notice_html = (
                 f"<div class='card' style='margin-top:12px; {notice_style}'><div>{notice_msg}</div></div>"
             )
+        invest_query_params = {key: request.query_params.get(key) for key in request.query_params}
+        embed_params = {"section": "investing"}
+        for key in ("symbol", "range", "lookup", "chart"):
+            value = invest_query_params.get(key)
+            if value:
+                embed_params[key] = value
+        invest_base_query = urlencode(embed_params)
+        invest_base_path = "/kid?" + invest_base_query if invest_base_query else "/kid?section=investing"
+        invest_symbol = invest_query_params.get("symbol")
+        invest_range = invest_query_params.get("range", DEFAULT_PRICE_RANGE)
+        invest_lookup = invest_query_params.get("lookup", "")
+        invest_chart_view = invest_query_params.get("chart", DEFAULT_CHART_VIEW)
+        try:
+            investing_section_html, _ = _kid_invest_dashboard_inner(
+                request,
+                kid_id,
+                symbol=invest_symbol,
+                range_code=invest_range,
+                lookup=invest_lookup,
+                chart_view=invest_chart_view,
+                base_path=invest_base_path,
+                include_back_link=False,
+                embed=True,
+                notice_message=notice_msg,
+                notice_kind=notice_kind,
+            )
+        except Exception:
+            investing_section_html = (
+                "<div class='card'>"
+                "<h3>Investing</h3>"
+                "<p class='muted'>Investing tools are unavailable right now. Try again soon.</p>"
+                "</div>"
+            )
+        admin_label_lookup = {
+            entry["role"]: entry["label"] for entry in all_parent_admins()
+        }
         def kid_name(identifier: str) -> str:
             person = kid_lookup.get(identifier)
             return person.name if person else identifier
@@ -4291,7 +4361,7 @@ def kid_home(
             ("goals", "Goals", goals_content),
             ("learning", "Learning Lab", learning_content),
             ("money", "Send/Request", money_content),
-            ("investing", "Investing", investing_card),
+            ("investing", "Investing", investing_section_html),
             ("activity", "Activity", activity_content),
             ("settings", "Settings", settings_content),
         ]
@@ -4302,7 +4372,10 @@ def kid_home(
             f"<a href='/kid?section={key}' class='{ 'active' if key == selected_section else ''}'>{html_escape(cfg['label'])}</a>"
             for key, cfg in sections_map.items()
         )
-        content_html = f"{notice_html}{sections_map[selected_section]['content']}"
+        if selected_section == "investing":
+            content_html = sections_map[selected_section]["content"]
+        else:
+            content_html = f"{notice_html}{sections_map[selected_section]['content']}"
         requests_badge = ""
         if incoming_count:
             requests_badge = (
@@ -4891,6 +4964,35 @@ def kid_checkoff(request: Request, chore_id: int = Form(...)):
             set_kid_notice(request, "That chore can't be completed today.", "error")
             return RedirectResponse("/kid?section=chores", status_code=302)
         chore_type = normalize_chore_type(chore.type)
+        if chore_type == "special" and not is_one_time_special(chore):
+            has_date_limits = bool(
+                chore.start_date
+                or chore.end_date
+                or chore_specific_dates(chore)
+            )
+            if has_date_limits:
+                recent_instances = session.exec(
+                    select(ChoreInstance)
+                    .where(ChoreInstance.chore_id == chore.id)
+                    .order_by(desc(ChoreInstance.id))
+                    .limit(20)
+                ).all()
+                already_completed = any(
+                    inst.completed_at
+                    and inst.completed_at.date() == today
+                    and inst.status
+                    in {"pending", "paid", CHORE_STATUS_PENDING_MARKETPLACE}
+                    for inst in recent_instances
+                )
+                if already_completed:
+                    set_kid_notice(
+                        request,
+                        "This special chore can only be completed once today.",
+                        "error",
+                    )
+                    return RedirectResponse(
+                        "/kid?section=chores", status_code=302
+                    )
         pk = "SPECIAL" if chore_type == "special" else period_key_for(chore_type, moment)
         query = select(ChoreInstance).where(ChoreInstance.chore_id == chore.id)
         if chore_type != "special":
@@ -5470,228 +5572,267 @@ def kid_goal_delete(request: Request, goal_id: int = Form(...)):
     return RedirectResponse("/kid?section=goals", status_code=302)
 
 
-@app.get("/kid/invest", response_class=HTMLResponse)
-def kid_invest_home(
+def _kid_invest_dashboard_inner(
     request: Request,
-    symbol: Optional[str] = Query(None),
-    range_code: str = Query(DEFAULT_PRICE_RANGE, alias="range"),
-    lookup: str = Query(""),
-    chart_view: str = Query(DEFAULT_CHART_VIEW, alias="chart"),
-) -> HTMLResponse:
-    if (redirect := require_kid(request)) is not None:
-        return redirect
-    kid_id = kid_authed(request)
-    assert kid_id
-    notice_msg, notice_kind = pop_kid_notice(request)
+    kid_id: str,
+    *,
+    symbol: Optional[str],
+    range_code: str,
+    lookup: str,
+    chart_view: str,
+    base_path: str,
+    include_back_link: bool,
+    embed: bool,
+    notice_message: Optional[str],
+    notice_kind: str,
+) -> Tuple[str, str]:
+    base_url, base_query = _invest_base_config(base_path)
+    base_hidden_html = _invest_hidden_inputs(base_query)
     notice_html = ""
-    if notice_msg:
+    if notice_message:
         notice_class = "error" if notice_kind == "error" else "success"
         notice_html = (
-            f"<div class='notice {notice_class}'>{html_escape(notice_msg)}</div>"
+            f"<div class='notice {notice_class}'>{html_escape(notice_message)}</div>"
         )
-    try:
-        instruments = list_market_instruments_for_kid(kid_id)
-        if not instruments:
-            raise RuntimeError("No market instruments available.")
-        instrument_map = {_normalize_symbol(inst.symbol): inst for inst in instruments}
-        requested_symbol = _normalize_symbol(symbol) if symbol else ""
-        lookup_query = (lookup or "").strip()
-        lookup_results = search_market_symbols(lookup_query) if lookup_query else []
-        default_symbol = _normalize_symbol(DEFAULT_MARKET_SYMBOL)
-        selected_symbol = requested_symbol or default_symbol
-        if selected_symbol not in instrument_map:
-            selected_symbol = default_symbol if default_symbol in instrument_map else next(iter(instrument_map.keys()))
-        active_instrument = instrument_map[selected_symbol]
-        instrument_symbol_raw = active_instrument.symbol
-        selected_range = normalize_history_range(range_code)
-        chart_mode = normalize_chart_view(chart_view)
-        metrics = compute_holdings_metrics(kid_id, selected_symbol)
-        history = fetch_price_history_range(selected_symbol, selected_range)
-        if chart_mode == CHART_VIEW_DETAIL:
-            svg = detailed_history_chart_svg(history, width=640, height=260)
-            enlarged_svg = detailed_history_chart_svg(history, width=1024, height=420)
+    instruments = list_market_instruments_for_kid(kid_id)
+    if not instruments:
+        raise RuntimeError("No market instruments available.")
+    instrument_map = {_normalize_symbol(inst.symbol): inst for inst in instruments}
+    requested_symbol = _normalize_symbol(symbol) if symbol else ""
+    lookup_query = (lookup or "").strip()
+    lookup_results = search_market_symbols(lookup_query) if lookup_query else []
+    default_symbol = _normalize_symbol(DEFAULT_MARKET_SYMBOL)
+    selected_symbol = requested_symbol or default_symbol
+    if selected_symbol not in instrument_map:
+        selected_symbol = (
+            default_symbol if default_symbol in instrument_map else next(iter(instrument_map.keys()))
+        )
+    active_instrument = instrument_map[selected_symbol]
+    instrument_symbol_raw = active_instrument.symbol
+    selected_range = normalize_history_range(range_code)
+    chart_mode = normalize_chart_view(chart_view)
+    metrics = compute_holdings_metrics(kid_id, selected_symbol)
+    history = fetch_price_history_range(selected_symbol, selected_range)
+    if chart_mode == CHART_VIEW_DETAIL:
+        svg = detailed_history_chart_svg(history, width=640, height=260)
+        enlarged_svg = detailed_history_chart_svg(history, width=1024, height=420)
+    else:
+        svg = sparkline_svg_from_history(history, width=360, height=120)
+        enlarged_svg = sparkline_svg_from_history(history, width=960, height=240)
+    cd_rates_bps = {code: DEFAULT_CD_RATE_BPS for code, _, _ in CD_TERM_OPTIONS}
+    with Session(engine) as session:
+        child = session.exec(select(Child).where(Child.kid_id == kid_id)).first()
+        balance_c = child.balance_cents if child else 0
+        certificates = session.exec(
+            select(Certificate)
+            .where(Certificate.kid_id == kid_id)
+            .order_by(desc(Certificate.opened_at))
+        ).all()
+        cd_rates_bps = get_all_cd_rate_bps(session)
+        penalty_days_by_term = get_all_cd_penalty_days(session)
+
+    def fmt(value: int) -> str:
+        return f"{'+' if value >= 0 else ''}{usd(value)}"
+
+    moment = _time_provider()
+    cd_total_c = 0
+    matured_ready = 0
+    next_maturity: Optional[datetime] = None
+    cert_rows = ""
+    return_to_url = None
+    link_url = lambda **params: _invest_build_url(
+        base_url, base_query, **params
+    )
+    if embed:
+        return_to_url = link_url(
+            symbol=instrument_symbol_raw,
+            range=selected_range,
+            chart=chart_mode,
+        )
+    return_hidden = (
+        f"<input type='hidden' name='return_to' value='{html_escape(return_to_url)}'>"
+        if return_to_url
+        else ""
+    )
+    for certificate in certificates:
+        value_c = certificate_value_cents(certificate, at=moment)
+        maturity = certificate_maturity_date(certificate)
+        progress_pct = certificate_progress_percent(certificate, at=moment)
+        rate_display = certificate.rate_bps / 100
+        if certificate.matured_at:
+            status = f"Cashed out on {certificate.matured_at.strftime('%Y-%m-%d')}"
+            progress_pct = 100.0
+        elif moment >= maturity:
+            status = "Matured — ready to cash out"
+            matured_ready += 1
         else:
-            svg = sparkline_svg_from_history(history, width=360, height=120)
-            enlarged_svg = sparkline_svg_from_history(history, width=960, height=240)
-        cd_rates_bps = {code: DEFAULT_CD_RATE_BPS for code, _, _ in CD_TERM_OPTIONS}
-        with Session(engine) as session:
-            child = session.exec(select(Child).where(Child.kid_id == kid_id)).first()
-            balance_c = child.balance_cents if child else 0
-            certificates = session.exec(
-                select(Certificate)
-                .where(Certificate.kid_id == kid_id)
-                .order_by(desc(Certificate.opened_at))
-            ).all()
-            cd_rates_bps = get_all_cd_rate_bps(session)
-            penalty_days_by_term = get_all_cd_penalty_days(session)
-
-        def fmt(value: int) -> str:
-            return f"{'+' if value >= 0 else ''}{usd(value)}"
-
-        moment = _time_provider()
-        cd_total_c = 0
-        matured_ready = 0
-        next_maturity: Optional[datetime] = None
-        cert_rows = ""
-        for certificate in certificates:
-            value_c = certificate_value_cents(certificate, at=moment)
-            maturity = certificate_maturity_date(certificate)
-            progress_pct = certificate_progress_percent(certificate, at=moment)
-            rate_display = certificate.rate_bps / 100
-            if certificate.matured_at:
-                status = f"Cashed out on {certificate.matured_at.strftime('%Y-%m-%d')}"
-                progress_pct = 100.0
-            elif moment >= maturity:
-                status = "Matured — ready to cash out"
-                matured_ready += 1
-            else:
-                days_left = max(0, (maturity.date() - moment.date()).days)
-                status = f"Matures {maturity:%Y-%m-%d} ({days_left} days left)"
-            if certificate.matured_at is None:
-                cd_total_c += value_c
-                if next_maturity is None or maturity < next_maturity:
-                    next_maturity = maturity
-            button_class_attr = " class='danger'" if certificate.matured_at is None else ""
-            cert_rows += (
-                f"<tr><td data-label='Principal'>{usd(certificate.principal_cents)}</td>"
-                f"<td data-label='Rate'>{rate_display:.2f}%</td>"
-                f"<td data-label='Term'>{certificate_term_label(certificate)}</td>"
-                f"<td data-label='Value Today'>{usd(value_c)}</td>"
-                f"<td data-label='Progress'>{progress_pct:.1f}%</td>"
-                f"<td data-label='Status'>{status}</td>"
-                f"<td data-label='Actions'>"
-                f"<form class='inline' method='post' action='/kid/invest/cd/cashout'>"
-                f"<input type='hidden' name='certificate_id' value='{certificate.id}'>"
-                f"<input type='hidden' name='symbol' value='{instrument_symbol_raw}'>"
-                f"<input type='hidden' name='range' value='{selected_range}'>"
-                f"<input type='hidden' name='chart' value='{chart_mode}'>"
-                f"<button type='submit'{button_class_attr}>{'Cash Out' if certificate.matured_at is None else 'Remove'}</button>"
-                f"</form></td></tr>"
-            )
-        if not cert_rows:
-            cert_rows = "<tr><td colspan='7' class='muted'>No certificates yet.</td></tr>"
-        cd_rates_pct = {code: rate / 100 for code, rate in cd_rates_bps.items()}
-        rate_summary_text = ", ".join(
-            f"{label} {cd_rates_pct.get(code, DEFAULT_CD_RATE_BPS / 100):.2f}%"
-            for code, label, _ in CD_TERM_OPTIONS
+            days_left = max(0, (maturity.date() - moment.date()).days)
+            status = f"Matures {maturity:%Y-%m-%d} ({days_left} days left)"
+        if certificate.matured_at is None:
+            cd_total_c += value_c
+            if next_maturity is None or maturity < next_maturity:
+                next_maturity = maturity
+        button_class_attr = " class='danger'" if certificate.matured_at is None else ""
+        cert_rows += (
+            f"<tr><td data-label='Principal'>{usd(certificate.principal_cents)}</td>"
+            f"<td data-label='Rate'>{rate_display:.2f}%</td>"
+            f"<td data-label='Term'>{certificate_term_label(certificate)}</td>"
+            f"<td data-label='Value Today'>{usd(value_c)}</td>"
+            f"<td data-label='Progress'>{progress_pct:.1f}%</td>"
+            f"<td data-label='Status'>{status}</td>"
+            f"<td data-label='Actions'>"
+            f"<form class='inline' method='post' action='/kid/invest/cd/cashout'>"
+            f"<input type='hidden' name='certificate_id' value='{certificate.id}'>"
+            f"<input type='hidden' name='symbol' value='{instrument_symbol_raw}'>"
+            f"<input type='hidden' name='range' value='{selected_range}'>"
+            f"<input type='hidden' name='chart' value='{chart_mode}'>"
+            f"{return_hidden}"
+            f"<button type='submit'{button_class_attr}>{'Cash Out' if certificate.matured_at is None else 'Remove'}</button>"
+            f"</form></td></tr>"
         )
-        summary_bits = [
-            f"<div><b>Current rates:</b> {rate_summary_text}</div>",
-            f"<div>Total active value: <b>{usd(cd_total_c)}</b></div>",
-        ]
-        if next_maturity:
-            summary_bits.append(f"<div>Next maturity: <b>{next_maturity:%Y-%m-%d}</b></div>")
-        if matured_ready:
-            summary_bits.append(
-                f"<div class='muted'>{matured_ready} certificate{'s' if matured_ready != 1 else ''} ready to cash out.</div>"
+    if not cert_rows:
+        cert_rows = "<tr><td colspan='7' class='muted'>No certificates yet.</td></tr>"
+    cd_rates_pct = {code: rate / 100 for code, rate in cd_rates_bps.items()}
+    rate_summary_text = ", ".join(
+        f"{label} {cd_rates_pct.get(code, DEFAULT_CD_RATE_BPS / 100):.2f}%"
+        for code, label, _ in CD_TERM_OPTIONS
+    )
+    summary_bits = [
+        f"<div><b>Current rates:</b> {rate_summary_text}</div>",
+        f"<div>Total active value: <b>{usd(cd_total_c)}</b></div>",
+    ]
+    if next_maturity:
+        summary_bits.append(f"<div>Next maturity: <b>{next_maturity:%Y-%m-%d}</b></div>")
+    if matured_ready:
+        summary_bits.append(
+            f"<div class='muted'>{matured_ready} certificate{'s' if matured_ready != 1 else ''} ready to cash out.</div>"
+        )
+    penalty_active = any(days > 0 for days in penalty_days_by_term.values())
+    if penalty_active:
+        penalty_parts = []
+        for code, label, _ in CD_TERM_OPTIONS:
+            days = penalty_days_by_term.get(code, 0)
+            penalty_parts.append(
+                f"{label}: {days} day{'s' if days != 1 else ''}"
             )
-        penalty_active = any(days > 0 for days in penalty_days_by_term.values())
-        if penalty_active:
-            penalty_parts = []
-            for code, label, _ in CD_TERM_OPTIONS:
-                days = penalty_days_by_term.get(code, 0)
-                penalty_parts.append(
-                    f"{label}: {days} day{'s' if days != 1 else ''}"
-                )
-            penalty_summary = (
-                "<div>Early withdrawal penalty: <b>"
-                + ", ".join(penalty_parts)
-                + "</b></div>"
-            )
-        else:
-            penalty_summary = "<div>No penalty for early withdrawals right now.</div>"
-        summary_bits.append(penalty_summary)
-        cd_summary_html = "".join(summary_bits)
-        cash_out_form = ""
-        if matured_ready:
-            cash_out_form = (
-                "<form method='post' action='/kid/invest/cd/mature' style='margin-top:10px;'>"
-                f"<input type='hidden' name='symbol' value='{instrument_symbol_raw}'>"
-                f"<input type='hidden' name='range' value='{selected_range}'>"
-                f"<input type='hidden' name='chart' value='{chart_mode}'>"
-                "<button type='submit'>Cash out matured</button>"
-                "</form>"
-            )
-
-        term_options_html = "".join(
-            f"<option value='{code}'{' selected' if code == DEFAULT_CD_TERM_CODE else ''}>{label} — {cd_rates_pct[code]:.2f}% APR</option>"
-            for code, label, _ in CD_TERM_OPTIONS
+        penalty_summary = (
+            "<div>Early withdrawal penalty: <b>"
+            + ", ".join(penalty_parts)
+            + "</b></div>"
+        )
+    else:
+        penalty_summary = "<div>No penalty for early withdrawals right now.</div>"
+    summary_bits.append(penalty_summary)
+    cd_summary_html = "".join(summary_bits)
+    cash_out_form = ""
+    if matured_ready:
+        cash_out_form = (
+            "<form method='post' action='/kid/invest/cd/mature' style='margin-top:10px;'>"
+            f"<input type='hidden' name='symbol' value='{instrument_symbol_raw}'>"
+            f"<input type='hidden' name='range' value='{selected_range}'>"
+            f"<input type='hidden' name='chart' value='{chart_mode}'>"
+            f"{return_hidden}"
+            "<button type='submit'>Cash out matured</button>"
+            "</form>"
         )
 
-        tabs_html = ""
-        if len(instruments) > 1:
-            links: List[str] = []
-            for inst in instruments:
-                normalized = _normalize_symbol(inst.symbol)
-                active_style = "background:var(--accent); color:#fff;" if normalized == selected_symbol else ""
-                link_url = (
-                    f"/kid/invest?symbol={inst.symbol}&range={selected_range}&chart={chart_mode}"
-                )
-                links.append(
-                    f"<a href='{link_url}' class='pill' style='margin-right:6px;{active_style}'>"
-                    f"{html_escape(inst.name or inst.symbol)}</a>"
-                )
-            tabs_html = "<div class='muted' style='margin-bottom:8px;'>Markets: " + "".join(links) + "</div>"
+    term_options_html = "".join(
+        f"<option value='{code}'{' selected' if code == DEFAULT_CD_TERM_CODE else ''}>{label} — {cd_rates_pct[code]:.2f}% APR</option>"
+        for code, label, _ in CD_TERM_OPTIONS
+    )
 
-        range_links: List[str] = []
-        for code, cfg in PRICE_HISTORY_RANGES.items():
-            label = cfg.get("label", code)
-            active_style = "background:var(--accent); color:#fff;" if code == selected_range else ""
-            link_url = (
-                f"/kid/invest?symbol={active_instrument.symbol}&range={code}&chart={chart_mode}"
+    tabs_html = ""
+    if len(instruments) > 1:
+        links: List[str] = []
+        for inst in instruments:
+            normalized = _normalize_symbol(inst.symbol)
+            active_style = (
+                "background:var(--accent); color:#fff;"
+                if normalized == selected_symbol
+                else ""
             )
-            range_links.append(
-                f"<a href='{link_url}' class='pill' style='margin-right:6px;{active_style}'>{label}</a>"
+            tab_url = link_url(
+                symbol=inst.symbol,
+                range=selected_range,
+                chart=chart_mode,
             )
-        range_selector_html = "<div class='muted' style='margin-top:8px;'>Range: " + "".join(range_links) + "</div>"
-        compact_url = (
-            f"/kid/invest?symbol={active_instrument.symbol}&range={selected_range}&chart={CHART_VIEW_COMPACT}"
-        )
-        detail_url = (
-            f"/kid/invest?symbol={active_instrument.symbol}&range={selected_range}&chart={CHART_VIEW_DETAIL}"
-        )
-        chart_toggle_html = (
-            "<div class='chart-toggle'>Chart: "
-            + f"<a href='{compact_url}' class='{'active' if chart_mode == CHART_VIEW_COMPACT else ''}'>Compact</a>"
-            + f"<a href='{detail_url}' class='{'active' if chart_mode == CHART_VIEW_DETAIL else ''}'>Detailed</a>"
-            + "</div>"
-        )
-        lookup_value = html_escape(lookup_query)
-        if lookup_query and lookup_results:
-            suggestion_items = []
-            for match in lookup_results:
-                symbol_val = match.get("symbol") or ""
-                name_val = match.get("name") or symbol_val
-                kind_val = match.get("kind") or INSTRUMENT_KIND_STOCK
-                kind_label = "Crypto" if kind_val == INSTRUMENT_KIND_CRYPTO else "Stock"
-                suggestion_items.append(
-                    "<li><b>"
-                    + html_escape(symbol_val)
-                    + "</b> — "
-                    + html_escape(name_val)
-                    + f" <span class='muted'>({kind_label})</span>"
-                    + "<form method='post' action='/kid/invest/track' class='inline' style='margin-top:6px;'>"
-                    + f"<input type='hidden' name='symbol' value='{html_escape(symbol_val)}'>"
-                    + f"<input type='hidden' name='name' value='{html_escape(name_val)}'>"
-                    + f"<input type='hidden' name='kind' value='{html_escape(kind_val)}'>"
-                    + f"<input type='hidden' name='range' value='{selected_range}'>"
-                    + f"<input type='hidden' name='chart' value='{chart_mode}'>"
-                    + "<button type='submit'>Track</button></form></li>"
-                )
-            search_results_html = (
-                "<ul style='margin:10px 0 0 18px; padding:0; list-style:disc;'>"
-                + "".join(suggestion_items)
-                + "</ul>"
+            links.append(
+                f"<a href='{tab_url}' class='pill' style='margin-right:6px;{active_style}'>"
+                f"{html_escape(inst.name or inst.symbol)}</a>"
             )
-        elif lookup_query:
-            search_results_html = "<div class='muted' style='margin-top:6px;'>No matches found.</div>"
-        else:
-            search_results_html = "<div class='muted' style='margin-top:6px;'>Try symbols like AAPL, VTI, or BTC-USD.</div>"
-        search_card_html = f"""
+        tabs_html = "<div class='muted' style='margin-bottom:8px;'>Markets: " + "".join(links) + "</div>"
+
+    range_links: List[str] = []
+    for code, cfg in PRICE_HISTORY_RANGES.items():
+        label = cfg.get("label", code)
+        active_style = (
+            "background:var(--accent); color:#fff;"
+            if code == selected_range
+            else ""
+        )
+        range_url = link_url(
+            symbol=active_instrument.symbol,
+            range=code,
+            chart=chart_mode,
+        )
+        range_links.append(
+            f"<a href='{range_url}' class='pill' style='margin-right:6px;{active_style}'>{label}</a>"
+        )
+    range_selector_html = "<div class='muted' style='margin-top:8px;'>Range: " + "".join(range_links) + "</div>"
+    compact_url = link_url(
+        symbol=active_instrument.symbol,
+        range=selected_range,
+        chart=CHART_VIEW_COMPACT,
+    )
+    detail_url = link_url(
+        symbol=active_instrument.symbol,
+        range=selected_range,
+        chart=CHART_VIEW_DETAIL,
+    )
+    chart_toggle_html = (
+        "<div class='chart-toggle'>Chart: ""
+        + f"<a href='{compact_url}' class='{'active' if chart_mode == CHART_VIEW_COMPACT else ''}'>Compact</a>"
+        + f"<a href='{detail_url}' class='{'active' if chart_mode == CHART_VIEW_DETAIL else ''}'>Detailed</a>"
+        + "</div>"
+    )
+    lookup_value = html_escape(lookup_query)
+    if lookup_query and lookup_results:
+        suggestion_items = []
+        for match in lookup_results:
+            symbol_val = match.get("symbol") or ""
+            name_val = match.get("name") or symbol_val
+            kind_val = match.get("kind") or INSTRUMENT_KIND_STOCK
+            kind_label = "Crypto" if kind_val == INSTRUMENT_KIND_CRYPTO else "Stock"
+            suggestion_items.append(
+                "<li><b>"
+                + html_escape(symbol_val)
+                + "</b> — "
+                + html_escape(name_val)
+                + f" <span class='muted'>({kind_label})</span>"
+                + "<form method='post' action='/kid/invest/track' class='inline' style='margin-top:6px;'>"
+                + f"<input type='hidden' name='symbol' value='{html_escape(symbol_val)}'>"
+                + f"<input type='hidden' name='name' value='{html_escape(name_val)}'>"
+                + f"<input type='hidden' name='kind' value='{html_escape(kind_val)}'>"
+                + f"<input type='hidden' name='range' value='{selected_range}'>"
+                + f"<input type='hidden' name='chart' value='{chart_mode}'>"
+                + f"{return_hidden}"
+                + "<button type='submit'>Track</button></form></li>"
+            )
+        search_results_html = (
+            "<ul style='margin:10px 0 0 18px; padding:0; list-style:disc;'>"
+            + "".join(suggestion_items)
+            + "</ul>"
+        )
+    elif lookup_query:
+        search_results_html = "<div class='muted' style='margin-top:6px;'>No matches found.</div>"
+    else:
+        search_results_html = "<div class='muted' style='margin-top:6px;'>Try symbols like AAPL, VTI, or BTC-USD.</div>"
+    search_card_html = f"""
         <div class='card'>
           <h3>Add a ticker</h3>
           <p class='muted'>Search by ticker or name to add a new stock, fund, or crypto.</p>
-          <form method='get' action='/kid/invest' class='inline'>
+          <form method='get' action='{html_escape(base_url)}' class='inline'>
+            {base_hidden_html}
             <input type='hidden' name='symbol' value='{html_escape(instrument_symbol_raw)}'>
             <input type='hidden' name='range' value='{selected_range}'>
             <input type='hidden' name='chart' value='{chart_mode}'>
@@ -5700,40 +5841,48 @@ def kid_invest_home(
           </form>
           {search_results_html}
         </div>
-        """
+    """
 
-        instrument_label = html_escape(active_instrument.name or instrument_symbol_raw)
-        instrument_symbol = html_escape(instrument_symbol_raw)
-        kind_label = "Crypto" if active_instrument.kind == INSTRUMENT_KIND_CRYPTO else "Stock"
-        unit_label = "per coin" if active_instrument.kind == INSTRUMENT_KIND_CRYPTO else "per share"
-        allow_remove = _normalize_symbol(instrument_symbol_raw) != _normalize_symbol(DEFAULT_MARKET_SYMBOL)
-        remove_button_html = ""
-        if allow_remove:
-            remove_button_html = (
-                "<form method='post' action='/kid/invest/delete' style='margin-top:10px;'>"
-                f"<input type='hidden' name='symbol' value='{instrument_symbol}'>"
-                f"<input type='hidden' name='range' value='{selected_range}'>"
-                f"<input type='hidden' name='chart' value='{chart_mode}'>"
-                "<button type='submit' class='danger secondary'>Remove from dashboard</button>"
-                "</form>"
-            )
-        has_chart_history = len(history) >= 2
-        chart_modal_id = f"chart-{_normalize_symbol(active_instrument.symbol).lower()}"
-        chart_display_html = (
-            f"<a href='#{chart_modal_id}' class='chart-popout' aria-label='Expand price chart'>{svg}</a>"
+    instrument_label = html_escape(active_instrument.name or instrument_symbol_raw)
+    instrument_symbol = html_escape(instrument_symbol_raw)
+    kind_label = "Crypto" if active_instrument.kind == INSTRUMENT_KIND_CRYPTO else "Stock"
+    unit_label = "per coin" if active_instrument.kind == INSTRUMENT_KIND_CRYPTO else "per share"
+    allow_remove = _normalize_symbol(instrument_symbol_raw) != _normalize_symbol(DEFAULT_MARKET_SYMBOL)
+    remove_button_html = ""
+    if allow_remove:
+        remove_button_html = (
+            "<form method='post' action='/kid/invest/delete' style='margin-top:10px;'>"
+            f"<input type='hidden' name='symbol' value='{instrument_symbol}'>"
+            f"<input type='hidden' name='range' value='{selected_range}'>"
+            f"<input type='hidden' name='chart' value='{chart_mode}'>"
+            f"{return_hidden}"
+            "<button type='submit' class='danger secondary'>Remove from dashboard</button>"
+            "</form>"
         )
-        chart_hint_html = "<div class='chart-hint'>Tap or click the chart to expand.</div>" if has_chart_history else ""
-        chart_modal_html = f"""
+    has_chart_history = len(history) >= 2
+    chart_modal_id = f"chart-{_normalize_symbol(active_instrument.symbol).lower()}"
+    chart_display_html = (
+        f"<a href='#{chart_modal_id}' class='chart-popout' aria-label='Expand price chart'>{svg}</a>"
+    )
+    chart_hint_html = "<div class='chart-hint'>Tap or click the chart to expand.</div>" if has_chart_history else ""
+    chart_modal_html = f"""
         <div id='{chart_modal_id}' class='modal-overlay chart-modal'>
           <div class='modal-card chart-modal__card'>
             <div class='modal-head'><h3>{instrument_label} — expanded chart</h3><a href='#' class='pill'>Close</a></div>
             <div class='chart-modal__body'>{enlarged_svg}</div>
           </div>
         </div>
-        """
+    """
 
-        inner = f"""
-        {notice_html}<div style='margin-bottom:10px;'><a href='/kid' class='button-link secondary'>← Back to My Account</a></div>{search_card_html}
+    back_link_html = ""
+    if include_back_link:
+        back_link_html = "<div style='margin-bottom:10px;'><a href='/kid' class='button-link secondary'>← Back to My Account</a></div>"
+    footer_back_html = ""
+    if not embed:
+        footer_back_html = "<p class='muted' style='margin-top:10px;'><a href='/kid'>← Back to My Account</a></p>"
+
+    inner = f"""
+        {notice_html}{back_link_html}{search_card_html}
         {tabs_html}
         <div class='card'>
           <h3>Investing — {instrument_label}</h3>
@@ -5765,6 +5914,7 @@ def kid_invest_home(
             <input type='hidden' name='symbol' value='{instrument_symbol}'>
             <input type='hidden' name='range' value='{selected_range}'>
             <input type='hidden' name='chart' value='{chart_mode}'>
+            {return_hidden}
             <input name='amount' type='text' data-money placeholder='amount $' required>
             <button type='submit'>Buy</button>
           </form>
@@ -5773,6 +5923,7 @@ def kid_invest_home(
             <input type='hidden' name='symbol' value='{instrument_symbol}'>
             <input type='hidden' name='range' value='{selected_range}'>
             <input type='hidden' name='chart' value='{chart_mode}'>
+            {return_hidden}
             <input name='amount' type='text' data-money placeholder='amount $' required>
             <button type='submit' class='danger'>Sell</button>
           </form>
@@ -5787,6 +5938,7 @@ def kid_invest_home(
             <input type='hidden' name='symbol' value='{instrument_symbol}'>
             <input type='hidden' name='range' value='{selected_range}'>
             <input type='hidden' name='chart' value='{chart_mode}'>
+            {return_hidden}
             <input name='amount' type='text' data-money placeholder='amount $' required>
             <label style='margin-left:6px;'>Term</label>
             <select name='term_choice'>
@@ -5797,13 +5949,44 @@ def kid_invest_home(
           <p class='muted' style='margin-top:6px;'>Funds move from your balance into the certificate.</p>
           <table style='margin-top:10px;'><tr><th>Principal</th><th>Rate</th><th>Term</th><th>Value Today</th><th>Progress</th><th>Status</th><th>Actions</th></tr>{cert_rows}</table>
         </div>
-        <p class='muted' style='margin-top:10px;'><a href='/kid'>← Back to My Account</a></p>
+        {footer_back_html}
         {chart_modal_html}
-        """
+    """
+    return inner, active_instrument.name or instrument_symbol_raw
+
+
+@app.get("/kid/invest", response_class=HTMLResponse)
+def kid_invest_home(
+    request: Request,
+    symbol: Optional[str] = Query(None),
+    range_code: str = Query(DEFAULT_PRICE_RANGE, alias="range"),
+    lookup: str = Query(""),
+    chart_view: str = Query(DEFAULT_CHART_VIEW, alias="chart"),
+) -> HTMLResponse:
+    if (redirect := require_kid(request)) is not None:
+        return redirect
+    kid_id = kid_authed(request)
+    assert kid_id
+    notice_msg, notice_kind = pop_kid_notice(request)
+    try:
+        inner, title_label = _kid_invest_dashboard_inner(
+            request,
+            kid_id,
+            symbol=symbol,
+            range_code=range_code,
+            lookup=lookup,
+            chart_view=chart_view,
+            base_path="/kid/invest",
+            include_back_link=True,
+            embed=False,
+            notice_message=notice_msg,
+            notice_kind=notice_kind,
+        )
         invest_styles = "<style>body[data-page='kid-invest']{overflow:hidden;}</style>"
         body_attrs = f"{body_pref_attrs(request)} data-page='kid-invest'"
+        page_title = html_escape(title_label)
         html = frame(
-            f"Investing — {instrument_label}",
+            f"Investing — {page_title}",
             inner,
             head_extra=invest_styles,
             body_attrs=body_attrs,
@@ -5826,15 +6009,27 @@ def kid_invest_track(
     kind: str = Form(INSTRUMENT_KIND_STOCK),
     range_code: str = Form(DEFAULT_PRICE_RANGE, alias="range"),
     chart_view: str = Form(DEFAULT_CHART_VIEW, alias="chart"),
+    return_to: Optional[str] = Form(None),
 ):
     if (redirect := require_kid(request)) is not None:
         return redirect
     kid_id = kid_authed(request)
     assert kid_id
+    next_range = normalize_history_range(range_code)
+    chart_mode = normalize_chart_view(chart_view)
+
+    def fallback_url(symbol_value: Optional[str] = None) -> str:
+        params = {"range": next_range, "chart": chart_mode}
+        if symbol_value:
+            params["symbol"] = symbol_value
+        query = urlencode(params)
+        return f"/kid/invest?{query}" if query else "/kid/invest"
+
     normalized_symbol = _normalize_symbol(symbol)
     if not normalized_symbol:
         set_kid_notice(request, "Enter a ticker symbol to track.", "error")
-        return RedirectResponse("/kid/invest", status_code=302)
+        target_url = _safe_invest_redirect(return_to, fallback_url())
+        return RedirectResponse(target_url, status_code=302)
     resolved = lookup_symbol_profile(normalized_symbol)
     if resolved:
         resolved_name = resolved.get("name") or normalized_symbol
@@ -5845,7 +6040,8 @@ def kid_invest_track(
     instrument = add_market_instrument(normalized_symbol, resolved_name, resolved_kind)
     if not instrument:
         set_kid_notice(request, "Could not add that symbol.", "error")
-        return RedirectResponse("/kid/invest", status_code=302)
+        target_url = _safe_invest_redirect(return_to, fallback_url(normalized_symbol))
+        return RedirectResponse(target_url, status_code=302)
     existing_link = None
     with Session(engine) as session:
         existing_link = session.exec(
@@ -5860,12 +6056,9 @@ def kid_invest_track(
     if existing_link:
         message = f"Already tracking {instrument.symbol}."
     set_kid_notice(request, message, "success")
-    next_range = normalize_history_range(range_code)
-    next_chart = normalize_chart_view(chart_view)
-    return RedirectResponse(
-        f"/kid/invest?symbol={instrument.symbol}&range={next_range}&chart={next_chart}",
-        status_code=302,
-    )
+    fallback = fallback_url(instrument.symbol)
+    target = _safe_invest_redirect(return_to, fallback)
+    return RedirectResponse(target, status_code=302)
 
 
 @app.post("/kid/invest/buy")
@@ -5875,6 +6068,7 @@ def kid_invest_buy(
     symbol: str = Form(DEFAULT_MARKET_SYMBOL),
     range_code: str = Form(DEFAULT_PRICE_RANGE, alias="range"),
     chart_view: str = Form(DEFAULT_CHART_VIEW, alias="chart"),
+    return_to: Optional[str] = Form(None),
 ):
     if (redirect := require_kid(request)) is not None:
         return redirect
@@ -5882,27 +6076,22 @@ def kid_invest_buy(
     assert kid_id
     next_range = normalize_history_range(range_code)
     chart_mode = normalize_chart_view(chart_view)
+    def redirect_back() -> RedirectResponse:
+        fallback_url = f"/kid/invest?symbol={symbol}&range={next_range}&chart={chart_mode}"
+        target_url = _safe_invest_redirect(return_to, fallback_url)
+        return RedirectResponse(target_url, status_code=302)
     amount_c = to_cents_from_dollars_str(amount, 0)
     if amount_c <= 0:
-        return RedirectResponse(
-            f"/kid/invest?symbol={symbol}&range={next_range}&chart={chart_mode}",
-            status_code=302,
-        )
+        return redirect_back()
     normalized_symbol = _normalize_symbol(symbol)
     price_c = market_price_cents(normalized_symbol)
     if price_c <= 0:
-        return RedirectResponse(
-            f"/kid/invest?symbol={symbol}&range={next_range}&chart={chart_mode}",
-            status_code=302,
-        )
+        return redirect_back()
     price = price_c / 100.0
     with Session(engine) as session:
         child = session.exec(select(Child).where(Child.kid_id == kid_id)).first()
         if not child or amount_c > child.balance_cents:
-            return RedirectResponse(
-                f"/kid/invest?symbol={symbol}&range={next_range}&chart={chart_mode}",
-                status_code=302,
-            )
+            return redirect_back()
         moment = _time_provider()
         shares = (amount_c / 100.0) / price
         holding = session.exec(
@@ -5933,10 +6122,7 @@ def kid_invest_buy(
             )
         )
         session.commit()
-    return RedirectResponse(
-        f"/kid/invest?symbol={symbol}&range={next_range}&chart={chart_mode}",
-        status_code=302,
-    )
+    return redirect_back()
 
 
 @app.post("/kid/invest/sell")
@@ -5946,6 +6132,7 @@ def kid_invest_sell(
     symbol: str = Form(DEFAULT_MARKET_SYMBOL),
     range_code: str = Form(DEFAULT_PRICE_RANGE, alias="range"),
     chart_view: str = Form(DEFAULT_CHART_VIEW, alias="chart"),
+    return_to: Optional[str] = Form(None),
 ):
     if (redirect := require_kid(request)) is not None:
         return redirect
@@ -5953,19 +6140,17 @@ def kid_invest_sell(
     assert kid_id
     next_range = normalize_history_range(range_code)
     chart_mode = normalize_chart_view(chart_view)
+    def redirect_back() -> RedirectResponse:
+        fallback_url = f"/kid/invest?symbol={symbol}&range={next_range}&chart={chart_mode}"
+        target_url = _safe_invest_redirect(return_to, fallback_url)
+        return RedirectResponse(target_url, status_code=302)
     amount_c = to_cents_from_dollars_str(amount, 0)
     if amount_c <= 0:
-        return RedirectResponse(
-            f"/kid/invest?symbol={symbol}&range={next_range}&chart={chart_mode}",
-            status_code=302,
-        )
+        return redirect_back()
     normalized_symbol = _normalize_symbol(symbol)
     price_c = market_price_cents(normalized_symbol)
     if price_c <= 0:
-        return RedirectResponse(
-            f"/kid/invest?symbol={symbol}&range={next_range}&chart={chart_mode}",
-            status_code=302,
-        )
+        return redirect_back()
     price = price_c / 100.0
     with Session(engine) as session:
         holding = session.exec(
@@ -5973,18 +6158,12 @@ def kid_invest_sell(
         ).first()
         child = session.exec(select(Child).where(Child.kid_id == kid_id)).first()
         if not holding or not child or holding.shares <= 0:
-            return RedirectResponse(
-                f"/kid/invest?symbol={symbol}&range={next_range}&chart={chart_mode}",
-                status_code=302,
-            )
+            return redirect_back()
         need_shares = (amount_c / 100.0) / price
         sell_shares = min(holding.shares, need_shares)
         proceeds_c = int(round(sell_shares * price * 100))
         if sell_shares <= 0 or proceeds_c <= 0:
-            return RedirectResponse(
-                f"/kid/invest?symbol={symbol}&range={next_range}&chart={chart_mode}",
-                status_code=302,
-            )
+            return redirect_back()
         txs = session.exec(
             select(InvestmentTx)
             .where(InvestmentTx.kid_id == kid_id, InvestmentTx.fund == normalized_symbol)
@@ -6029,10 +6208,7 @@ def kid_invest_sell(
             )
         )
         session.commit()
-    return RedirectResponse(
-        f"/kid/invest?symbol={symbol}&range={next_range}&chart={chart_mode}",
-        status_code=302,
-    )
+    return redirect_back()
 
 
 @app.post("/kid/invest/cd/open")
@@ -6043,6 +6219,7 @@ def kid_invest_cd_open(
     symbol: str = Form(DEFAULT_MARKET_SYMBOL),
     range_code: str = Form(DEFAULT_PRICE_RANGE, alias="range"),
     chart_view: str = Form(DEFAULT_CHART_VIEW, alias="chart"),
+    return_to: Optional[str] = Form(None),
 ):
     if (redirect := require_kid(request)) is not None:
         return redirect
@@ -6053,19 +6230,17 @@ def kid_invest_cd_open(
     if amount_c <= 0:
         next_range = normalize_history_range(range_code)
         chart_mode = normalize_chart_view(chart_view)
-        return RedirectResponse(
-            f"/kid/invest?symbol={symbol}&range={next_range}&chart={chart_mode}",
-            status_code=302,
-        )
+        fallback_url = f"/kid/invest?symbol={symbol}&range={next_range}&chart={chart_mode}"
+        target_url = _safe_invest_redirect(return_to, fallback_url)
+        return RedirectResponse(target_url, status_code=302)
     with Session(engine) as session:
         child = session.exec(select(Child).where(Child.kid_id == kid_id)).first()
         if not child or amount_c > child.balance_cents:
             next_range = normalize_history_range(range_code)
             chart_mode = normalize_chart_view(chart_view)
-            return RedirectResponse(
-                f"/kid/invest?symbol={symbol}&range={next_range}&chart={chart_mode}",
-                status_code=302,
-            )
+            fallback_url = f"/kid/invest?symbol={symbol}&range={next_range}&chart={chart_mode}"
+            target_url = _safe_invest_redirect(return_to, fallback_url)
+            return RedirectResponse(target_url, status_code=302)
         rate_bps = get_cd_rate_bps(session, term_code)
         penalty_days = get_cd_penalty_days(session, term_code)
         now = _time_provider()
@@ -6094,10 +6269,9 @@ def kid_invest_cd_open(
     next_range = normalize_history_range(range_code)
     chart_mode = normalize_chart_view(chart_view)
     set_kid_notice(request, f"Locked savings for a {term_code} certificate.", "success")
-    return RedirectResponse(
-        f"/kid/invest?symbol={symbol}&range={next_range}&chart={chart_mode}",
-        status_code=302,
-    )
+    fallback_url = f"/kid/invest?symbol={symbol}&range={next_range}&chart={chart_mode}"
+    target_url = _safe_invest_redirect(return_to, fallback_url)
+    return RedirectResponse(target_url, status_code=302)
 
 
 @app.post("/kid/invest/cd/mature")
@@ -6106,6 +6280,7 @@ def kid_invest_cd_mature(
     symbol: str = Form(DEFAULT_MARKET_SYMBOL),
     range_code: str = Form(DEFAULT_PRICE_RANGE, alias="range"),
     chart_view: str = Form(DEFAULT_CHART_VIEW, alias="chart"),
+    return_to: Optional[str] = Form(None),
 ):
     if (redirect := require_kid(request)) is not None:
         return redirect
@@ -6116,10 +6291,9 @@ def kid_invest_cd_mature(
     with Session(engine) as session:
         child = session.exec(select(Child).where(Child.kid_id == kid_id)).first()
         if not child:
-            return RedirectResponse(
-                f"/kid/invest?symbol={symbol}&range={next_range}&chart={chart_mode}",
-                status_code=302,
-            )
+            fallback_url = f"/kid/invest?symbol={symbol}&range={next_range}&chart={chart_mode}"
+            target_url = _safe_invest_redirect(return_to, fallback_url)
+            return RedirectResponse(target_url, status_code=302)
         certificates = session.exec(
             select(Certificate)
             .where(Certificate.kid_id == kid_id)
@@ -6157,7 +6331,7 @@ def kid_invest_cd_mature(
             session.rollback()
             set_kid_notice(request, "No certificates were ready to mature yet.", "error")
     return RedirectResponse(
-        f"/kid/invest?symbol={symbol}&range={next_range}&chart={chart_mode}",
+        _safe_invest_redirect(return_to, f"/kid/invest?symbol={symbol}&range={next_range}&chart={chart_mode}"),
         status_code=302,
     )
 
@@ -6169,6 +6343,7 @@ def kid_invest_cd_cashout(
     symbol: str = Form(DEFAULT_MARKET_SYMBOL),
     range_code: str = Form(DEFAULT_PRICE_RANGE, alias="range"),
     chart_view: str = Form(DEFAULT_CHART_VIEW, alias="chart"),
+    return_to: Optional[str] = Form(None),
 ):
     if (redirect := require_kid(request)) is not None:
         return redirect
@@ -6176,29 +6351,29 @@ def kid_invest_cd_cashout(
     assert kid_id
     next_range = normalize_history_range(range_code)
     chart_mode = normalize_chart_view(chart_view)
+    fallback_url = f"/kid/invest?symbol={symbol}&range={next_range}&chart={chart_mode}"
+    target_return = _safe_invest_redirect(return_to, fallback_url)
+    def redirect_back() -> RedirectResponse:
+        return RedirectResponse(target_return, status_code=302)
     with Session(engine) as session:
         child = session.exec(select(Child).where(Child.kid_id == kid_id)).first()
         certificate = session.get(Certificate, certificate_id)
         if not child or not certificate or certificate.kid_id != kid_id:
-            return RedirectResponse(
-                f"/kid/invest?symbol={symbol}&range={next_range}&chart={chart_mode}",
-                status_code=302,
-            )
+            return redirect_back()
         if certificate.matured_at is not None:
             session.delete(certificate)
             session.commit()
             set_kid_notice(request, "Removed the cashed-out certificate.", "success")
-            return RedirectResponse(
-                f"/kid/invest?symbol={symbol}&range={next_range}&chart={chart_mode}",
-                status_code=302,
-            )
+            return redirect_back()
         moment = _time_provider()
         maturity = certificate_maturity_date(certificate)
         if moment < maturity:
-            return RedirectResponse(
-                f"/kid/invest/cd/sell?certificate_id={certificate.id}&symbol={symbol}&range={next_range}&chart={chart_mode}",
-                status_code=302,
+            sell_url = (
+                f"/kid/invest/cd/sell?certificate_id={certificate.id}&symbol={symbol}&range={next_range}&chart={chart_mode}"
             )
+            if target_return:
+                sell_url += f"&return_to={quote(target_return)}"
+            return RedirectResponse(sell_url, status_code=302)
         payout_c = certificate_maturity_value_cents(certificate)
         certificate.matured_at = moment
         child.balance_cents += payout_c
@@ -6214,10 +6389,7 @@ def kid_invest_cd_cashout(
         )
         session.commit()
     set_kid_notice(request, "Cashed out your certificate!", "success")
-    return RedirectResponse(
-        f"/kid/invest?symbol={symbol}&range={next_range}&chart={chart_mode}",
-        status_code=302,
-    )
+    return redirect_back()
 
 
 @app.get("/kid/invest/cd/sell", response_class=HTMLResponse)
@@ -6227,23 +6399,22 @@ def kid_invest_cd_sell_confirm(
     symbol: str = Query(DEFAULT_MARKET_SYMBOL),
     range_code: str = Query(DEFAULT_PRICE_RANGE, alias="range"),
     chart_view: str = Query(DEFAULT_CHART_VIEW, alias="chart"),
+    return_to: Optional[str] = Query(None),
 ):
     if (redirect := require_kid(request)) is not None:
         return redirect
     kid_id = kid_authed(request)
     assert kid_id
+    next_range = normalize_history_range(range_code)
+    chart_mode = normalize_chart_view(chart_view)
+    fallback_url = f"/kid/invest?symbol={symbol}&range={next_range}&chart={chart_mode}"
+    target_return = _safe_invest_redirect(return_to, fallback_url)
     with Session(engine) as session:
         certificate = session.get(Certificate, certificate_id)
         if not certificate or certificate.kid_id != kid_id:
-            return RedirectResponse(
-                f"/kid/invest?symbol={symbol}&range={normalize_history_range(range_code)}&chart={normalize_chart_view(chart_view)}",
-                status_code=302,
-            )
+            return RedirectResponse(target_return, status_code=302)
     if certificate.matured_at is not None:
-        return RedirectResponse(
-            f"/kid/invest?symbol={symbol}&range={normalize_history_range(range_code)}&chart={normalize_chart_view(chart_view)}",
-            status_code=302,
-        )
+        return RedirectResponse(target_return, status_code=302)
     moment = _time_provider()
     gross_c, penalty_c, net_c = certificate_sale_breakdown_cents(certificate, at=moment)
     maturity = certificate_maturity_date(certificate)
@@ -6262,6 +6433,12 @@ def kid_invest_cd_sell_confirm(
         )
     button_class_attr = " class='danger'" if penalty_c > 0 and not matured else ""
     symbol_safe = html_escape(symbol)
+    return_hidden = (
+        f"<input type='hidden' name='return_to' value='{html_escape(target_return)}'>"
+        if target_return
+        else ""
+    )
+    cancel_href = target_return if target_return else fallback_url
     inner = f"""
     <div class='card'>
       <h3>Sell certificate?</h3>
@@ -6279,9 +6456,10 @@ def kid_invest_cd_sell_confirm(
         <input type='hidden' name='symbol' value='{symbol_safe}'>
         <input type='hidden' name='range' value='{next_range}'>
         <input type='hidden' name='chart' value='{chart_mode}'>
+        {return_hidden}
         <button type='submit'{button_class_attr}>Yes, sell certificate</button>
       </form>
-      <p class='muted' style='margin-top:12px;'><a href='/kid/invest?symbol={symbol_safe}&range={next_range}&chart={chart_mode}'>No, keep it growing</a></p>
+      <p class='muted' style='margin-top:12px;'><a href='{cancel_href}'>No, keep it growing</a></p>
     </div>
     """
     return render_page(request, "Sell Certificate", inner)
@@ -6294,6 +6472,7 @@ def kid_invest_cd_sell(
     symbol: str = Form(DEFAULT_MARKET_SYMBOL),
     range_code: str = Form(DEFAULT_PRICE_RANGE, alias="range"),
     chart_view: str = Form(DEFAULT_CHART_VIEW, alias="chart"),
+    return_to: Optional[str] = Form(None),
 ):
     if (redirect := require_kid(request)) is not None:
         return redirect
@@ -6301,19 +6480,17 @@ def kid_invest_cd_sell(
     assert kid_id
     next_range = normalize_history_range(range_code)
     chart_mode = normalize_chart_view(chart_view)
+    fallback_url = f"/kid/invest?symbol={symbol}&range={next_range}&chart={chart_mode}"
+    target_return = _safe_invest_redirect(return_to, fallback_url)
+    def redirect_back() -> RedirectResponse:
+        return RedirectResponse(target_return, status_code=302)
     with Session(engine) as session:
         child = session.exec(select(Child).where(Child.kid_id == kid_id)).first()
         certificate = session.get(Certificate, certificate_id)
         if not child or not certificate or certificate.kid_id != kid_id:
-            return RedirectResponse(
-                f"/kid/invest?symbol={symbol}&range={next_range}&chart={chart_mode}",
-                status_code=302,
-            )
+            return redirect_back()
         if certificate.matured_at is not None:
-            return RedirectResponse(
-                f"/kid/invest?symbol={symbol}&range={next_range}&chart={chart_mode}",
-                status_code=302,
-            )
+            return redirect_back()
         moment = _time_provider()
         gross_c, penalty_c, net_c = certificate_sale_breakdown_cents(certificate, at=moment)
         certificate.matured_at = moment
@@ -6341,10 +6518,7 @@ def kid_invest_cd_sell(
             )
         session.commit()
     set_kid_notice(request, f"Added {usd(net_c)} to your balance.", "success")
-    return RedirectResponse(
-        f"/kid/invest?symbol={symbol}&range={next_range}&chart={chart_mode}",
-        status_code=302,
-    )
+    return redirect_back()
 
 
 @app.post("/kid/invest/delete")
@@ -6353,6 +6527,7 @@ def kid_invest_delete(
     symbol: str = Form(...),
     range_code: str = Form(DEFAULT_PRICE_RANGE, alias="range"),
     chart_view: str = Form(DEFAULT_CHART_VIEW, alias="chart"),
+    return_to: Optional[str] = Form(None),
 ):
     if (redirect := require_kid(request)) is not None:
         return redirect
@@ -6361,18 +6536,18 @@ def kid_invest_delete(
     normalized_symbol = _normalize_symbol(symbol)
     next_range = normalize_history_range(range_code)
     chart_mode = normalize_chart_view(chart_view)
+    def redirect_with_symbol(selected_symbol: str) -> RedirectResponse:
+        fallback_url = (
+            f"/kid/invest?symbol={selected_symbol}&range={next_range}&chart={chart_mode}"
+        )
+        target_url = _safe_invest_redirect(return_to, fallback_url)
+        return RedirectResponse(target_url, status_code=302)
     if not normalized_symbol:
         set_kid_notice(request, "Choose a stock to remove first.", "error")
-        return RedirectResponse(
-            f"/kid/invest?symbol={symbol}&range={next_range}&chart={chart_mode}",
-            status_code=302,
-        )
+        return redirect_with_symbol(symbol)
     if normalized_symbol == _normalize_symbol(DEFAULT_MARKET_SYMBOL):
         set_kid_notice(request, "The default market cannot be removed.", "error")
-        return RedirectResponse(
-            f"/kid/invest?symbol={symbol}&range={next_range}&chart={chart_mode}",
-            status_code=302,
-        )
+        return redirect_with_symbol(symbol)
     removed = False
     already_removed = False
     with Session(engine) as session:
@@ -6381,10 +6556,7 @@ def kid_invest_delete(
         ).first()
         if holding and abs(holding.shares) > 1e-4:
             set_kid_notice(request, "Sell your shares before removing this market.", "error")
-            return RedirectResponse(
-                f"/kid/invest?symbol={symbol}&range={next_range}&chart={chart_mode}",
-                status_code=302,
-            )
+            return redirect_with_symbol(symbol)
         link = session.exec(
             select(KidMarketInstrument)
             .where(KidMarketInstrument.kid_id == kid_id)
@@ -6406,10 +6578,7 @@ def kid_invest_delete(
         set_kid_notice(request, f"{normalized_symbol} was already removed.", "success")
     else:
         set_kid_notice(request, f"Removed {normalized_symbol} from your dashboard.", "success")
-    return RedirectResponse(
-        f"/kid/invest?symbol={fallback_symbol}&range={next_range}&chart={chart_mode}",
-        status_code=302,
-    )
+    return redirect_with_symbol(fallback_symbol)
 
 
 # ---------------------------------------------------------------------------
@@ -8298,6 +8467,12 @@ def admin_manage_chores(request: Request, kid_id: str = Query(...)):
                 f"<input type='hidden' name='chore_id' value='{chore.id}'><button type='submit'>Activate</button></form>"
             )
         )
+        action_items.append(
+            "<form method='post' action='/admin/chores/delete' class='chore-row__action-form' "
+            "onsubmit=\"return confirm('Delete this chore?');\">"
+            f"<input type='hidden' name='chore_id' value='{chore.id}'><button type='submit' class='danger-outline'>Delete</button>"
+            "</form>"
+        )
         action_html = "<div class='chore-row__actions'>" + "".join(action_items) + "</div>"
         rows_parts.append(
             "<tr>"
@@ -8389,26 +8564,46 @@ def admin_manage_chores(request: Request, kid_id: str = Query(...)):
       <p class='muted'>No pending submissions right now.</p>
     </div>
             """
-        history_rows = "".join(
-            "<tr>"
-            f"<td data-label='When'>{(claim.approved_at or claim.submitted_at).strftime('%Y-%m-%d %H:%M')}</td>"
-            f"<td data-label='Chore'><b>{html_escape(chore.name)}</b></td>"
-            f"<td data-label='Kid'><b>{html_escape(child.name)}</b><div class='muted'>{child.kid_id}</div></td>"
-            f"<td data-label='Period'>{claim.period_key}</td>"
-            f"<td data-label='Result'>{claim.status.title()}</td>"
-            f"<td data-label='Award' class='right'>{usd(claim.award_cents)}</td>"
-            "</tr>"
-            for claim, child, chore in recent_claim_rows
-        ) or "<tr><td colspan='6' class='muted'>(no recent activity)</td></tr>"
+        history_row_items: List[str] = []
+        for claim, child, chore in recent_claim_rows:
+            approved_role = (claim.approved_by or "").strip()
+            approved_label = (
+                admin_label_lookup.get(approved_role, approved_role)
+                if approved_role
+                else "—"
+            )
+            approved_display = (
+                html_escape(approved_label)
+                if approved_label != "—"
+                else approved_label
+            )
+            history_row_items.append(
+                "<tr>"
+                + f"<td data-label='When'>{(claim.approved_at or claim.submitted_at).strftime('%Y-%m-%d %H:%M')}</td>"
+                + f"<td data-label='Chore'><b>{html_escape(chore.name)}</b></td>"
+                + f"<td data-label='Kid'><b>{html_escape(child.name)}</b><div class='muted'>{child.kid_id}</div></td>"
+                + f"<td data-label='Period'>{claim.period_key}</td>"
+                + f"<td data-label='Result'>{claim.status.title()}</td>"
+                + f"<td data-label='Approved By'>{approved_display}</td>"
+                + f"<td data-label='Award' class='right'>{usd(claim.award_cents)}</td>"
+                + "</tr>"
+            )
+        history_rows = (
+            "".join(history_row_items)
+            or "<tr><td colspan='7' class='muted'>(no recent activity)</td></tr>"
+        )
         history_html = f"""
     <div class='card'>
       <h3>Recent Free-for-all Decisions</h3>
-      <table><tr><th>When</th><th>Chore</th><th>Kid</th><th>Period</th><th>Result</th><th>Award</th></tr>{history_rows}</table>
+      <table><tr><th>When</th><th>Chore</th><th>Kid</th><th>Period</th><th>Result</th><th>Approved By</th><th>Award</th></tr>{history_rows}</table>
     </div>
     """
     topbar = f"""
     <div class='topbar'><h3>{heading} {badge}</h3>
-      <a href='/admin'><button>Back</button></a>
+      <div style='display:flex; gap:8px; flex-wrap:wrap;'>
+        <a href='/admin?section=children'><button>Back</button></a>
+        <a href='/admin'><button>Home</button></a>
+      </div>
     </div>
     """
     inner = f"""
@@ -8790,6 +8985,45 @@ def admin_chore_deactivate(request: Request, chore_id: int = Form(...)):
         chore.active = False
         session.add(chore)
         session.commit()
+    return RedirectResponse(f"/admin/chores?kid_id={target_kid}", status_code=302)
+
+
+@app.post("/admin/chores/delete")
+def admin_chore_delete(request: Request, chore_id: int = Form(...)):
+    if (
+        redirect := require_admin_permission(
+            request, "can_manage_chores", redirect="/admin?section=chores"
+        )
+    ) is not None:
+        return redirect
+    chore_name = ""
+    target_kid = GLOBAL_CHORE_KID_ID
+    with Session(engine) as session:
+        chore = session.get(Chore, chore_id)
+        if not chore:
+            set_admin_notice(request, "Chore not found.", "error")
+            return RedirectResponse("/admin?section=chores", status_code=302)
+        chore_name = chore.name
+        target_kid = chore.kid_id or GLOBAL_CHORE_KID_ID
+        if chore.kid_id and chore.kid_id != GLOBAL_CHORE_KID_ID:
+            if (
+                denied := ensure_admin_kid_access(
+                    request, chore.kid_id, redirect="/admin?section=chores"
+                )
+            ) is not None:
+                return denied
+        session.exec(delete(ChoreInstance).where(ChoreInstance.chore_id == chore.id))
+        session.exec(delete(MarketplaceListing).where(MarketplaceListing.chore_id == chore.id))
+        if chore.kid_id == GLOBAL_CHORE_KID_ID:
+            session.exec(delete(GlobalChoreClaim).where(GlobalChoreClaim.chore_id == chore.id))
+        session.delete(chore)
+        session.commit()
+    if chore_name:
+        set_admin_notice(
+            request,
+            f"Deleted chore {html_escape(chore_name)}.",
+            "success",
+        )
     return RedirectResponse(f"/admin/chores?kid_id={target_kid}", status_code=302)
 
 
