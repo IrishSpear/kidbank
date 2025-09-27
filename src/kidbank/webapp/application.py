@@ -3064,6 +3064,17 @@ def compute_holdings_metrics(kid_id: str, symbol: str) -> dict:
     }
 
 
+def price_history_growth_percent(history: Sequence[Mapping[str, Any]]) -> Optional[float]:
+    prices = [point.get("p") for point in history if isinstance(point.get("p"), int)]
+    if len(prices) < 2:
+        return None
+    start, end = prices[0], prices[-1]
+    if start == 0:
+        return None
+    change = (end - start) / start * 100
+    return float(change)
+
+
 def sparkline_svg_from_history(hist: Iterable[dict], width: int = 320, height: int = 64, pad: int = 6) -> str:
     prices = [point.get("p") for point in hist if isinstance(point.get("p"), int)]
     svg_attrs = (
@@ -6275,6 +6286,7 @@ def _kid_invest_dashboard_inner(
     chart_mode = normalize_chart_view(chart_view)
     metrics = compute_holdings_metrics(kid_id, selected_symbol)
     history = fetch_price_history_range(selected_symbol, selected_range)
+    growth_pct = price_history_growth_percent(history)
     if chart_mode == CHART_VIEW_DETAIL:
         svg = detailed_history_chart_svg(history, width=640, height=260)
         enlarged_svg = detailed_history_chart_svg(history, width=1024, height=420)
@@ -6540,15 +6552,34 @@ def _kid_invest_dashboard_inner(
         </div>
     """
 
-    back_link_html = ""
+    if growth_pct is not None:
+        growth_color = "16a34a" if growth_pct >= 0 else "dc2626"
+        growth_line_html = (
+            "<div style='margin-top:6px;'>Window growth: "
+            + f"<span style='color:#{growth_color}; font-weight:600;'>{growth_pct:+.2f}%</span>"
+            + "</div>"
+        )
+    else:
+        growth_line_html = "<div class='muted' style='margin-top:6px;'>Window growth: —</div>"
+
+    nav_links: List[str] = []
     if include_back_link:
-        back_link_html = "<div style='margin-bottom:10px;'><a href='/kid' class='button-link secondary'>← Back to My Account</a></div>"
+        nav_links.append("<a href='/kid' class='button-link secondary'>← Back to My Account</a>")
+    if not embed:
+        nav_links.append("<a href='/kid/invest/portfolio'><button type='button'>View Portfolio Overview</button></a>")
+    nav_links_html = ""
+    if nav_links:
+        nav_links_html = (
+            "<div style='margin-bottom:10px; display:flex; flex-wrap:wrap; gap:8px;'>"
+            + "".join(nav_links)
+            + "</div>"
+        )
     footer_back_html = ""
     if not embed:
         footer_back_html = "<p class='muted' style='margin-top:10px;'><a href='/kid'>← Back to My Account</a></p>"
 
     inner = f"""
-        {notice_html}{back_link_html}{search_card_html}
+        {notice_html}{nav_links_html}{search_card_html}
         {tabs_html}
         <div class='card'>
           <h3>Investing — {instrument_label}</h3>
@@ -6562,6 +6593,7 @@ def _kid_invest_dashboard_inner(
               {chart_display_html}
               {chart_hint_html}
               {range_selector_html}
+              {growth_line_html}
               {chart_toggle_html}
             </div>
             <div class='card'>
@@ -6667,6 +6699,214 @@ def kid_invest_home(
         </div>
         """
         return render_page(request, "Investing — Error", body)
+
+
+def _instrument_portfolio_category(instrument: MarketInstrument) -> str:
+    if instrument.kind == INSTRUMENT_KIND_CRYPTO:
+        return "Crypto"
+    name_lower = (instrument.name or "").lower()
+    symbol_upper = (instrument.symbol or "").upper()
+    if "fund" in name_lower or "etf" in name_lower or symbol_upper.endswith("ETF"):
+        return "Funds"
+    return "Stock"
+
+
+@app.get("/kid/invest/portfolio", response_class=HTMLResponse)
+def kid_invest_portfolio(request: Request) -> HTMLResponse:
+    if (redirect := require_kid(request)) is not None:
+        return redirect
+    kid_id = kid_authed(request)
+    assert kid_id
+
+    instruments = list_market_instruments_for_kid(kid_id)
+    categories = ["Stock", "Funds", "Crypto"]
+    holdings_by_category: Dict[str, List[Dict[str, Any]]] = {key: [] for key in categories}
+    totals_by_category: Dict[str, Dict[str, int]] = {
+        key: {"value": 0, "invested": 0, "unrealized": 0, "realized": 0} for key in categories
+    }
+
+    for instrument in instruments:
+        metrics = compute_holdings_metrics(kid_id, instrument.symbol)
+        category = _instrument_portfolio_category(instrument)
+        if category not in holdings_by_category:
+            holdings_by_category[category] = []
+            totals_by_category[category] = {"value": 0, "invested": 0, "unrealized": 0, "realized": 0}
+        holdings_by_category[category].append({
+            "instrument": instrument,
+            "metrics": metrics,
+        })
+        totals = totals_by_category[category]
+        totals["value"] += metrics["market_value_c"]
+        totals["invested"] += metrics["invested_cost_c"]
+        totals["unrealized"] += metrics["unrealized_pl_c"]
+        totals["realized"] += metrics["realized_pl_c"]
+
+    for entries in holdings_by_category.values():
+        entries.sort(key=lambda entry: (_normalize_symbol(entry["instrument"].symbol), entry["instrument"].name or ""))
+
+    moment = _time_provider()
+    with Session(engine) as session:
+        certificates = session.exec(
+            select(Certificate)
+            .where(Certificate.kid_id == kid_id)
+            .order_by(desc(Certificate.opened_at))
+        ).all()
+
+    cd_rows: List[str] = []
+    cd_totals = {"value": 0, "principal": 0, "count": 0, "ready": 0}
+    for certificate in certificates:
+        value_c = certificate_value_cents(certificate, at=moment)
+        maturity = certificate_maturity_date(certificate)
+        cd_totals["value"] += value_c
+        cd_totals["principal"] += certificate.principal_cents
+        cd_totals["count"] += 1
+        if certificate.matured_at:
+            status = f"Cashed out on {certificate.matured_at:%Y-%m-%d}"
+        elif moment >= maturity:
+            status = "Matured — ready to cash out"
+            cd_totals["ready"] += 1
+        else:
+            days_left = max(0, (maturity.date() - moment.date()).days)
+            status = f"Matures {maturity:%Y-%m-%d} ({days_left} days left)"
+        cd_rows.append(
+            "<tr>"
+            + f"<td data-label='Principal'>{usd(certificate.principal_cents)}</td>"
+            + f"<td data-label='Value'>{usd(value_c)}</td>"
+            + f"<td data-label='Rate'>{certificate.rate_bps / 100:.2f}%</td>"
+            + f"<td data-label='Term'>{html_escape(certificate_term_label(certificate))}</td>"
+            + f"<td data-label='Status'>{status}</td>"
+            + f"<td data-label='Opened'>{certificate.opened_at:%Y-%m-%d}</td>"
+            + "</tr>"
+        )
+
+    def fmt_signed(value: int) -> str:
+        if value > 0:
+            return f"+{usd(value)}"
+        if value < 0:
+            return usd(value)
+        return usd(0)
+
+    def fmt_pct(value: float) -> str:
+        prefix = "+" if value >= 0 else ""
+        return f"{prefix}{value:.2f}%"
+
+    insight_items: List[str] = []
+    for key, label in (("Stock", "Stocks"), ("Funds", "Funds"), ("Crypto", "Crypto")):
+        totals = totals_by_category.get(key) or {"value": 0, "invested": 0, "unrealized": 0, "realized": 0}
+        change_c = totals["unrealized"] + totals["realized"]
+        insight_items.append(
+            "<div>"
+            + f"<div class='insight-label'>{label}</div>"
+            + f"<div class='insight-value'>{usd(totals['value'])}</div>"
+            + f"<div class='insight-meta'>Invested {usd(totals['invested'])} • Change {fmt_signed(change_c)}</div>"
+            + "</div>"
+        )
+    cd_change = cd_totals["value"] - cd_totals["principal"]
+    cd_meta_parts = [f"Principal {usd(cd_totals['principal'])}"]
+    if cd_totals["ready"]:
+        ready = cd_totals["ready"]
+        cd_meta_parts.append(f"{ready} ready to cash out")
+    insight_items.append(
+        "<div>"
+        + "<div class='insight-label'>CDs</div>"
+        + f"<div class='insight-value'>{usd(cd_totals['value'])}</div>"
+        + f"<div class='insight-meta'>{' • '.join(cd_meta_parts)} • Change {fmt_signed(cd_change)}</div>"
+        + "</div>"
+    )
+
+    insight_html = (
+        "<div class='insight-grid insight-grid--tight'>"
+        + "".join(insight_items)
+        + "</div>"
+    )
+
+    overview_card = (
+        "<div class='card'>"
+        "<h3>Portfolio Overview</h3>"
+        "<p class='muted'>Current holdings grouped by asset type.</p>"
+        f"{insight_html}"
+        "<div style='margin-top:12px;'><a href='/kid/invest'><button type='button'>Back to Investing</button></a></div>"
+        "</div>"
+    )
+
+    category_cards: List[str] = []
+    headers = (
+        "<tr><th>Symbol</th><th>Name</th><th>Shares</th><th>Price</th><th>Value</th><th>Invested</th>"
+        "<th>Unrealized</th><th>Realized</th><th>Total Return</th></tr>"
+    )
+    for key, label in (("Stock", "Stock Holdings"), ("Funds", "Fund Holdings"), ("Crypto", "Crypto Holdings")):
+        entries = holdings_by_category.get(key, [])
+        totals = totals_by_category.get(key) or {"value": 0, "invested": 0}
+        summary_line = (
+            f"<div class='muted' style='margin-top:6px;'>Positions: {len(entries)} • Value {usd(totals['value'])} "
+            f"• Invested {usd(totals['invested'])}</div>"
+        )
+        if entries:
+            rows = []
+            for entry in entries:
+                instrument = entry["instrument"]
+                metrics = entry["metrics"]
+                invested = metrics["invested_cost_c"]
+                total_return_c = metrics["unrealized_pl_c"] + metrics["realized_pl_c"]
+                return_text = "—"
+                if invested:
+                    pct_value = total_return_c / invested * 100
+                    return_text = fmt_pct(pct_value)
+                rows.append(
+                    "<tr>"
+                    + f"<td data-label='Symbol'><b>{html_escape(instrument.symbol)}</b></td>"
+                    + f"<td data-label='Name'>{html_escape(instrument.name or instrument.symbol)}</td>"
+                    + f"<td data-label='Shares' class='right'>{metrics['shares']:.4f}</td>"
+                    + f"<td data-label='Price' class='right'>{usd(metrics['price_c'])}</td>"
+                    + f"<td data-label='Value' class='right'>{usd(metrics['market_value_c'])}</td>"
+                    + f"<td data-label='Invested' class='right'>{usd(metrics['invested_cost_c'])}</td>"
+                    + f"<td data-label='Unrealized' class='right'>{fmt_signed(metrics['unrealized_pl_c'])}</td>"
+                    + f"<td data-label='Realized' class='right'>{fmt_signed(metrics['realized_pl_c'])}</td>"
+                    + f"<td data-label='Total Return' class='right'>{return_text}</td>"
+                    + "</tr>"
+                )
+            table_html = f"<table>{headers}{''.join(rows)}</table>"
+        else:
+            table_html = "<p class='muted' style='margin-top:6px;'>No holdings tracked in this category yet.</p>"
+        category_cards.append(
+            "<div class='card'>"
+            + f"<h3>{label}</h3>"
+            + summary_line
+            + table_html
+            + "</div>"
+        )
+
+    if cd_rows:
+        cd_table = (
+            "<table><tr><th>Principal</th><th>Value</th><th>Rate</th><th>Term</th><th>Status</th><th>Opened</th></tr>"
+            + "".join(cd_rows)
+            + "</table>"
+        )
+    else:
+        cd_table = "<p class='muted' style='margin-top:6px;'>No certificates yet.</p>"
+    cd_summary = (
+        f"<div class='muted' style='margin-top:6px;'>Certificates: {cd_totals['count']} • Value {usd(cd_totals['value'])} "
+        f"• Principal {usd(cd_totals['principal'])}</div>"
+    )
+    if cd_totals["ready"]:
+        ready = cd_totals["ready"]
+        cd_summary += (
+            f"<div class='muted'>" + f"{ready} certificate{'s' if ready != 1 else ''} ready to cash out." + "</div>"
+        )
+    cd_card = (
+        "<div class='card'>"
+        "<h3>Certificates of Deposit</h3>"
+        + cd_summary
+        + cd_table
+        + "</div>"
+    )
+
+    inner = overview_card + "".join(category_cards) + cd_card
+    body_attrs = f"{body_pref_attrs(request)} data-page='kid-invest-portfolio'"
+    html = frame("Investing — Portfolio", inner, body_attrs=body_attrs)
+    return HTMLResponse(html)
+
+
 @app.post("/kid/invest/track")
 def kid_invest_track(
     request: Request,
