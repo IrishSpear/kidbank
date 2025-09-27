@@ -6696,7 +6696,7 @@ def kid_invest_home(
         invest_styles = """
         <style>
         body[data-page='kid-invest']{overflow:hidden;}
-        .portfolio-modal__card{max-width:960px;width:calc(100% - 24px);}
+        .portfolio-modal__card{max-width:1120px;width:calc(100% - 24px);}
         .portfolio-modal__body{max-height:70vh;overflow:auto;padding:12px 4px 20px;}
         .portfolio-summary-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin-bottom:16px;}
         .portfolio-summary-card{background:#f8fafc;border:1px solid #e2e8f0;border-radius:12px;padding:12px;}
@@ -6705,6 +6705,22 @@ def kid_invest_home(
         .portfolio-summary-card__meta{font-size:13px;color:#64748b;margin-top:4px;}
         .portfolio-section{margin-top:18px;}
         .portfolio-section__header{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:10px;}
+        .portfolio-table-wrap{overflow:auto;border-radius:12px;border:1px solid #e2e8f0;box-shadow:0 1px 2px rgba(15,23,42,0.08);}
+        .portfolio-table{width:100%;border-collapse:separate;border-spacing:0;min-width:720px;background:#fff;}
+        .portfolio-table thead th{position:sticky;top:0;background:#0f172a;color:#f8fafc;text-transform:uppercase;font-size:12px;letter-spacing:0.05em;padding:10px 12px;text-align:left;z-index:1;}
+        .portfolio-table tbody td{padding:10px 12px;border-top:1px solid #e2e8f0;font-size:14px;vertical-align:middle;}
+        .portfolio-table tbody tr:first-child td{border-top:none;}
+        .portfolio-table tbody tr:hover td{background:#f1f5f9;}
+        .portfolio-row--gain td{background:rgba(22,163,74,0.08);}
+        .portfolio-row--loss td{background:rgba(220,38,38,0.08);}
+        .portfolio-row--even td{background:rgba(15,23,42,0.04);}
+        .portfolio-table tbody tr:hover.portfolio-row--gain td{background:rgba(22,163,74,0.15);}
+        .portfolio-table tbody tr:hover.portfolio-row--loss td{background:rgba(220,38,38,0.15);}
+        .portfolio-symbol{font-weight:700;font-size:15px;color:#0f172a;}
+        .portfolio-company{color:#475569;font-size:13px;}
+        .portfolio-actions{display:flex;flex-direction:column;gap:6px;}
+        .portfolio-actions form{display:flex;flex-wrap:wrap;gap:6px;align-items:center;}
+        .portfolio-actions input[data-money]{width:110px;}
         .portfolio-list{list-style:none;padding:0;margin:10px 0 0 0;display:flex;flex-direction:column;gap:10px;}
         .portfolio-item{border:1px solid #e2e8f0;border-radius:12px;padding:12px;background:#fff;box-shadow:0 1px 2px rgba(15,23,42,0.08);}
         .portfolio-item__meta{display:flex;flex-wrap:wrap;gap:8px;font-size:13px;color:#475569;margin-top:6px;}
@@ -6886,15 +6902,15 @@ def _build_portfolio_modal_html(
             + "</div>"
         )
         if entries:
-            items: List[str] = []
-            for instrument, metrics in entries:
+            rows: List[str] = []
+            for idx, (instrument, metrics) in enumerate(entries):
                 invested_c = metrics["invested_cost_c"]
                 total_return_c = metrics["unrealized_pl_c"] + metrics["realized_pl_c"]
-                return_text = "—"
+                return_pct_text = "—"
                 if invested_c:
-                    return_text = fmt_pct(total_return_c / invested_c * 100)
+                    return_pct_text = fmt_pct(total_return_c / invested_c * 100)
                 buy_form = (
-                    "<form method='post' action='/kid/invest/buy' class='inline'>"
+                    "<form method='post' action='/kid/invest/buy' class='inline portfolio-actions__form'>"
                     + f"<input type='hidden' name='symbol' value='{html_escape(instrument.symbol)}'>"
                     + f"<input type='hidden' name='range' value='{html_escape(selected_range)}'>"
                     + f"<input type='hidden' name='chart' value='{html_escape(chart_mode)}'>"
@@ -6904,7 +6920,7 @@ def _build_portfolio_modal_html(
                     + "</form>"
                 )
                 sell_form = (
-                    "<form method='post' action='/kid/invest/sell' class='inline'>"
+                    "<form method='post' action='/kid/invest/sell' class='inline portfolio-actions__form'>"
                     + f"<input type='hidden' name='symbol' value='{html_escape(instrument.symbol)}'>"
                     + f"<input type='hidden' name='range' value='{html_escape(selected_range)}'>"
                     + f"<input type='hidden' name='chart' value='{html_escape(chart_mode)}'>"
@@ -6913,23 +6929,41 @@ def _build_portfolio_modal_html(
                     + "<button type='submit' class='danger'>Sell</button>"
                     + "</form>"
                 )
-                items.append(
-                    "<li class='portfolio-item'>"
-                    + f"<div><b>{html_escape(instrument.symbol)}</b> — {html_escape(instrument.name or instrument.symbol)}</div>"
-                    + "<div class='portfolio-item__meta'>"
-                    + f"<span>Shares {metrics['shares']:.4f}</span>"
-                    + f"<span>Value {usd(metrics['market_value_c'])}</span>"
-                    + f"<span>Invested {usd(metrics['invested_cost_c'])}</span>"
-                    + f"<span>Total return {return_text}</span>"
-                    + f"<span>P/L {fmt_signed(total_return_c)}</span>"
-                    + "</div>"
-                    + "<div class='portfolio-item__actions'>"
+                row_classes: List[str] = []
+                if total_return_c > 0:
+                    row_classes.append("portfolio-row--gain")
+                elif total_return_c < 0:
+                    row_classes.append("portfolio-row--loss")
+                else:
+                    row_classes.append("portfolio-row--even")
+                class_attr = f" class='{' '.join(row_classes)}'" if row_classes else ""
+                rows.append(
+                    f"<tr{class_attr}>"
+                    + "<td>"
+                    + f"<div class='portfolio-symbol'>{html_escape(instrument.symbol)}</div>"
+                    + f"<div class='portfolio-company'>{html_escape(instrument.name or instrument.symbol)}</div>"
+                    + "</td>"
+                    + f"<td>{usd(metrics['price_c'])}</td>"
+                    + f"<td>{usd(metrics['avg_cost_c'])}</td>"
+                    + f"<td>{metrics['shares']:.4f}</td>"
+                    + f"<td>{usd(metrics['market_value_c'])}</td>"
+                    + f"<td>{usd(invested_c)}</td>"
+                    + f"<td>{fmt_signed(total_return_c)}</td>"
+                    + f"<td>{return_pct_text}</td>"
+                    + "<td><div class='portfolio-actions'>"
                     + buy_form
                     + sell_form
-                    + "</div>"
-                    + "</li>"
+                    + "</div></td>"
+                    + "</tr>"
                 )
-            items_html = "<ul class='portfolio-list'>" + "".join(items) + "</ul>"
+            table_head = (
+                "<thead><tr><th>Ticker</th><th>Price</th><th>Avg Cost</th><th>Shares</th><th>Value</th><th>Invested</th><th>P/L</th><th>Return %</th><th>Actions</th></tr></thead>"
+            )
+            items_html = (
+                "<div class='portfolio-table-wrap'>"
+                + f"<table class='portfolio-table'>{table_head}<tbody>{''.join(rows)}</tbody></table>"
+                + "</div>"
+            )
         else:
             items_html = "<p class='muted'>No holdings yet in this category.</p>"
         category_sections.append(
