@@ -3562,11 +3562,14 @@ def kid_home(
                 schedule_bits.append(f"Month days: {format_month_days(month_days)}")
             if chore.kid_id == SHARED_CHORE_KID_ID:
                 member_pairs = getattr(chore, "shared_member_pairs", [])
-                others = [name for kid, name in member_pairs if kid != kid_id]
-                if not others:
-                    others = [name for _, name in member_pairs]
-                if others:
-                    schedule_bits.append("Shared with: " + ", ".join(html_escape(name) for name in others))
+                shared_other_names = [name for kid, name in member_pairs if kid != kid_id]
+                if not shared_other_names:
+                    shared_other_names = [name for _, name in member_pairs]
+                if shared_other_names:
+                    schedule_bits.append(
+                        "Shared with: "
+                        + ", ".join(html_escape(name) for name in shared_other_names)
+                    )
                 schedule_bits.append(f"Max claimants: {chore.max_claimants}")
             if getattr(chore, "marketplace_blocked", False):
                 schedule_bits.append("Job board listing disabled")
