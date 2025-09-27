@@ -752,9 +752,9 @@ def base_styles() -> str:
       }
       input,textarea,select{
         width:100%; padding:12px; border:1px solid #2b3545; border-radius:10px;
-        background:transparent; color:var(--text); box-sizing:border-box; font-size:16px;
+        background:#ffffff; color:#000000 !important; box-sizing:border-box; font-size:16px;
       }
-      select, select option{color:#000;}
+      select, select option{color:#000000;}
       input[type=checkbox], input[type=radio]{
         width:auto; min-width:0; padding:0; margin:0 6px 0 0;
       }
