@@ -938,6 +938,19 @@ def base_styles() -> str:
         td[data-label="Actions"] .right{ text-align:left; }
         td[data-label="Actions"] form,
         td[data-label="Actions"] a{ display:block; width:100%; margin:6px 0 0 0; }
+        .calendar-table,
+        .calendar-table thead,
+        .calendar-table tbody,
+        .calendar-table tr,
+        .calendar-table th,
+        .calendar-table td{ display:table; width:auto; }
+        .calendar-table{ width:100%; }
+        .calendar-table thead{ display:table-header-group; }
+        .calendar-table tbody{ display:table-row-group; }
+        .calendar-table tr{ display:table-row; margin:0; border:none; padding:0; background:transparent; }
+        .calendar-table th,
+        .calendar-table td{ display:table-cell; border:none; padding:6px 4px; position:static; text-align:center !important; white-space:normal; }
+        .calendar-table td::before{ content:none; }
         td[data-label="Actions"] button{ width:100%; }
         .chore-row__actions{align-items:stretch;}
         .chore-row__actions form{justify-content:stretch;}
