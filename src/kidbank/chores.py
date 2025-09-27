@@ -369,7 +369,7 @@ class GlobalChore:
 
 
 class ChoreListingStatus(str, Enum):
-    """Lifecycle states for marketplace listings."""
+    """Lifecycle states for job board listings."""
 
     OPEN = "open"
     CLAIMED = "claimed"
@@ -403,7 +403,7 @@ class ChoreListing:
     def __post_init__(self) -> None:
         offer = Decimal(self.offer).quantize(Decimal("0.01"))
         if offer <= Decimal("0.00"):
-            raise ValueError("Offer must be positive for a marketplace listing.")
+            raise ValueError("Offer must be positive for a job board listing.")
         object.__setattr__(self, "offer", offer)
 
     def claim(self, child_name: str, *, when: datetime | None = None) -> None:
@@ -464,7 +464,7 @@ class ChoreListing:
 
 
 class ChoreMarketplace:
-    """Manage marketplace listings for chores."""
+    """Manage job board listings for chores."""
 
     def __init__(self) -> None:
         self._listings: Dict[str, ChoreListing] = {}
@@ -485,7 +485,7 @@ class ChoreMarketplace:
         try:
             return self._listings[listing_id]
         except KeyError as exc:  # pragma: no cover - defensive guard
-            raise KeyError(f"Marketplace listing '{listing_id}' does not exist.") from exc
+            raise KeyError(f"Job board listing '{listing_id}' does not exist.") from exc
 
     def listings(self, *, include_closed: bool = False) -> Sequence[ChoreListing]:
         if include_closed:
