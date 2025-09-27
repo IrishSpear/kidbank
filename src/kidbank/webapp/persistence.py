@@ -108,6 +108,7 @@ class ChoreInstance(SQLModel, table=True):
     period_key: str  # daily: YYYY-MM-DD; weekly: <SundayISO>-WEEK; special: SPECIAL
     status: str = "available"  # available|pending|pending_marketplace|paid
     completed_at: Optional[datetime] = None
+    completing_kid_id: Optional[str] = None
     paid_event_id: Optional[int] = None
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
@@ -225,6 +226,12 @@ class GlobalChoreAudience(SQLModel, table=True):
     kid_id: str
 
 
+class SharedChoreMember(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    chore_id: int
+    kid_id: str
+
+
 class Lesson(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     title: str
@@ -252,6 +259,7 @@ class QuizAttempt(SQLModel, table=True):
 
 
 GLOBAL_CHORE_KID_ID = "__GLOBAL__"
+SHARED_CHORE_KID_ID = "__SHARED__"
 GLOBAL_CHORE_STATUS_PENDING = "pending"
 GLOBAL_CHORE_STATUS_APPROVED = "approved"
 GLOBAL_CHORE_STATUS_REJECTED = "rejected"
@@ -342,6 +350,8 @@ def run_migrations() -> None:
             raw.execute("ALTER TABLE chore ADD COLUMN end_date TEXT;")
         if not _column_exists(raw, "choreinstance", "paid_event_id"):
             raw.execute("ALTER TABLE choreinstance ADD COLUMN paid_event_id INTEGER;")
+        if not _column_exists(raw, "choreinstance", "completing_kid_id"):
+            raw.execute("ALTER TABLE choreinstance ADD COLUMN completing_kid_id TEXT;")
         if not _column_exists(raw, "choreinstance", "created_at"):
             raw.execute("ALTER TABLE choreinstance ADD COLUMN created_at TEXT;")
         if not _column_exists(raw, "goal", "achieved_at"):
@@ -415,6 +425,15 @@ def run_migrations() -> None:
                 price_cents INTEGER,
                 amount_cents INTEGER,
                 realized_pl_cents INTEGER
+            );
+            """
+        )
+        raw.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sharedchoremember (
+                id INTEGER PRIMARY KEY,
+                chore_id INTEGER,
+                kid_id TEXT
             );
             """
         )
@@ -614,10 +633,12 @@ __all__ = [
     "KidMarketInstrument",
     "GlobalChoreClaim",
     "GlobalChoreAudience",
+    "SharedChoreMember",
     "Lesson",
     "Quiz",
     "QuizAttempt",
     "GLOBAL_CHORE_KID_ID",
+    "SHARED_CHORE_KID_ID",
     "GLOBAL_CHORE_STATUS_PENDING",
     "GLOBAL_CHORE_STATUS_APPROVED",
     "GLOBAL_CHORE_STATUS_REJECTED",

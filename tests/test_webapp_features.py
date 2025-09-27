@@ -42,6 +42,7 @@ from kidbank.webapp import (
     Child,
     Chore,
     ChoreInstance,
+    SharedChoreMember,
     Event,
     Goal,
     GlobalChoreClaim,
@@ -52,6 +53,7 @@ from kidbank.webapp import (
     MetaKV,
     Quiz,
     QuizAttempt,
+    SHARED_CHORE_KID_ID,
 )
 
 
@@ -882,6 +884,46 @@ def test_global_chore_audience_limits_claims() -> None:
         ).all()
     assert len(claims) == 1
     assert claims[0].kid_id == "avery"
+
+
+def test_kid_dashboard_renders_shared_chore_details() -> None:
+    client = TestClient(app)
+    with Session(engine) as session:
+        kids = [
+            Child(kid_id="avery", name="Avery", kid_pin="1111", balance_cents=0),
+            Child(kid_id="blake", name="Blake", kid_pin="2222", balance_cents=0),
+        ]
+        session.add_all(kids)
+        session.commit()
+        shared_chore = Chore(
+            kid_id=SHARED_CHORE_KID_ID,
+            name="Dish Duty",
+            type="weekly",
+            award_cents=500,
+            penalty_cents=100,
+            max_claimants=2,
+        )
+        session.add(shared_chore)
+        session.commit()
+        session.refresh(shared_chore)
+        session.add_all(
+            [
+                SharedChoreMember(chore_id=shared_chore.id, kid_id="avery"),
+                SharedChoreMember(chore_id=shared_chore.id, kid_id="blake"),
+            ]
+        )
+        session.commit()
+    login = client.post(
+        "/kid/login",
+        data={"kid_id": "avery", "kid_pin": "1111"},
+        follow_redirects=False,
+    )
+    assert login.status_code == 302
+    dashboard = client.get("/kid?section=chores")
+    assert dashboard.status_code == 200
+    assert "We hit a snag" not in dashboard.text
+    assert "Shared with:" in dashboard.text
+    assert "Max claimants: 2" in dashboard.text
 
 
 def test_global_chore_multiple_claims_split_evenly() -> None:
