@@ -3346,7 +3346,7 @@ def kid_home(
                 is_special_once
                 and is_selected_today
                 and status
-                in {"pending", CHORE_STATUS_PENDING_MARKETPLACE, "paid"}
+                in {"pending", CHORE_STATUS_PENDING_MARKETPLACE}
             ):
                 special_note_html = "<div class='muted chore-item__schedule'>Available again tomorrow.</div>"
             if is_selected_today and status == "available":
