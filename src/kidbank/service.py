@@ -564,7 +564,7 @@ class KidBank:
         return payouts
 
     def marketplace_listings(self, *, include_closed: bool = False) -> Sequence[ChoreListing]:
-        """Return marketplace listings, optionally including closed ones."""
+        """Return job board listings, optionally including closed ones."""
 
         return self._marketplace.listings(include_closed=include_closed)
 
@@ -575,20 +575,20 @@ class KidBank:
         *,
         offer: AmountLike,
     ) -> ChoreListing:
-        """Publish one of the owner's chores to the marketplace."""
+        """Publish one of the owner's chores to the job board."""
 
         self.get_account(owner)
         board = self._chores[owner]
         board.get(chore_name)
         if self._marketplace.active_listing_for(owner, chore_name):
-            raise ValueError(f"Chore '{chore_name}' already has an active marketplace listing.")
+            raise ValueError(f"Chore '{chore_name}' already has an active job board listing.")
         offer_value = to_decimal(offer)
         if offer_value <= Decimal("0.00"):
-            raise ValueError("Marketplace offer must be positive.")
+            raise ValueError("Job board offer must be positive.")
         escrow = self.withdraw(
             owner,
             offer_value,
-            f"Marketplace listing escrow: {chore_name}",
+            f"Job board listing escrow: {chore_name}",
             category=EventCategory.CHORE,
             metadata={"marketplace": "escrow", "chore": chore_name},
         )
@@ -599,7 +599,7 @@ class KidBank:
         return listing
 
     def claim_marketplace_chore(self, child_name: str, listing_id: str) -> ChoreListing:
-        """Allow another child to claim an open marketplace listing."""
+        """Allow another child to claim an open job board listing."""
 
         self.get_account(child_name)
         listing = self._marketplace.claim(listing_id, child_name)
@@ -615,15 +615,15 @@ class KidBank:
         proof: Optional[str] = None,
         at: Optional[datetime] = None,
     ) -> Decimal:
-        """Submit a marketplace chore completion for administrator approval."""
+        """Submit a job board chore completion for administrator approval."""
 
 
         self.get_account(child_name)
         listing = self._marketplace.listing(listing_id)
         if listing.status is not ChoreListingStatus.CLAIMED:
-            raise ValueError("Marketplace listing is not ready for completion.")
+            raise ValueError("Job board listing is not ready for completion.")
         if listing.claimed_by != child_name:
-            raise ValueError("This marketplace listing was claimed by another child.")
+            raise ValueError("This job board listing was claimed by another child.")
         board = self._chores[listing.owner]
         completion = board.complete_chore(listing.chore_name, at=at, proof=proof)
         self._marketplace.submit(listing_id, child_name, completion)
@@ -641,17 +641,17 @@ class KidBank:
 
 
     def cancel_marketplace_listing(self, owner: str, listing_id: str) -> ChoreListing:
-        """Cancel an open marketplace listing and refund the escrowed funds."""
+        """Cancel an open job board listing and refund the escrowed funds."""
 
         self.get_account(owner)
         listing = self._marketplace.listing(listing_id)
         if listing.owner != owner:
-            raise ValueError("Only the owner can cancel this marketplace listing.")
+            raise ValueError("Only the owner can cancel this job board listing.")
         self._marketplace.cancel(listing_id, owner)
         self.deposit(
             owner,
             listing.offer,
-            f"Marketplace listing cancelled: {listing.chore_name}",
+            f"Job board listing cancelled: {listing.chore_name}",
             category=EventCategory.CHORE,
             metadata={"marketplace": "refund", "listing": listing.listing_id, "chore": listing.chore_name},
         )
@@ -660,7 +660,7 @@ class KidBank:
         return listing
 
     def pending_marketplace_submissions(self) -> Sequence[ChoreListing]:
-        """Return marketplace listings waiting on administrator approval."""
+        """Return job board listings waiting on administrator approval."""
 
         return self._marketplace.submissions()
 
@@ -674,9 +674,9 @@ class KidBank:
     ) -> Decimal:
         listing = self._marketplace.listing(listing_id)
         if listing.status is not ChoreListingStatus.SUBMITTED:
-            raise ValueError("Marketplace submission is not awaiting approval.")
+            raise ValueError("Job board submission is not awaiting approval.")
         if not listing.pending_completion:
-            raise ValueError("Marketplace submission details were missing.")
+            raise ValueError("Job board submission details were missing.")
         completion = listing.pending_completion
         default_total = (completion.awarded_value + listing.offer).quantize(Decimal("0.01"))
         if payout_override is None:
@@ -684,7 +684,7 @@ class KidBank:
         else:
             final_total = to_decimal(payout_override).quantize(Decimal("0.01"))
             if final_total < Decimal("0.00"):
-                raise ValueError("Marketplace payout override cannot be negative.")
+                raise ValueError("Job board payout override cannot be negative.")
         award_value = completion.awarded_value
         offer_component = max(final_total - award_value, Decimal("0.00"))
         offer_delta = offer_component - listing.offer
@@ -694,7 +694,7 @@ class KidBank:
             self.withdraw(
                 listing.owner,
                 offer_delta,
-                f"Marketplace offer increase: {listing.chore_name}",
+                f"Job board offer increase: {listing.chore_name}",
                 category=EventCategory.CHORE,
                 metadata={"marketplace": "offer_increase", "listing": listing.listing_id},
             )
@@ -702,7 +702,7 @@ class KidBank:
             self.deposit(
                 listing.owner,
                 -offer_delta,
-                f"Marketplace offer refund: {listing.chore_name}",
+                f"Job board offer refund: {listing.chore_name}",
                 category=EventCategory.CHORE,
                 metadata={"marketplace": "offer_refund", "listing": listing.listing_id},
             )
@@ -722,7 +722,7 @@ class KidBank:
             transaction = self.deposit(
                 listing.claimed_by or listing.owner,
                 final_total,
-                f"Marketplace chore payout: {listing.chore_name}",
+            f"Job board chore payout: {listing.chore_name}",
                 category=EventCategory.CHORE,
                 metadata=metadata,
             )
@@ -759,13 +759,13 @@ class KidBank:
     ) -> None:
         listing = self._marketplace.listing(listing_id)
         if listing.status is not ChoreListingStatus.SUBMITTED:
-            raise ValueError("Marketplace submission is not awaiting approval.")
+            raise ValueError("Job board submission is not awaiting approval.")
         resolution_time = self._now()
         if listing.offer > Decimal("0.00"):
             self.deposit(
                 listing.owner,
                 listing.offer,
-                f"Marketplace listing rejected: {listing.chore_name}",
+                f"Job board listing rejected: {listing.chore_name}",
                 category=EventCategory.CHORE,
                 metadata={"marketplace": "reject_refund", "listing": listing.listing_id},
             )

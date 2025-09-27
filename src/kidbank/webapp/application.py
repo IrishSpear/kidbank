@@ -3427,7 +3427,7 @@ def kid_home(
             if month_days:
                 schedule_bits.append(f"Month days: {format_month_days(month_days)}")
             if getattr(chore, "marketplace_blocked", False):
-                schedule_bits.append("Marketplace listing disabled")
+                schedule_bits.append("Job board listing disabled")
             schedule_line = (
                 f"<div class='muted chore-item__schedule'>{' • '.join(schedule_bits)}</div>"
                 if schedule_bits
@@ -4103,10 +4103,10 @@ def kid_home(
             ),
             (
                 "<div class='stat-card'>"
-                "<div class='stat-card__label'>Marketplace</div>"
+                "<div class='stat-card__label'>Job Board</div>"
                 f"<div class='stat-card__value'>{marketplace_available_count} open</div>"
                 f"<div class='stat-card__meta'>My listings {my_listing_active_count} • My claims {my_claimed_active_count}</div>"
-                "<a href='/kid?section=marketplace' class='stat-card__action'>Visit market</a></div>"
+                "<a href='/kid?section=marketplace' class='stat-card__action'>Visit job board</a></div>"
             ),
             (
                 "<div class='stat-card'>"
@@ -4495,7 +4495,7 @@ def kid_home(
             )
         my_listings_table = (
             "".join(my_listing_rows)
-            or "<tr><td colspan='4' class='muted'>You have not posted any marketplace listings yet.</td></tr>"
+            or "<tr><td colspan='4' class='muted'>You have not posted any job board listings yet.</td></tr>"
         )
 
         my_claim_rows = []
@@ -4543,8 +4543,8 @@ def kid_home(
 
         marketplace_content = f"""
           <div class='card'>
-            <h3>Post a marketplace listing</h3>
-            <p class='muted'>Offer one of your chores for another kid to complete. You set the extra cash and they also earn the chore award.</p>
+            <h3>Post to the job board</h3>
+            <p class='muted'>Offer one of your chores on the job board for another kid to complete. You set the extra cash and they also earn the chore award.</p>
             {listing_form_html}
           </div>
           <div class='card'>
@@ -4576,7 +4576,7 @@ def kid_home(
             ("overview", "Overview", overview_content),
             ("chores", "My Chores", chores_content),
             ("freeforall", "Free-for-all", global_card),
-            ("marketplace", "Marketplace", marketplace_content),
+            ("marketplace", "Job Board", marketplace_content),
             ("goals", "Goals", goals_content),
             ("learning", "Learning Lab", learning_content),
             ("money", "Send/Request", money_content),
@@ -5193,7 +5193,7 @@ def kid_checkoff(request: Request, chore_id: int = Form(...)):
         if active_listing:
             set_kid_notice(
                 request,
-                "That chore is currently listed in the marketplace.",
+                "That chore is currently listed on the job board.",
                 "error",
             )
             return RedirectResponse("/kid?section=marketplace", status_code=302)
@@ -5538,7 +5538,7 @@ def kid_marketplace_list(
             set_kid_notice(request, "That chore isn't available to list today.", "error")
             return RedirectResponse("/kid?section=marketplace", status_code=302)
         if getattr(chore, "marketplace_blocked", False):
-            set_kid_notice(request, "That chore can't be listed in the marketplace.", "error")
+            set_kid_notice(request, "That chore can't be listed on the job board.", "error")
             return RedirectResponse("/kid?section=marketplace", status_code=302)
         listed_chore_name = chore.name
         existing_listing = _safe_marketplace_first(
@@ -5566,7 +5566,7 @@ def kid_marketplace_list(
             Event(
                 child_id=child.kid_id,
                 change_cents=-offer_cents,
-                reason=f"Marketplace offer held: {chore.name}",
+                reason=f"Job board offer held: {chore.name}",
             )
         )
         listing = MarketplaceListing(
@@ -5579,7 +5579,7 @@ def kid_marketplace_list(
         session.add(child)
         session.add(listing)
         session.commit()
-    set_kid_notice(request, f"Listed '{listed_chore_name}' in the marketplace!", "success")
+    set_kid_notice(request, f"Listed '{listed_chore_name}' on the job board!", "success")
     return RedirectResponse("/kid?section=marketplace", status_code=302)
 
 
@@ -5609,7 +5609,7 @@ def kid_marketplace_cancel(request: Request, listing_id: int = Form(...)):
             Event(
                 child_id=owner.kid_id,
                 change_cents=listing.offer_cents,
-                reason=f"Marketplace offer returned: {listing.chore_name}",
+                reason=f"Job board offer returned: {listing.chore_name}",
             )
         )
         session.add(owner)
@@ -5680,7 +5680,7 @@ def kid_marketplace_complete(request: Request, listing_id: int = Form(...)):
             Event(
                 child_id=owner.kid_id,
                 change_cents=0,
-                reason=f"Marketplace helper {worker.name} submitted {listing.chore_name}",
+                reason=f"Job board helper {worker.name} submitted {listing.chore_name}",
 
             )
         )
@@ -5708,7 +5708,7 @@ def kid_marketplace_complete(request: Request, listing_id: int = Form(...)):
         session.commit()
     set_kid_notice(
         request,
-        "Marketplace chore submitted! A parent will review the payout soon.",
+        "Job board chore submitted! A parent will review the payout soon.",
         "success",
     )
 
@@ -7255,7 +7255,7 @@ def admin_home(
         pending_rows_parts.append(
             "<tr>"
             f"<td data-label='Kid'><b>{worker_name}</b><div class='muted'>{html_escape(listing.claimed_by or '')}</div></td>"
-            f"<td data-label='Chore'><b>{html_escape(listing.chore_name)}</b><div class='muted'>Marketplace from {owner_name}</div></td>"
+            f"<td data-label='Chore'><b>{html_escape(listing.chore_name)}</b><div class='muted'>Job board listing from {owner_name}</div></td>"
             f"<td data-label='Award' class='right'><b>{usd(total_value)}</b><div class='muted'>Offer {usd(listing.offer_cents)} • Award {usd(listing.chore_award_cents)}</div></td>"
             f"<td data-label='Completed'>{submitted_at}</td>"
             "<td data-label='Actions' class='right'>"
@@ -7265,7 +7265,7 @@ def admin_home(
             "<input name='amount' type='text' data-money placeholder='override $ (optional)' style='max-width:150px'>"
             "<input name='reason' type='text' placeholder='reason (optional)' style='max-width:200px'>"
             "<button type='submit'>Approve</button></form> "
-            "<form class='inline' method='post' action='/admin/marketplace/deny' style='margin-left:6px;' onsubmit='return confirm(\"Deny this marketplace payout?\");'>"
+            "<form class='inline' method='post' action='/admin/marketplace/deny' style='margin-left:6px;' onsubmit='return confirm(\"Deny this job board payout?\");'>"
             f"<input type='hidden' name='listing_id' value='{listing.id}'>"
             "<input type='hidden' name='redirect' value='/admin?section=payouts'>"
             "<input name='reason' type='text' placeholder='reason (optional)' style='max-width:200px'>"
@@ -7399,7 +7399,7 @@ def admin_home(
             readonly_rows.append(
                 "<tr>"
                 f"<td data-label='Kid'><b>{worker_name}</b><div class='muted'>{html_escape(listing.claimed_by or '')}</div></td>"
-                f"<td data-label='Chore'><b>{html_escape(listing.chore_name)}</b><div class='muted'>Marketplace from {owner_name}</div></td>"
+                f"<td data-label='Chore'><b>{html_escape(listing.chore_name)}</b><div class='muted'>Job board listing from {owner_name}</div></td>"
                 f"<td data-label='Award' class='right'><b>{usd(listing.offer_cents + listing.chore_award_cents)}</b></td>"
                 f"<td data-label='Completed'>{_format_market_ts(listing.submitted_at)}</td>"
                 "</tr>"
@@ -8410,7 +8410,7 @@ def admin_home(
         )
     marketplace_table = (
         "".join(marketplace_rows)
-        or "<tr><td colspan='5' class='muted'>No marketplace activity recorded yet.</td></tr>"
+        or "<tr><td colspan='5' class='muted'>No job board activity recorded yet.</td></tr>"
     )
     marketplace_summary = (
         f"Open {len(marketplace_open)} • Claimed {len(marketplace_claimed)}"
@@ -8421,7 +8421,7 @@ def admin_home(
     )
     marketplace_card = (
         "<div class='card'>"
-        "<h3>Chore Marketplace</h3>"
+        "<h3>Chore Job Board</h3>"
         f"<div class='muted'>{marketplace_summary}</div>"
         f"<div class='muted' style='margin-bottom:8px;'>Escrow {usd(escrow_total_c)} • Lifetime payouts {usd(payout_total_c)}</div>"
         f"<table><tr><th>Created</th><th>Owner</th><th>Offer</th><th>Total</th><th>Status</th></tr>{marketplace_table}</table>"
@@ -8455,7 +8455,7 @@ def admin_home(
         "<div class='chore-schedule-selector chore-schedule-selector--special' data-schedule-group='special' style='display:none;'><label>Specific dates (comma separated)</label><input name='specific_dates' placeholder='YYYY-MM-DD,YYYY-MM-DD'></div>"
         "</div>"
         "<label>Notes</label><input name='notes' placeholder='Any details'>"
-        "<label style='display:flex; align-items:center; gap:6px; margin-top:6px;'><input type='checkbox' name='block_marketplace' value='1'> Prevent marketplace listing</label>"
+        "<label style='display:flex; align-items:center; gap:6px; margin-top:6px;'><input type='checkbox' name='block_marketplace' value='1'> Prevent job board listing</label>"
         "<p class='muted'>Global chores appear for all kids under “Free-for-all”. Use max claimants to set how many kids can share the reward per period.</p>"
         "<button type='submit'>Add Chore</button>"
         "</form>"
@@ -8479,7 +8479,7 @@ def admin_home(
         ("accounts", "Account tools", accounts_content, ""),
         ("investing", "Portfolios & analytics", investing_card, ""),
         ("chores", "Chore publishing", chores_card, ""),
-        ("marketplace", "Marketplace", marketplace_card, ""),
+        ("marketplace", "Job Board", marketplace_card, ""),
         ("prizes", "Prizes", prizes_card, ""),
         ("rules", "Allowance rules", rules_card, ""),
         ("time", "Time controls", time_card, ""),
@@ -8738,7 +8738,7 @@ def admin_manage_chores(request: Request, kid_id: str = Query(...)):
             f"<div style='display:flex; align-items:center; gap:8px; flex-wrap:wrap;'><label style='display:flex; align-items:center; gap:4px; font-weight:400;'><input type='checkbox' name='penalty_enabled' value='1'{penalty_checked} form='{form_id}'> Apply</label><input name='penalty_amount' type='text' data-money value='{penalty_value}' form='{form_id}' class='chore-field--compact'></div>"
             "</div>"
             f"<div class='chore-card__field'><label>Max spots</label><input name='max_claimants' type='number' min='1' value='{max(1, chore.max_claimants)}' form='{form_id}'></div>"
-            f"<div class='chore-card__field'><label>Marketplace</label><div style='display:flex; align-items:center; gap:8px; font-weight:400;'><input type='checkbox' name='block_marketplace' value='1'{marketplace_checked} form='{form_id}' id='marketplace-{chore.id}'><label for='marketplace-{chore.id}' style='margin:0;'>Block listing</label></div></div>"
+            f"<div class='chore-card__field'><label>Job Board</label><div style='display:flex; align-items:center; gap:8px; font-weight:400;'><input type='checkbox' name='block_marketplace' value='1'{marketplace_checked} form='{form_id}' id='marketplace-{chore.id}'><label for='marketplace-{chore.id}' style='margin:0;'>Block listing</label></div></div>"
             f"<div class='chore-card__field chore-card__field--wide'><label>Schedule</label>{schedule_html}</div>"
             f"<div class='chore-card__field chore-card__field--wide'><label>Notes</label><textarea name='notes' form='{form_id}' rows='2'>{notes_value}</textarea></div>"
             "</div>"
@@ -10409,7 +10409,7 @@ def admin_marketplace_payout(
     with Session(engine) as session:
         listing = session.get(MarketplaceListing, listing_id)
         if not listing or listing.status != MARKETPLACE_STATUS_SUBMITTED:
-            set_admin_notice(request, "That marketplace submission is not pending.", "error")
+            set_admin_notice(request, "That job board submission is not pending.", "error")
             return RedirectResponse(redirect_target, status_code=302)
         owner = session.exec(select(Child).where(Child.kid_id == listing.owner_kid_id)).first()
         worker = (
@@ -10419,7 +10419,7 @@ def admin_marketplace_payout(
         )
         chore = session.get(Chore, listing.chore_id)
         if not owner or not worker:
-            set_admin_notice(request, "Could not locate kids for that marketplace payout.", "error")
+            set_admin_notice(request, "Could not locate kids for that job board payout.", "error")
             return RedirectResponse(redirect_target, status_code=302)
         award_cents = listing.chore_award_cents or (chore.award_cents if chore else 0)
         if award_cents < 0:
@@ -10450,7 +10450,7 @@ def admin_marketplace_payout(
                 Event(
                     child_id=owner.kid_id,
                     change_cents=-offer_delta_c,
-                    reason=f"Marketplace offer increase: {listing.chore_name}",
+                    reason=f"Job board offer increase: {listing.chore_name}",
                 )
             )
         elif offer_delta_c < 0:
@@ -10460,7 +10460,7 @@ def admin_marketplace_payout(
                 Event(
                     child_id=owner.kid_id,
                     change_cents=refund_c,
-                    reason=f"Marketplace offer refund: {listing.chore_name}",
+                    reason=f"Job board offer refund: {listing.chore_name}",
                 )
             )
         owner.updated_at = moment
@@ -10468,7 +10468,7 @@ def admin_marketplace_payout(
         if final_total_c > 0:
             worker.balance_cents += final_total_c
             worker.updated_at = moment
-            payout_reason = f"Marketplace payout: {listing.chore_name}"
+            payout_reason = f"Job board payout: {listing.chore_name}"
             if note_clean:
                 payout_reason += f" ({note_clean})"
             payout_reason += f"|approved_by:{actor}"
@@ -10534,7 +10534,7 @@ def admin_marketplace_deny(
     with Session(engine) as session:
         listing = session.get(MarketplaceListing, listing_id)
         if not listing or listing.status != MARKETPLACE_STATUS_SUBMITTED:
-            set_admin_notice(request, "That marketplace submission is not pending.", "error")
+            set_admin_notice(request, "That job board submission is not pending.", "error")
             return RedirectResponse(redirect_target, status_code=302)
         owner = session.exec(select(Child).where(Child.kid_id == listing.owner_kid_id)).first()
         if not owner:
@@ -10548,7 +10548,7 @@ def admin_marketplace_deny(
             Event(
                 child_id=owner.kid_id,
                 change_cents=listing.offer_cents,
-                reason=f"Marketplace refund: {listing.chore_name}",
+                reason=f"Job board refund: {listing.chore_name}",
             )
         )
         chore = session.get(Chore, listing.chore_id)
@@ -10577,7 +10577,7 @@ def admin_marketplace_deny(
         session.add(owner)
         session.add(listing)
         session.commit()
-    msg = "Marketplace submission denied. Funds returned to the owner."
+    msg = "Job board submission denied. Funds returned to the owner."
     if note_clean:
         msg = f"{msg} ({html_escape(note_clean)})"
     set_admin_notice(
