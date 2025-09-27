@@ -844,12 +844,26 @@ def base_styles() -> str:
       .status-dot--active{background:#16a34a; box-shadow:0 0 0 2px rgba(22,163,74,0.3);}
       .status-dot--inactive{background:#dc2626; box-shadow:0 0 0 2px rgba(220,38,38,0.3);}
       .transfer-alerts{display:flex; flex-direction:column; gap:12px; margin-top:12px;}
-      .transfer-alert{display:flex; gap:12px; flex-wrap:wrap; align-items:flex-start; justify-content:space-between; padding:14px; border-radius:12px; background:#ecfdf5; border:1px solid #34d399;}
-      .transfer-alert__info{flex:1; min-width:220px;}
-      .transfer-alert__meta{font-size:13px; color:var(--muted); margin-top:4px;}
-      .transfer-alert__actions{display:flex; align-items:center; gap:8px;}
-      .transfer-alert__dismiss{background:rgba(16,185,129,0.12); color:#047857; border:none; border-radius:8px; padding:8px 12px; font-weight:600; cursor:pointer;}
-      .transfer-alert__dismiss:hover{filter:brightness(1.05);}
+      .transfer-alert{display:flex; gap:16px; align-items:stretch; justify-content:space-between; padding:16px; border-radius:16px; background:rgba(15,23,42,0.85); border:1px solid rgba(148,163,184,0.24); box-shadow:0 24px 45px -24px rgba(15,23,42,0.9); flex-wrap:wrap;}
+      .transfer-alert__badge{min-width:140px; background:linear-gradient(135deg, rgba(34,197,94,0.35), rgba(21,128,61,0.65)); border-radius:12px; padding:14px 16px; display:flex; flex-direction:column; justify-content:center; text-align:center; box-shadow:inset 0 0 0 1px rgba(34,197,94,0.35);}
+      .transfer-alert__amount{font-size:26px; font-weight:700; color:#bbf7d0; letter-spacing:0.01em;}
+      .transfer-alert__label{font-size:12px; text-transform:uppercase; letter-spacing:0.18em; color:rgba(226,232,240,0.75); margin-top:6px;}
+      .transfer-alert__info{flex:1; min-width:220px; display:flex; flex-direction:column; gap:8px;}
+      .transfer-alert__headline{font-size:18px; font-weight:650; letter-spacing:0.01em;}
+      .transfer-alert__sender{color:#a5b4fc; font-weight:700;}
+      .transfer-alert__note{font-size:14px; background:rgba(148,163,184,0.12); border-radius:10px; padding:10px 12px;}
+      .transfer-alert__note-label{font-weight:600; color:rgba(226,232,240,0.85); margin-right:6px; text-transform:uppercase; letter-spacing:0.12em; font-size:11px; display:inline-block;}
+      .transfer-alert__meta{font-size:13px; color:var(--muted);}
+      .transfer-alert__actions{display:flex; align-items:center; justify-content:flex-end; gap:10px; flex:0 0 auto;}
+      .transfer-alert__dismiss{background:rgba(34,197,94,0.14); color:#22c55e; border:1px solid rgba(34,197,94,0.35); border-radius:999px; padding:10px 18px; font-weight:700; cursor:pointer; text-transform:uppercase; letter-spacing:0.12em; font-size:11px; transition:filter .15s ease, transform .15s ease;}
+      .transfer-alert__dismiss:hover{filter:brightness(1.08); transform:translateY(-1px);}
+      @media (max-width:720px){
+        .transfer-alert{flex-direction:column; align-items:stretch;}
+        .transfer-alert__badge{width:100%; flex-direction:row; align-items:center; justify-content:space-between; text-align:left; padding:12px 16px;}
+        .transfer-alert__amount{font-size:24px;}
+        .transfer-alert__label{margin-top:0;}
+        .transfer-alert__actions{justify-content:flex-start;}
+      }
       .chore-table .chore-schedule{display:flex; flex-direction:column; gap:8px;}
       .chore-schedule__dates{display:flex; flex-wrap:wrap; gap:8px;}
       .chore-schedule__dates input{flex:1 1 140px; min-width:140px;}
@@ -3982,21 +3996,26 @@ def kid_home(
                 event = info["event"]
                 sender = html_escape(info["sender"])
                 amount_text = usd(event.change_cents)
-                detail_line = ""
+                note_block = ""
                 note_text = (info.get("note") or "").strip()
                 if note_text:
-                    detail_line = (
-                        "<div class='transfer-alert__meta'>Why: "
+                    note_block = (
+                        "<div class='transfer-alert__note'>"
+                        "<span class='transfer-alert__note-label'>Why</span>"
                         + html_escape(note_text)
                         + "</div>"
                     )
-                received_label = event.timestamp.strftime("%Y-%m-%d %H:%M")
+                received_label = event.timestamp.strftime("%b %d, %Y • %I:%M %p")
                 blocks.append(
                     "<div class='transfer-alert'>"
+                    + "<div class='transfer-alert__badge'>"
+                    + f"<div class='transfer-alert__amount'>{amount_text}</div>"
+                    + "<div class='transfer-alert__label'>Received</div>"
+                    + "</div>"
                     + "<div class='transfer-alert__info'>"
-                    + f"<div><b>{sender}</b> sent you {amount_text}</div>"
-                    + detail_line
-                    + f"<div class='transfer-alert__meta'>Received {received_label}</div>"
+                    + f"<div class='transfer-alert__headline'><span class='transfer-alert__sender'>{sender}</span> sent you money</div>"
+                    + note_block
+                    + f"<div class='transfer-alert__meta'>Arrived {received_label}</div>"
                     + "</div>"
                     + "<form method='post' action='/kid/transfer_notice/dismiss' class='transfer-alert__actions'>"
                     + f"<input type='hidden' name='event_id' value='{event.id}'>"
