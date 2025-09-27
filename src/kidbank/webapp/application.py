@@ -3444,6 +3444,11 @@ def kid_home(
                 if schedule_bits
                 else ""
             )
+            note_line = (
+                f"<div class='muted chore-item__notes'>{html_escape(chore.notes or '')}</div>"
+                if chore.notes
+                else ""
+            )
             completed_line = ""
             if inst and inst.completed_at:
                 completed_line = (
@@ -3472,6 +3477,7 @@ def kid_home(
                 + f"<div class='chore-item__title'><b>{html_escape(chore.name)}</b>"
                 + f"{type_html}</div>"
                 + f"<div class='muted chore-item__meta'>Reward {usd(chore.award_cents)}</div>"
+                + note_line
                 + schedule_line
                 + completed_line
                 + "</div>"
@@ -8465,38 +8471,62 @@ def admin_home(
         f"<label style='margin-right:6px;'><input type='checkbox' name='weekdays' value='{day}'> {label}</label>"
         for day, label in WEEKDAY_OPTIONS
     )
+    multi_label_style = "display:flex; align-items:center; gap:6px; padding:6px 8px; border-radius:8px; border:1px solid #e2e8f0; background:#fff;"
+    multi_assign_options: List[str] = [
+        (
+            f"<label class='chore-multi-option chore-multi-option--global' style='{multi_label_style}'>"
+            f"<input type='checkbox' name='kid_ids' value='{GLOBAL_CHORE_KID_ID}' data-global-checkbox> "
+            "Free-for-all (global)"
+            "</label>"
+        )
+    ]
+    for kid in kids:
+        multi_assign_options.append(
+            f"<label class='chore-multi-option' style='{multi_label_style}'>"
+            f"<input type='checkbox' name='kid_ids' value='{kid.kid_id}'> "
+            f"{html_escape(kid.name)}"
+            "</label>"
+        )
+    multi_assign_box = (
+        "<div class='chore-multi-assign' id='chore-create-assignees-container'>"
+        "<div class='chore-multi-assign__label'>Multi-assign</div>"
+        f"<div class='chore-multi-assign__box' id='chore-create-assignees' data-global-option='{GLOBAL_CHORE_KID_ID}' style='display:grid; gap:6px; grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); padding:12px; border:1px solid #cbd5f5; border-radius:10px; background:#f8fafc;'>"
+        + "".join(multi_assign_options)
+        + "</div>"
+        + "<div class='muted' style='margin-top:6px;'>Check one or more kids to publish the chore. Include Free-for-all to create a shared task. Combine it with names to send both shared and personal copies.</div>"
+        + "</div>"
+    )
     chores_card = (
         "<div class='card'>"
-        "<h3>Add a Chore</h3>"
-        "<form method='post' action='/admin/chores/create' class='stacked-form'>"
-        f"<label>Assign to kids</label><select name='kid_ids' id='chore-create-kids' multiple required data-global-option='{GLOBAL_CHORE_KID_ID}' size='{max(4, min(8, len(kids) + 1))}'>"
-        f"{kid_options_html}<option value='{GLOBAL_CHORE_KID_ID}'>Free-for-all (global)</option></select>"
-        "<div class='muted' style='margin-top:4px;'>Hold Ctrl (Windows) or Command (Mac) to pick multiple kids. Include “Free-for-all (global)” to publish a shared task.</div>"
-        "<label>Name</label><input name='name' placeholder='Take out trash' required>"
-        "<div class='grid' style='grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:8px;'>"
-        "<div><label>Type</label><select name='type' id='chore-create-type' class='chore-type-select' data-schedule-root='chore-create-schedule'><option value='daily'>Daily</option><option value='weekly'>Weekly</option><option value='monthly'>Monthly</option><option value='special'>Special</option></select></div>"
-        "<div><label>Award (dollars)</label><input name='award' type='text' data-money value='0.50'></div>"
-        "<div><label>Penalty if missed</label><div style='display:flex; align-items:center; gap:6px; margin-top:4px;'><label style='display:flex; align-items:center; gap:4px; font-weight:400;'><input type='checkbox' name='penalty_enabled' value='1'> Apply</label><input name='penalty_amount' type='text' data-money value='0.00' placeholder='penalty $'></div></div>"
-        f"<div class='chore-max-claimants' data-global-only style='display:none;'><label>Max claimants (global)</label><input name='max_claimants' type='number' min='1' value='1'></div>"
-        "</div>"
-        "<div class='grid' style='grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:8px;'>"
-        "<div><label>Start Date (optional)</label><input name='start_date' type='date'></div>"
-        "<div><label>End Date (optional)</label><input name='end_date' type='date'></div>"
-        "</div>"
-        "<div id='chore-create-schedule'>"
-        "<div class='chore-schedule-selector chore-schedule-selector--weekly' data-schedule-group='weekly' style='margin-top:6px; display:none;'><div class='muted' style='margin-bottom:4px;'>Weekdays (optional)</div><div>"
-        f"{weekday_selector}"
-        "</div></div>"
-        "<div class='chore-schedule-selector chore-schedule-selector--monthly' data-schedule-group='monthly' style='display:none;'><label>Specific days (comma separated)</label><input name='specific_month_days' placeholder='1,15'></div>"
-        "<div class='chore-schedule-selector chore-schedule-selector--special' data-schedule-group='special' style='display:none;'><label>Specific dates (comma separated)</label><input name='specific_dates' placeholder='YYYY-MM-DD,YYYY-MM-DD'></div>"
-        "</div>"
-        "<label>Notes</label><input name='notes' placeholder='Any details'>"
-        "<label style='display:flex; align-items:center; gap:6px; margin-top:6px;'><input type='checkbox' name='block_marketplace' value='1'> Prevent job board listing</label>"
-        "<p class='muted'>Global chores appear for all kids under “Free-for-all”. Use max claimants to set how many kids can share the reward per period.</p>"
-        "<button type='submit'>Add Chore</button>"
-        "</form>"
-        "<script>(function(){function applySchedule(select){var rootId=select.getAttribute('data-schedule-root');if(!rootId){return;}var root=document.getElementById(rootId);if(!root){return;}var value=(select.value||'').toLowerCase();root.querySelectorAll('[data-schedule-group]').forEach(function(el){var group=el.getAttribute('data-schedule-group');var show=false;if(group==='weekly'){show=value==='weekly';}else if(group==='monthly'){show=value==='monthly';}else if(group==='special'){show=value==='special';}el.style.display=show?'':'none';});}function toggleGlobal(){var select=document.getElementById('chore-create-kids');if(!select){return;}var globalValue=select.getAttribute('data-global-option');var hasGlobal=false;Array.prototype.slice.call(select.selectedOptions||[]).forEach(function(opt){if(opt.value===globalValue){hasGlobal=true;}});document.querySelectorAll('[data-global-only]').forEach(function(el){el.style.display=hasGlobal?'':'none';});}var selects=document.querySelectorAll('.chore-type-select');selects.forEach(function(select){var handler=function(){applySchedule(select);};select.addEventListener('change',handler);handler();});var kidSelect=document.getElementById('chore-create-kids');if(kidSelect){kidSelect.addEventListener('change',toggleGlobal);toggleGlobal();}})();</script>"
-        "</div>"
+        + "<h3>Add a Chore</h3>"
+        + "<form method='post' action='/admin/chores/create' class='stacked-form'>"
+        + "<label>Assign to kids</label>"
+        + f"{multi_assign_box}"
+        + "<label>Name</label><input name='name' placeholder='Take out trash' required>"
+        + "<div class='grid' style='grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:8px;'>"
+        + "<div><label>Type</label><select name='type' id='chore-create-type' class='chore-type-select' data-schedule-root='chore-create-schedule'><option value='daily'>Daily</option><option value='weekly'>Weekly</option><option value='monthly'>Monthly</option><option value='special'>Special</option></select></div>"
+        + "<div><label>Award (dollars)</label><input name='award' type='text' data-money value='0.50'></div>"
+        + "<div><label>Penalty if missed</label><div style='display:flex; align-items:center; gap:6px; margin-top:4px;'><label style='display:flex; align-items:center; gap:4px; font-weight:400;'><input type='checkbox' name='penalty_enabled' value='1'> Apply</label><input name='penalty_amount' type='text' data-money value='0.00' placeholder='penalty $'></div></div>"
+        + f"<div class='chore-max-claimants' data-global-only style='display:none;'><label>Max claimants (global)</label><input name='max_claimants' type='number' min='1' value='1'></div>"
+        + "</div>"
+        + "<div class='grid' style='grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:8px;'>"
+        + "<div><label>Start Date (optional)</label><input name='start_date' type='date'></div>"
+        + "<div><label>End Date (optional)</label><input name='end_date' type='date'></div>"
+        + "</div>"
+        + "<div id='chore-create-schedule'>"
+        + "<div class='chore-schedule-selector chore-schedule-selector--weekly' data-schedule-group='weekly' style='margin-top:6px; display:none;'><div class='muted' style='margin-bottom:4px;'>Weekdays (optional)</div><div>"
+        + f"{weekday_selector}"
+        + "</div></div>"
+        + "<div class='chore-schedule-selector chore-schedule-selector--monthly' data-schedule-group='monthly' style='display:none;'><label>Specific days (comma separated)</label><input name='specific_month_days' placeholder='1,15'></div>"
+        + "<div class='chore-schedule-selector chore-schedule-selector--special' data-schedule-group='special' style='display:none;'><label>Specific dates (comma separated)</label><input name='specific_dates' placeholder='YYYY-MM-DD,YYYY-MM-DD'></div>"
+        + "</div>"
+        + "<label>Notes</label><input name='notes' placeholder='Any details'>"
+        + "<label style='display:flex; align-items:center; gap:6px; margin-top:6px;'><input type='checkbox' name='block_marketplace' value='1'> Prevent job board listing</label>"
+        + "<p class='muted'>Global chores appear for all kids under “Free-for-all”. Use max claimants to set how many kids can share the reward per period.</p>"
+        + "<button type='submit'>Add Chore</button>"
+        + "</form>"
+        + "<script>(function(){function applySchedule(select){var rootId=select.getAttribute('data-schedule-root');if(!rootId){return;}var root=document.getElementById(rootId);if(!root){return;}var value=(select.value||'').toLowerCase();root.querySelectorAll('[data-schedule-group]').forEach(function(el){var group=el.getAttribute('data-schedule-group');var show=false;if(group==='weekly'){show=value==='weekly';}else if(group==='monthly'){show=value==='monthly';}else if(group==='special'){show=value==='special';}el.style.display=show?'':'none';});}function toggleGlobal(){var assignRoot=document.getElementById('chore-create-assignees');if(!assignRoot){return;}var globalValue=assignRoot.getAttribute('data-global-option');var hasGlobal=false;assignRoot.querySelectorAll(\"input[name='kid_ids']\").forEach(function(box){if(box.value===globalValue&&box.checked){hasGlobal=true;}});document.querySelectorAll('[data-global-only]').forEach(function(el){el.style.display=hasGlobal?'':'none';});assignRoot.style.borderColor=hasGlobal?'#f59e0b':'#cbd5f5';assignRoot.style.boxShadow=hasGlobal?'0 0 0 2px rgba(245,158,11,0.2)':'none';var container=document.getElementById('chore-create-assignees-container');if(container){container.classList.toggle('has-global',hasGlobal);}}var selects=document.querySelectorAll('.chore-type-select');selects.forEach(function(select){var handler=function(){applySchedule(select);};select.addEventListener('change',handler);handler();});var assignRoot=document.getElementById('chore-create-assignees');if(assignRoot){assignRoot.querySelectorAll(\"input[name='kid_ids']\").forEach(function(box){box.addEventListener('change',toggleGlobal);});toggleGlobal();}})();</script>"
+        + "</div>"
     )
     admin_pref_controls = preference_controls_html(request)
     settings_card = (
