@@ -80,6 +80,39 @@ def now_local() -> datetime:
     return _time_provider()
 
 
+_TRANSFER_DISMISS_SESSION_KEY = "kid_transfer_dismissals"
+
+
+def _get_dismissed_transfer_ids(request: Request, kid_id: str) -> Set[int]:
+    raw_store = request.session.get(_TRANSFER_DISMISS_SESSION_KEY)
+    if isinstance(raw_store, dict):
+        raw_values = raw_store.get(kid_id)
+        if isinstance(raw_values, list):
+            dismissed: Set[int] = set()
+            for value in raw_values:
+                try:
+                    dismissed.add(int(value))
+                except (TypeError, ValueError):
+                    continue
+            return dismissed
+    return set()
+
+
+def _record_transfer_dismissal(request: Request, kid_id: str, event_id: int) -> None:
+    if event_id <= 0:
+        return
+    raw_store = request.session.get(_TRANSFER_DISMISS_SESSION_KEY)
+    if not isinstance(raw_store, dict):
+        raw_store = {}
+    raw_values = raw_store.get(kid_id)
+    if not isinstance(raw_values, list):
+        raw_values = []
+    if event_id not in raw_values:
+        raw_values.append(event_id)
+    raw_store[kid_id] = raw_values
+    request.session[_TRANSFER_DISMISS_SESSION_KEY] = raw_store
+
+
 def _penalty_event_reason(chore_id: int, target_day: date) -> str:
     return f"chore_penalty_missed:{chore_id}:{target_day.isoformat()}"
 
@@ -721,6 +754,7 @@ def base_styles() -> str:
         width:100%; padding:12px; border:1px solid #2b3545; border-radius:10px;
         background:transparent; color:var(--text); box-sizing:border-box; font-size:16px;
       }
+      select, select option{color:#000;}
       input[type=checkbox], input[type=radio]{
         width:auto; min-width:0; padding:0; margin:0 6px 0 0;
       }
@@ -798,6 +832,24 @@ def base_styles() -> str:
       .chore-item__meta{font-size:13px;}
       .chore-item__schedule{font-size:12px; margin-top:4px;}
       .chore-item__action{display:flex; align-items:center;}
+      .chore-card-list{display:flex; flex-direction:column; gap:16px;}
+      .chore-card{background:rgba(148,163,184,0.12); border-radius:12px; padding:16px; display:flex; flex-direction:column; gap:16px;}
+      .chore-card__grid{display:grid; grid-template-columns:repeat(auto-fit,minmax(200px,1fr)); gap:16px;}
+      .chore-card__field{display:flex; flex-direction:column; gap:6px;}
+      .chore-card__field label{font-size:13px; font-weight:600; color:var(--muted);}
+      .chore-card__field--wide{grid-column:1/-1;}
+      .chore-card__footer{display:flex; justify-content:space-between; align-items:flex-end; flex-wrap:wrap; gap:12px;}
+      .chore-card__status{display:flex; align-items:center; gap:8px; font-weight:600;}
+      .status-dot{display:inline-block; width:14px; height:14px; border-radius:999px;}
+      .status-dot--active{background:#16a34a; box-shadow:0 0 0 2px rgba(22,163,74,0.3);}
+      .status-dot--inactive{background:#dc2626; box-shadow:0 0 0 2px rgba(220,38,38,0.3);}
+      .transfer-alerts{display:flex; flex-direction:column; gap:12px; margin-top:12px;}
+      .transfer-alert{display:flex; gap:12px; flex-wrap:wrap; align-items:flex-start; justify-content:space-between; padding:14px; border-radius:12px; background:#ecfdf5; border:1px solid #34d399;}
+      .transfer-alert__info{flex:1; min-width:220px;}
+      .transfer-alert__meta{font-size:13px; color:var(--muted); margin-top:4px;}
+      .transfer-alert__actions{display:flex; align-items:center; gap:8px;}
+      .transfer-alert__dismiss{background:rgba(16,185,129,0.12); color:#047857; border:none; border-radius:8px; padding:8px 12px; font-weight:600; cursor:pointer;}
+      .transfer-alert__dismiss:hover{filter:brightness(1.05);}
       .chore-table .chore-schedule{display:flex; flex-direction:column; gap:8px;}
       .chore-schedule__dates{display:flex; flex-wrap:wrap; gap:8px;}
       .chore-schedule__dates input{flex:1 1 140px; min-width:140px;}
@@ -1346,7 +1398,8 @@ def list_chore_instances_for_kid(
                     (
                         i
                         for i in insts
-                        if i.status in {"available", "pending", CHORE_STATUS_PENDING_MARKETPLACE}
+                        if i.status
+                        in {"available", "pending", CHORE_STATUS_PENDING_MARKETPLACE, "paid"}
                     ),
                     None,
                 )
@@ -3834,13 +3887,16 @@ def kid_home(
           {''.join(request_blocks)}
         </div>
         """
-        transfer_notices_html = ""
-        transfer_blocks: List[str] = []
+        dismissed_transfer_ids = _get_dismissed_transfer_ids(request, kid_id)
+        transfer_notice_card = ""
+        transfer_notices: List[Dict[str, Any]] = []
         transfer_cutoff = moment - timedelta(days=2)
         for event in events:
-            if event.change_cents <= 0 or not event.timestamp:
+            if event.change_cents <= 0 or not event.timestamp or not event.id:
                 continue
             if event.timestamp < transfer_cutoff:
+                continue
+            if event.id in dismissed_transfer_ids:
                 continue
             reason_text = (event.reason or "").strip()
             sender_name = ""
@@ -3861,30 +3917,52 @@ def kid_home(
                 continue
             if not sender_name:
                 continue
-            detail_line = ""
-            if note_text:
-                detail_line = (
-                    "<div class='muted' style='margin-top:4px;'>Why: "
-                    + html_escape(note_text)
+            transfer_notices.append(
+                {
+                    "event": event,
+                    "sender": sender_name,
+                    "note": note_text,
+                }
+            )
+            if len(transfer_notices) >= 3:
+                break
+        if transfer_notices:
+            blocks: List[str] = []
+            redirect_target = html_escape("/kid?section=overview")
+            for info in transfer_notices:
+                event = info["event"]
+                sender = html_escape(info["sender"])
+                amount_text = usd(event.change_cents)
+                detail_line = ""
+                note_text = (info.get("note") or "").strip()
+                if note_text:
+                    detail_line = (
+                        "<div class='transfer-alert__meta'>Why: "
+                        + html_escape(note_text)
+                        + "</div>"
+                    )
+                received_label = event.timestamp.strftime("%Y-%m-%d %H:%M")
+                blocks.append(
+                    "<div class='transfer-alert'>"
+                    + "<div class='transfer-alert__info'>"
+                    + f"<div><b>{sender}</b> sent you {amount_text}</div>"
+                    + detail_line
+                    + f"<div class='transfer-alert__meta'>Received {received_label}</div>"
+                    + "</div>"
+                    + "<form method='post' action='/kid/transfer_notice/dismiss' class='transfer-alert__actions'>"
+                    + f"<input type='hidden' name='event_id' value='{event.id}'>"
+                    + f"<input type='hidden' name='redirect' value='{redirect_target}'>"
+                    + "<button type='submit' class='transfer-alert__dismiss'>Dismiss</button>"
+                    + "</form>"
                     + "</div>"
                 )
-            received_label = event.timestamp.strftime("%Y-%m-%d %H:%M")
-            transfer_blocks.append(
-                "<div style='margin-top:12px; padding:12px; border-radius:10px; background:#ecfdf5; border:1px solid #34d399;'>"
-                + f"<div><b>{html_escape(sender_name)}</b> sent you {usd(event.change_cents)}</div>"
-                + detail_line
-                + f"<div class='muted' style='margin-top:4px;'>Received {received_label}</div>"
-                + "</div>"
-            )
-            if len(transfer_blocks) >= 3:
-                break
-        if transfer_blocks:
-            transfer_notices_html = (
-                "<div class='card' style='border:2px solid #34d399; background:#ecfdf5;'>"
+            transfer_notice_card = (
+                "<div class='card'>"
                 "<h3>Money received</h3>"
                 "<div class='muted'>Recent transfers from other kids.</div>"
-                + "".join(transfer_blocks)
-                + "</div>"
+                + "<div class='transfer-alerts'>"
+                + "".join(blocks)
+                + "</div></div>"
             )
         money_card = f"""
           <div class='card'>
@@ -4187,7 +4265,14 @@ def kid_home(
             </div>
           </div>
         """
-        overview_content = hero_html + overview_quick_html + money_insights_html + investing_overview_html + highlights_card
+        overview_content = (
+            hero_html
+            + (transfer_notice_card or "")
+            + overview_quick_html
+            + money_insights_html
+            + investing_overview_html
+            + highlights_card
+        )
         goals_content = f"""
           <div class='card'>
             <h3>My Goals <a href='#modal-goal-tips' class='help-icon' aria-label='Goal tips'>?</a></h3>
@@ -4427,8 +4512,7 @@ def kid_home(
           </div>
         """
         money_content = (
-            (transfer_notices_html if transfer_notices_html else "")
-            + (notifications_html if notifications_html else "")
+            (notifications_html if notifications_html else "")
             + money_card
         )
         pref_controls = preference_controls_html(request)
@@ -4567,6 +4651,24 @@ def kid_home(
         </div>
         """
         return render_page(request, "Kid — Error", body)
+
+
+@app.post("/kid/transfer_notice/dismiss")
+def kid_transfer_notice_dismiss(
+    request: Request,
+    event_id: int = Form(...),
+    redirect: str = Form("/kid"),
+):
+    if (redirect_resp := require_kid(request)) is not None:
+        return redirect_resp
+    kid_id = kid_authed(request)
+    assert kid_id
+    if event_id:
+        _record_transfer_dismissal(request, kid_id, int(event_id))
+    redirect_target = (redirect or "/kid").strip()
+    if not redirect_target.startswith("/"):
+        redirect_target = "/kid"
+    return RedirectResponse(redirect_target, status_code=303)
 
 
 @app.get("/kid/lesson/{lesson_id}", response_class=HTMLResponse)
@@ -8569,23 +8671,35 @@ def admin_manage_chores(request: Request, kid_id: str = Query(...)):
             "</form>"
         )
         action_html = "<div class='chore-row__actions'>" + "".join(action_items) + "</div>"
-        rows_parts.append(
-            "<tr>"
-            f"<td data-label='Name'><form id='{form_id}' method='post' action='/admin/chores/update'></form>"
-            f"<input type='hidden' name='chore_id' value='{chore.id}' form='{form_id}'>"
-            f"<input name='name' value='{name_value}' form='{form_id}'></td>"
-            f"<td data-label='Type'><select name='type' form='{form_id}' class='chore-type-select' data-schedule-root='{schedule_id}'>{type_select}</select></td>"
-            f"<td data-label='Award ($)' class='right'><input name='award' type='text' data-money value='{dollars_value(chore.award_cents)}' form='{form_id}' class='chore-field--compact'></td>"
-            f"<td data-label='Penalty ($)' class='right'><div style='display:flex; align-items:center; justify-content:flex-end; gap:6px;'><label style='display:flex; align-items:center; gap:4px; font-weight:400;'><input type='checkbox' name='penalty_enabled' value='1'{penalty_checked} form='{form_id}'> Apply</label><input name='penalty_amount' type='text' data-money value='{penalty_value}' form='{form_id}' class='chore-field--compact'></div></td>"
-            f"<td data-label='Max Spots'><input name='max_claimants' type='number' min='1' value='{max(1, chore.max_claimants)}' form='{form_id}' class='chore-field--compact'></td>"
-            f"<td data-label='Schedule'>{schedule_html}</td>"
-            f"<td data-label='Notes'><input name='notes' value='{notes_value}' form='{form_id}'></td>"
-            f"<td data-label='Marketplace'><label style='display:flex; align-items:center; gap:6px;'><input type='checkbox' name='block_marketplace' value='1'{marketplace_checked} form='{form_id}'> Block listing</label></td>"
-            f"<td data-label='Status'><span class='pill'>{'Active' if chore.active else 'Inactive'}</span></td>"
-            f"<td data-label='Actions' class='right'>{action_html}</td>"
-            "</tr>"
+        status_label = "Active" if chore.active else "Inactive"
+        status_indicator = (
+            "<span class='status-dot status-dot--active' title='Active' aria-label='Active'></span>"
+            if chore.active
+            else "<span class='status-dot status-dot--inactive' title='Inactive' aria-label='Inactive'></span>"
         )
-    rows = "".join(rows_parts) or "<tr><td colspan='9' class='muted'>(no chores yet)</td></tr>"
+        rows_parts.append(
+            "<div class='chore-card'>"
+            f"<form id='{form_id}' method='post' action='/admin/chores/update'></form>"
+            f"<input type='hidden' name='chore_id' value='{chore.id}' form='{form_id}'>"
+            "<div class='chore-card__grid'>"
+            f"<div class='chore-card__field'><label>Name</label><input name='name' value='{name_value}' form='{form_id}'></div>"
+            f"<div class='chore-card__field'><label>Type</label><select name='type' form='{form_id}' class='chore-type-select' data-schedule-root='{schedule_id}'>{type_select}</select></div>"
+            f"<div class='chore-card__field'><label>Award ($)</label><input name='award' type='text' data-money value='{dollars_value(chore.award_cents)}' form='{form_id}'></div>"
+            "<div class='chore-card__field'><label>Penalty ($)</label>"
+            f"<div style='display:flex; align-items:center; gap:8px; flex-wrap:wrap;'><label style='display:flex; align-items:center; gap:4px; font-weight:400;'><input type='checkbox' name='penalty_enabled' value='1'{penalty_checked} form='{form_id}'> Apply</label><input name='penalty_amount' type='text' data-money value='{penalty_value}' form='{form_id}' class='chore-field--compact'></div>"
+            "</div>"
+            f"<div class='chore-card__field'><label>Max spots</label><input name='max_claimants' type='number' min='1' value='{max(1, chore.max_claimants)}' form='{form_id}'></div>"
+            f"<div class='chore-card__field'><label>Marketplace</label><div style='display:flex; align-items:center; gap:8px; font-weight:400;'><input type='checkbox' name='block_marketplace' value='1'{marketplace_checked} form='{form_id}' id='marketplace-{chore.id}'><label for='marketplace-{chore.id}' style='margin:0;'>Block listing</label></div></div>"
+            f"<div class='chore-card__field chore-card__field--wide'><label>Schedule</label>{schedule_html}</div>"
+            f"<div class='chore-card__field chore-card__field--wide'><label>Notes</label><textarea name='notes' form='{form_id}' rows='2'>{notes_value}</textarea></div>"
+            "</div>"
+            "<div class='chore-card__footer'>"
+            f"<div class='chore-card__status'>{status_indicator}<span>{status_label}</span></div>"
+            f"{action_html}"
+            "</div>"
+            "</div>"
+        )
+    rows = "".join(rows_parts) or "<div class='muted chore-empty'>No chores yet.</div>"
     if is_global:
         heading = "Manage Global Chores"
         badge = f"<span class='pill' style='margin-left:8px;'>{GLOBAL_CHORE_KID_ID}</span>"
@@ -8596,10 +8710,9 @@ def admin_manage_chores(request: Request, kid_id: str = Query(...)):
         note_html = "<p class='muted' style='margin-top:6px;'>“Make Available Now” republishes the chore for the current period (within its active window).</p>"
     chores_table = f"""
     <div class='card'>
-      <table class='chore-table'>
-        <tr><th>Name</th><th>Type</th><th>Award ($)</th><th>Penalty ($)</th><th>Max Spots</th><th>Schedule</th><th>Notes</th><th>Marketplace</th><th>Status</th><th>Actions</th></tr>
+      <div class='chore-card-list'>
         {rows}
-      </table>
+      </div>
       {note_html}
     </div>
     """

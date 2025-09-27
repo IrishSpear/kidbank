@@ -287,7 +287,33 @@ def test_marketplace_blocked_chore_not_listed() -> None:
     assert listing is None
 
 
-def test_money_received_notification_shows_in_money_section() -> None:
+def test_special_chore_completion_stays_visible() -> None:
+    client = TestClient(app)
+    with Session(engine) as session:
+        child = Child(kid_id="kid1", name="Kid One", balance_cents=0, kid_pin="0000")
+        chore = Chore(kid_id=child.kid_id, name="Special Task", type="special", award_cents=500)
+        session.add_all([child, chore])
+        session.commit()
+        session.refresh(chore)
+        instance = ChoreInstance(
+            chore_id=chore.id,
+            period_key="SPECIAL",
+            status="paid",
+            completed_at=datetime.utcnow(),
+        )
+        session.add(instance)
+        session.commit()
+    login = client.post(
+        "/kid/login", data={"kid_id": "kid1", "kid_pin": "0000"}, follow_redirects=False
+    )
+    assert login.status_code == 302
+    page = client.get("/kid?section=chores")
+    assert page.status_code == 200
+    assert "Special Task" in page.text
+    assert "<span class='pill status-paid'>Completed</span>" in page.text
+
+
+def test_money_received_notification_shows_on_overview() -> None:
     client = TestClient(app)
     with Session(engine) as session:
         child = Child(kid_id="kid1", name="Kid One", balance_cents=1_000, kid_pin="0000")
@@ -304,11 +330,45 @@ def test_money_received_notification_shows_in_money_section() -> None:
         "/kid/login", data={"kid_id": "kid1", "kid_pin": "0000"}, follow_redirects=False
     )
     assert login.status_code == 302
-    page = client.get("/kid?section=money")
+    page = client.get("/kid?section=overview")
     assert page.status_code == 200
     assert "Money received" in page.text
     assert "Kid Two" in page.text
     assert "sent you $5.00" in page.text
+    assert "Dismiss" in page.text
+
+
+def test_money_received_notification_can_be_dismissed() -> None:
+    client = TestClient(app)
+    with Session(engine) as session:
+        child = Child(kid_id="kid1", name="Kid One", balance_cents=1_000, kid_pin="0000")
+        other = Child(kid_id="kid2", name="Kid Two", balance_cents=500, kid_pin="1111")
+        event = Event(
+            child_id="kid1",
+            change_cents=500,
+            reason="Received from Kid Two: Birthday gift",
+            timestamp=datetime.utcnow(),
+        )
+        session.add_all([child, other, event])
+        session.commit()
+        session.refresh(event)
+        event_id = event.id
+    assert event_id is not None
+    login = client.post(
+        "/kid/login", data={"kid_id": "kid1", "kid_pin": "0000"}, follow_redirects=False
+    )
+    assert login.status_code == 302
+    page = client.get("/kid?section=overview")
+    assert "Money received" in page.text
+    dismiss = client.post(
+        "/kid/transfer_notice/dismiss",
+        data={"event_id": event_id, "redirect": "/kid?section=overview"},
+        follow_redirects=False,
+    )
+    assert dismiss.status_code == 303
+    assert dismiss.headers["location"] == "/kid?section=overview"
+    refreshed = client.get("/kid?section=overview")
+    assert "Money received" not in refreshed.text
 
 
 def test_kid_goals_page_shows_balance() -> None:
