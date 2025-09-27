@@ -45,6 +45,7 @@ from kidbank.webapp import (
     Event,
     Goal,
     GlobalChoreClaim,
+    GlobalChoreAudience,
     Investment,
     InvestmentTx,
     Lesson,
@@ -726,6 +727,45 @@ def test_only_dad_can_update_privileges() -> None:
     assert privs.can_manage_payouts
 
 
+def test_admin_can_assign_chore_to_multiple_kids_personal() -> None:
+    client = TestClient(app)
+    with Session(engine) as session:
+        kids = [
+            Child(kid_id="avery", name="Avery", balance_cents=0),
+            Child(kid_id="blake", name="Blake", balance_cents=0),
+        ]
+        session.add_all(kids)
+        session.commit()
+    login = client.post(
+        "/admin/login", data={"pin": DAD_PIN}, follow_redirects=False
+    )
+    assert login.status_code == 302
+    payload = urlencode(
+        [
+            ("kid_ids", "avery"),
+            ("kid_ids", "blake"),
+            ("name", "Laundry"),
+            ("type", "weekly"),
+            ("award", "3.00"),
+            ("penalty_amount", "0.00"),
+        ],
+        doseq=True,
+    )
+    response = client.post(
+        "/admin/chores/create",
+        data=payload,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        follow_redirects=False,
+    )
+    assert response.status_code == 302
+    assert response.headers["location"] == "/admin?section=chores"
+    with Session(engine) as session:
+        chores = session.exec(select(Chore).where(Chore.name == "Laundry")).all()
+        kid_ids = sorted(chore.kid_id for chore in chores)
+        assert kid_ids == ["avery", "blake"]
+        assert all(chore.max_claimants == 1 for chore in chores)
+
+
 def test_admin_can_assign_chore_to_multiple_kids_and_global() -> None:
     client = TestClient(app)
     with Session(engine) as session:
@@ -762,13 +802,85 @@ def test_admin_can_assign_chore_to_multiple_kids_and_global() -> None:
     assert response.headers["location"] == "/admin?section=chores"
     with Session(engine) as session:
         chores = session.exec(select(Chore).where(Chore.name == "Laundry")).all()
-    assert len(chores) == 3
-    kid_ids = sorted(chore.kid_id for chore in chores)
-    assert kid_ids == sorted(["avery", "blake", GLOBAL_CHORE_KID_ID])
-    global_chore = next(ch for ch in chores if ch.kid_id == GLOBAL_CHORE_KID_ID)
-    assert global_chore.max_claimants == 2
-    personal = [ch for ch in chores if ch.kid_id != GLOBAL_CHORE_KID_ID]
-    assert all(ch.max_claimants == 1 for ch in personal)
+        assert len(chores) == 1
+        global_chore = chores[0]
+        assert global_chore.kid_id == GLOBAL_CHORE_KID_ID
+        assert global_chore.max_claimants == 2
+        audience_rows = session.exec(
+            select(GlobalChoreAudience).where(GlobalChoreAudience.chore_id == global_chore.id)
+        ).all()
+        assert sorted(row.kid_id for row in audience_rows) == ["avery", "blake"]
+
+
+def test_global_chore_audience_limits_claims() -> None:
+    admin_client = TestClient(app)
+    avery_client = TestClient(app)
+    cameron_client = TestClient(app)
+    with Session(engine) as session:
+        kids = [
+            Child(kid_id="avery", name="Avery", balance_cents=0, kid_pin="1111"),
+            Child(kid_id="blake", name="Blake", balance_cents=0, kid_pin="2222"),
+            Child(kid_id="cameron", name="Cameron", balance_cents=0, kid_pin="3333"),
+        ]
+        session.add_all(kids)
+        session.commit()
+    admin_login = admin_client.post(
+        "/admin/login", data={"pin": DAD_PIN}, follow_redirects=False
+    )
+    assert admin_login.status_code == 302
+    payload = urlencode(
+        [
+            ("kid_ids", "avery"),
+            ("kid_ids", "blake"),
+            ("kid_ids", GLOBAL_CHORE_KID_ID),
+            ("name", "Laundry"),
+            ("type", "weekly"),
+            ("award", "3.00"),
+            ("penalty_amount", "0.00"),
+            ("max_claimants", "2"),
+        ],
+        doseq=True,
+    )
+    response = admin_client.post(
+        "/admin/chores/create",
+        data=payload,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        follow_redirects=False,
+    )
+    assert response.status_code == 302
+    with Session(engine) as session:
+        chore = session.exec(select(Chore).where(Chore.name == "Laundry")).first()
+        assert chore is not None
+        chore_id = chore.id
+    assert chore_id is not None
+    avery_login = avery_client.post(
+        "/kid/login", data={"kid_id": "avery", "kid_pin": "1111"}, follow_redirects=False
+    )
+    assert avery_login.status_code == 302
+    allowed_apply = avery_client.post(
+        "/kid/global_chore/apply",
+        data={"chore_id": chore_id},
+        follow_redirects=False,
+    )
+    assert allowed_apply.status_code == 302
+    cameron_login = cameron_client.post(
+        "/kid/login", data={"kid_id": "cameron", "kid_pin": "3333"}, follow_redirects=False
+    )
+    assert cameron_login.status_code == 302
+    denied_apply = cameron_client.post(
+        "/kid/global_chore/apply",
+        data={"chore_id": chore_id},
+        follow_redirects=False,
+    )
+    assert denied_apply.status_code == 302
+    denied_page = cameron_client.get("/kid?section=freeforall")
+    assert "Laundry" not in denied_page.text
+    with Session(engine) as session:
+        claims = session.exec(
+            select(GlobalChoreClaim).where(GlobalChoreClaim.chore_id == chore_id)
+        ).all()
+    assert len(claims) == 1
+    assert claims[0].kid_id == "avery"
 
 
 def test_global_chore_multiple_claims_split_evenly() -> None:

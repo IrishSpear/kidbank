@@ -219,6 +219,12 @@ class GlobalChoreClaim(SQLModel, table=True):
     notes: Optional[str] = None
 
 
+class GlobalChoreAudience(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    chore_id: int
+    kid_id: str
+
+
 class Lesson(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     title: str
@@ -461,6 +467,21 @@ def run_migrations() -> None:
                 approved_by TEXT,
                 notes TEXT
             );
+            """
+        )
+        raw.execute(
+            """
+            CREATE TABLE IF NOT EXISTS globalchoreaudience (
+                id INTEGER PRIMARY KEY,
+                chore_id INTEGER,
+                kid_id TEXT
+            );
+            """
+        )
+        raw.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_globalchoreaudience_chore_kid
+            ON globalchoreaudience(chore_id, kid_id);
             """
         )
         raw.execute(

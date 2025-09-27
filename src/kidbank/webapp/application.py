@@ -1393,6 +1393,21 @@ def get_global_claim(session: Session, chore_id: int, kid_id: str, period_key: s
     ).first()
 
 
+def load_global_chore_audience(
+    session: Session, chore_ids: Iterable[int]
+) -> Dict[int, Set[str]]:
+    identifiers = [cid for cid in chore_ids if cid]
+    if not identifiers:
+        return {}
+    rows = session.exec(
+        select(GlobalChoreAudience).where(GlobalChoreAudience.chore_id.in_(identifiers))
+    ).all()
+    audience: Dict[int, Set[str]] = {}
+    for row in rows:
+        audience.setdefault(row.chore_id, set()).add(row.kid_id)
+    return audience
+
+
 def ensure_instances_for_kid(kid_id: str) -> None:
     moment = now_local()
     today = moment.date()
@@ -3284,6 +3299,9 @@ def kid_home(
                 .where(Chore.active == True)  # noqa: E712
                 .order_by(Chore.name)
             ).all()
+            audience_map = load_global_chore_audience(
+                session, [ch.id for ch in global_chores if ch.id]
+            )
             global_chore_lookup.update({ch.id: ch for ch in global_chores})
             kid_global_claims = session.exec(
                 select(GlobalChoreClaim)
@@ -3327,6 +3345,11 @@ def kid_home(
             for gchore in global_chores:
                 if not is_chore_in_window(gchore, today):
                     continue
+                allowed_ids = (
+                    audience_map.get(gchore.id) if gchore.id is not None else set()
+                )
+                if allowed_ids and kid_id not in allowed_ids:
+                    continue
                 period_key = global_chore_period_key(moment, gchore)
                 total_claims = count_global_claims(session, gchore.id, period_key, include_pending=True)
                 approved_claims = count_global_claims(session, gchore.id, period_key, include_pending=False)
@@ -3338,6 +3361,7 @@ def kid_home(
                         "total_claims": total_claims,
                         "approved_claims": approved_claims,
                         "existing_claim": existing_claim,
+                        "audience": allowed_ids or set(),
                     }
                 )
         kid_lookup: Dict[str, Child] = {child.kid_id: child}
@@ -3576,6 +3600,19 @@ def kid_home(
                 if chore.notes
                 else ""
             )
+            audience_ids: Set[str] = info.get("audience") or set()
+            audience_line = ""
+            if audience_ids:
+                invited_names = []
+                for kid in sorted(audience_ids):
+                    entry = kid_lookup.get(kid)
+                    invited_names.append(html_escape(entry.name if entry else kid))
+                if invited_names:
+                    audience_line = (
+                        "<div class='muted' style='margin-top:4px;'>Invited: "
+                        + ", ".join(invited_names)
+                        + "</div>"
+                    )
             schedule_bits: List[str] = []
             if chore.start_date or chore.end_date:
                 schedule_bits.append(
@@ -3636,6 +3673,7 @@ def kid_home(
                 + f"<div style='font-weight:600;'>{name_html}</div>"
                 + f"<div class='muted' style='margin-top:2px;'>Reward: {usd(chore.award_cents)} shared by up to {chore.max_claimants} kid{'s' if chore.max_claimants != 1 else ''} ({period_display})</div>"
                 + notes_line
+                + audience_line
                 + schedule_line
                 + stats_line
                 + (f"<div style='margin-top:6px;'>{status_html}</div>" if status_html else "")
@@ -3663,7 +3701,7 @@ def kid_home(
         global_card = f"""
           <div class='card'>
             <h3>Free-for-all</h3>
-            <div class='muted'>Optional chores open to everyone for extra rewards.</div>
+            <div class='muted'>Optional chores you can claim for extra rewards. Some may be limited to invited kids.</div>
             {global_sections}
             {history_html}
           </div>
@@ -3672,7 +3710,7 @@ def kid_home(
             global_card = f"""
           <div class='card'>
             <h3>Free-for-all</h3>
-            <div class='muted'>Optional chores open to everyone for extra rewards.</div>
+            <div class='muted'>Optional chores you can claim for extra rewards. Some may be limited to invited kids.</div>
             <div class='muted' style='margin-top:10px;'>No global chores have been posted yet.</div>
           </div>
         """
@@ -5303,6 +5341,13 @@ def kid_global_chore_apply(request: Request, chore_id: int = Form(...)):
             or not is_chore_in_window(chore, today)
         ):
             set_kid_notice(request, "That Free-for-all chore is not available right now.", "error")
+            return RedirectResponse("/kid?section=freeforall", status_code=302)
+        audience_rows = session.exec(
+            select(GlobalChoreAudience).where(GlobalChoreAudience.chore_id == chore.id)
+        ).all()
+        audience_ids = {row.kid_id for row in audience_rows}
+        if audience_ids and kid_id not in audience_ids:
+            set_kid_notice(request, "That Free-for-all chore isn't open to you.", "error")
             return RedirectResponse("/kid?section=freeforall", status_code=302)
         period_key = global_chore_period_key(moment, chore)
         existing_claim = get_global_claim(session, chore.id, kid_id, period_key)
@@ -8496,7 +8541,7 @@ def admin_home(
         f"<div class='chore-multi-assign__box' id='chore-create-assignees' data-global-option='{GLOBAL_CHORE_KID_ID}' style='display:grid; gap:6px; grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); padding:12px; border:1px solid #cbd5f5; border-radius:10px; background:#f8fafc;'>"
         + "".join(multi_assign_options)
         + "</div>"
-        + "<div class='muted' style='margin-top:6px;'>Check one or more kids to publish the chore. Include Free-for-all to create a shared task. Combine it with names to send both shared and personal copies.</div>"
+        + "<div class='muted' style='margin-top:6px;'>Check one or more kids to publish the chore. Include Free-for-all to create a shared task. When you also select kids, only those names can claim the shared chore.</div>"
         + "</div>"
     )
     chores_card = (
@@ -8993,28 +9038,56 @@ def admin_chore_create(
     if not unique_ids:
         set_admin_notice(request, "Select at least one kid for the chore.", "error")
         return RedirectResponse("/admin?section=chores", status_code=302)
+    global_selected = False
+    personal_targets: List[str] = []
+    for kid_value in unique_ids:
+        if kid_value == GLOBAL_CHORE_KID_ID:
+            global_selected = True
+        else:
+            personal_targets.append(kid_value)
+    creation_targets = [GLOBAL_CHORE_KID_ID] if global_selected else personal_targets
+    if not creation_targets:
+        set_admin_notice(request, "Select at least one kid for the chore.", "error")
+        return RedirectResponse("/admin?section=chores", status_code=302)
     prevent_marketplace = bool(block_marketplace)
     kid_labels: List[str] = []
     with Session(engine) as session:
-        for kid_value in unique_ids:
+        child_lookup: Dict[str, Child] = {}
+        for kid_value in personal_targets:
+            if (
+                denied := ensure_admin_kid_access(
+                    request, kid_value, redirect="/admin?section=chores"
+                )
+            ) is not None:
+                return denied
+            target_child = session.exec(
+                select(Child).where(Child.kid_id == kid_value)
+            ).first()
+            if target_child:
+                child_lookup[kid_value] = target_child
+        for kid_value in creation_targets:
             is_global = kid_value == GLOBAL_CHORE_KID_ID
-            if not is_global:
-                if (
-                    denied := ensure_admin_kid_access(
-                        request, kid_value, redirect="/admin?section=chores"
-                    )
-                ) is not None:
-                    return denied
             normalized_type = normalize_chore_type(type, is_global=is_global)
             weekday_value = weekday_csv if normalized_type == "weekly" else None
             dates_value = dates_csv if normalized_type == "special" else None
             month_days_value = month_days_csv if normalized_type == "monthly" else None
             max_claims = max_claims_value if is_global else 1
-            kid_label = "Free-for-all" if is_global else kid_value or "Unknown"
-            if not is_global:
-                target_child = session.exec(
-                    select(Child).where(Child.kid_id == kid_value)
-                ).first()
+            if is_global:
+                if global_selected and personal_targets:
+                    audience_names = [
+                        (child_lookup.get(pid).name if child_lookup.get(pid) else pid)
+                        for pid in personal_targets
+                    ]
+                    if len(audience_names) > 3:
+                        display = ", ".join(audience_names[:3]) + f" +{len(audience_names) - 3} more"
+                    else:
+                        display = ", ".join(audience_names)
+                    kid_label = f"Free-for-all ({display})"
+                else:
+                    kid_label = "Free-for-all"
+            else:
+                kid_label = kid_value or "Unknown"
+                target_child = child_lookup.get(kid_value)
                 if target_child:
                     kid_label = target_child.name
             chore = Chore(
@@ -9033,6 +9106,10 @@ def admin_chore_create(
                 marketplace_blocked=prevent_marketplace,
             )
             session.add(chore)
+            session.flush()
+            if is_global and global_selected and personal_targets:
+                for kid in personal_targets:
+                    session.add(GlobalChoreAudience(chore_id=chore.id, kid_id=kid))
             kid_labels.append(kid_label)
         session.commit()
     if kid_labels:
@@ -9403,6 +9480,7 @@ def admin_chore_delete(request: Request, chore_id: int = Form(...)):
         session.exec(delete(MarketplaceListing).where(MarketplaceListing.chore_id == chore.id))
         if chore.kid_id == GLOBAL_CHORE_KID_ID:
             session.exec(delete(GlobalChoreClaim).where(GlobalChoreClaim.chore_id == chore.id))
+            session.exec(delete(GlobalChoreAudience).where(GlobalChoreAudience.chore_id == chore.id))
         session.delete(chore)
         session.commit()
     if chore_name:
