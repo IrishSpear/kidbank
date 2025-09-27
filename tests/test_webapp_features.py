@@ -26,6 +26,7 @@ from kidbank.webapp import (  # noqa: E402
     KidMarketInstrument,
     MarketplaceListing,
     MoneyRequest,
+    MARKETPLACE_STATUS_COMPLETED,
     REMEMBER_NAME_COOKIE,
     app,
     detailed_history_chart_svg,
@@ -36,12 +37,14 @@ from kidbank.webapp import (  # noqa: E402
     list_kid_market_symbols,
     load_admin_privileges,
     run_migrations,
+    period_key_for,
 )
 from kidbank.webapp import (
     Certificate,
     Child,
     Chore,
     ChoreInstance,
+    SharedChoreMember,
     Event,
     Goal,
     GlobalChoreClaim,
@@ -52,6 +55,7 @@ from kidbank.webapp import (
     MetaKV,
     Quiz,
     QuizAttempt,
+    SHARED_CHORE_KID_ID,
 )
 
 
@@ -288,6 +292,51 @@ def test_marketplace_blocked_chore_not_listed() -> None:
             select(MarketplaceListing).where(MarketplaceListing.chore_id == chore_id)
         ).first()
     assert listing is None
+
+
+def test_marketplace_completed_listing_can_be_dismissed() -> None:
+    client = TestClient(app)
+    with Session(engine) as session:
+        owner = Child(kid_id="owner", name="Owner", balance_cents=1_000, kid_pin="1111")
+        worker = Child(kid_id="worker", name="Worker", balance_cents=500, kid_pin="2222")
+        chore = Chore(kid_id=owner.kid_id, name="Laundry", type="weekly", award_cents=300)
+        session.add_all([owner, worker, chore])
+        session.commit()
+        session.refresh(chore)
+        listing = MarketplaceListing(
+            owner_kid_id=owner.kid_id,
+            chore_id=chore.id,
+            chore_name=chore.name,
+            chore_award_cents=chore.award_cents,
+            offer_cents=150,
+            status=MARKETPLACE_STATUS_COMPLETED,
+            claimed_by=worker.kid_id,
+            completed_at=datetime.utcnow(),
+        )
+        session.add(listing)
+        session.commit()
+        session.refresh(listing)
+        listing_id = listing.id
+    assert listing_id is not None
+    login = client.post(
+        "/kid/login", data={"kid_id": "worker", "kid_pin": "2222"}, follow_redirects=False
+    )
+    assert login.status_code == 302
+    page = client.get("/kid?section=marketplace")
+    assert page.status_code == 200
+    assert "Laundry" in page.text
+    assert "Dismiss" in page.text
+    dismiss = client.post(
+        "/kid/marketplace/dismiss",
+        data={"listing_id": listing_id, "redirect": "/kid?section=marketplace"},
+        follow_redirects=False,
+    )
+    assert dismiss.status_code == 303
+    assert dismiss.headers["location"] == "/kid?section=marketplace"
+    refreshed = client.get("/kid?section=marketplace")
+    assert refreshed.status_code == 200
+    assert "Laundry" not in refreshed.text
+    assert "Claim a listing to see it here." in refreshed.text
 
 
 def test_special_chore_completion_stays_visible() -> None:
@@ -882,6 +931,94 @@ def test_global_chore_audience_limits_claims() -> None:
         ).all()
     assert len(claims) == 1
     assert claims[0].kid_id == "avery"
+
+
+def test_kid_dashboard_renders_shared_chore_details() -> None:
+    client = TestClient(app)
+    with Session(engine) as session:
+        kids = [
+            Child(kid_id="avery", name="Avery", kid_pin="1111", balance_cents=0),
+            Child(kid_id="blake", name="Blake", kid_pin="2222", balance_cents=0),
+        ]
+        session.add_all(kids)
+        session.commit()
+        shared_chore = Chore(
+            kid_id=SHARED_CHORE_KID_ID,
+            name="Dish Duty",
+            type="weekly",
+            award_cents=500,
+            penalty_cents=100,
+            max_claimants=2,
+        )
+        session.add(shared_chore)
+        session.commit()
+        session.refresh(shared_chore)
+        session.add_all(
+            [
+                SharedChoreMember(chore_id=shared_chore.id, kid_id="avery"),
+                SharedChoreMember(chore_id=shared_chore.id, kid_id="blake"),
+            ]
+        )
+        session.commit()
+    login = client.post(
+        "/kid/login",
+        data={"kid_id": "avery", "kid_pin": "1111"},
+        follow_redirects=False,
+    )
+    assert login.status_code == 302
+    dashboard = client.get("/kid?section=chores")
+    assert dashboard.status_code == 200
+    assert "We hit a snag" not in dashboard.text
+    assert "Shared with:" in dashboard.text
+    assert "Max claimants: 2" in dashboard.text
+
+
+def test_shared_chore_button_disabled_when_spots_taken() -> None:
+    client = TestClient(app)
+    today = date.today()
+    period_moment = datetime.combine(today, datetime.min.time())
+    with Session(engine) as session:
+        kids = [
+            Child(kid_id="avery", name="Avery", kid_pin="1111", balance_cents=0),
+            Child(kid_id="blake", name="Blake", kid_pin="2222", balance_cents=0),
+        ]
+        session.add_all(kids)
+        session.commit()
+        shared_chore = Chore(
+            kid_id=SHARED_CHORE_KID_ID,
+            name="Clean Kitchen",
+            type="daily",
+            award_cents=400,
+            max_claimants=1,
+        )
+        session.add(shared_chore)
+        session.commit()
+        session.refresh(shared_chore)
+        session.add_all(
+            [
+                SharedChoreMember(chore_id=shared_chore.id, kid_id="avery"),
+                SharedChoreMember(chore_id=shared_chore.id, kid_id="blake"),
+            ]
+        )
+        taken_instance = ChoreInstance(
+            chore_id=shared_chore.id,
+            period_key=period_key_for("daily", period_moment),
+            status="pending",
+            completing_kid_id="blake",
+            completed_at=datetime.utcnow(),
+        )
+        session.add(taken_instance)
+        session.commit()
+    login = client.post(
+        "/kid/login",
+        data={"kid_id": "avery", "kid_pin": "1111"},
+        follow_redirects=False,
+    )
+    assert login.status_code == 302
+    dashboard = client.get("/kid?section=chores")
+    assert dashboard.status_code == 200
+    assert "<button type='submit' disabled>All spots taken</button>" in dashboard.text
+    assert "<button type='submit'>Mark complete</button>" not in dashboard.text
 
 
 def test_global_chore_multiple_claims_split_evenly() -> None:

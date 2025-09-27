@@ -31,7 +31,7 @@ from urllib.request import Request as URLRequest, urlopen
 
 from fastapi import FastAPI, Form, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse, JSONResponse, Response
-from sqlalchemy import delete, inspect
+from sqlalchemy import and_, delete, inspect, or_
 from sqlmodel import Session, desc, select
 from starlette.middleware.sessions import SessionMiddleware
 
@@ -81,6 +81,12 @@ def now_local() -> datetime:
 
 
 _TRANSFER_DISMISS_SESSION_KEY = "kid_transfer_dismissals"
+_MARKETPLACE_DISMISS_SESSION_KEY = "kid_marketplace_dismissals"
+_MARKETPLACE_DISMISSIBLE_STATUSES = {
+    MARKETPLACE_STATUS_COMPLETED,
+    MARKETPLACE_STATUS_CANCELLED,
+    MARKETPLACE_STATUS_REJECTED,
+}
 
 
 def _get_dismissed_transfer_ids(request: Request, kid_id: str) -> Set[int]:
@@ -111,6 +117,37 @@ def _record_transfer_dismissal(request: Request, kid_id: str, event_id: int) -> 
         raw_values.append(event_id)
     raw_store[kid_id] = raw_values
     request.session[_TRANSFER_DISMISS_SESSION_KEY] = raw_store
+
+
+def _get_dismissed_marketplace_ids(request: Request, kid_id: str) -> Set[int]:
+    raw_store = request.session.get(_MARKETPLACE_DISMISS_SESSION_KEY)
+    if isinstance(raw_store, dict):
+        raw_values = raw_store.get(kid_id)
+        if isinstance(raw_values, list):
+            dismissed: Set[int] = set()
+            for value in raw_values:
+                try:
+                    dismissed.add(int(value))
+                except (TypeError, ValueError):
+                    continue
+            return dismissed
+    return set()
+
+
+def _record_marketplace_dismissal(request: Request, kid_id: str, listing_id: int) -> None:
+    if listing_id <= 0:
+        return
+    raw_store = request.session.get(_MARKETPLACE_DISMISS_SESSION_KEY)
+    if not isinstance(raw_store, dict):
+        raw_store = {}
+    raw_values = raw_store.get(kid_id)
+    if not isinstance(raw_values, list):
+        raw_values = []
+    if listing_id not in raw_values:
+        raw_values.append(listing_id)
+        raw_values = raw_values[-60:]
+    raw_store[kid_id] = raw_values
+    request.session[_MARKETPLACE_DISMISS_SESSION_KEY] = raw_store
 
 
 def _penalty_event_reason(chore_id: int, target_day: date) -> str:
@@ -183,6 +220,14 @@ def _chore_submission_before_deadline(
     period_key = period_key_for(chore_type, period_moment)
     query = select(ChoreInstance).where(ChoreInstance.chore_id == chore.id)
     query = query.where(ChoreInstance.period_key == period_key)
+    if chore.kid_id == SHARED_CHORE_KID_ID:
+        instances = session.exec(query.order_by(desc(ChoreInstance.id))).all()
+        for instance in instances:
+            if instance.status not in {"pending", "paid", CHORE_STATUS_PENDING_MARKETPLACE}:
+                continue
+            if instance.completed_at and instance.completed_at <= deadline:
+                return True
+        return False
     instance = session.exec(query.order_by(desc(ChoreInstance.id))).first()
     if not instance:
         return False
@@ -208,14 +253,15 @@ def apply_chore_penalties(moment: Optional[datetime] = None) -> None:
         for chore in chores:
             if chore.kid_id == GLOBAL_CHORE_KID_ID:
                 continue
-            child = child_cache.get(chore.kid_id)
-            if child is None:
-                child = session.exec(
-                    select(Child).where(Child.kid_id == chore.kid_id)
-                ).first()
-                if child is None:
-                    continue
-                child_cache[chore.kid_id] = child
+            if chore.kid_id == SHARED_CHORE_KID_ID:
+                member_rows = session.exec(
+                    select(SharedChoreMember).where(SharedChoreMember.chore_id == chore.id)
+                ).all()
+                participant_ids = [row.kid_id for row in member_rows]
+            else:
+                participant_ids = [chore.kid_id]
+            if not participant_ids:
+                continue
             created_day = (chore.created_at or datetime.utcnow()).date()
             first_day = max(
                 created_day,
@@ -249,8 +295,25 @@ def apply_chore_penalties(moment: Optional[datetime] = None) -> None:
                 if not _chore_submission_before_deadline(
                     session, chore, current_day, deadline
                 ):
-                    deduction = min(chore.penalty_cents, child.balance_cents)
-                    if deduction > 0:
+                    for participant in participant_ids:
+                        child = child_cache.get(participant)
+                        if child is None:
+                            child = session.exec(
+                                select(Child).where(Child.kid_id == participant)
+                            ).first()
+                            if child is None:
+                                continue
+                            child_cache[participant] = child
+                        existing = session.exec(
+                            select(Event)
+                            .where(Event.child_id == participant)
+                            .where(Event.reason == reason)
+                        ).first()
+                        if existing:
+                            continue
+                        deduction = min(chore.penalty_cents, child.balance_cents)
+                        if deduction <= 0:
+                            continue
                         child.balance_cents -= deduction
                         child.updated_at = datetime.utcnow()
                         session.add(
@@ -1443,18 +1506,86 @@ def list_chore_instances_for_kid(
     pk_weekly = period_key_for("weekly", moment)
     pk_monthly = period_key_for("monthly", moment)
     with Session(engine) as session:
-        chores = session.exec(select(Chore).where(Chore.kid_id == kid_id, Chore.active == True)).all()  # noqa: E712
+        personal = session.exec(
+            select(Chore).where(Chore.kid_id == kid_id, Chore.active == True)
+        ).all()  # noqa: E712
+        for chore in personal:
+            object.__setattr__(chore, "shared_member_names", [])
+            object.__setattr__(chore, "shared_member_pairs", [])
+        shared_links = session.exec(
+            select(SharedChoreMember).where(SharedChoreMember.kid_id == kid_id)
+        ).all()
+        shared_ids = sorted({link.chore_id for link in shared_links if link.chore_id})
+        shared: List[Chore] = []
+        member_map: Dict[int, List[str]] = {}
+        child_lookup: Dict[str, Child] = {}
+        if shared_ids:
+            shared = session.exec(
+                select(Chore)
+                .where(Chore.id.in_(shared_ids))
+                .where(Chore.active == True)
+            ).all()  # noqa: E712
+            member_rows = session.exec(
+                select(SharedChoreMember).where(SharedChoreMember.chore_id.in_(shared_ids))
+            ).all()
+            for row in member_rows:
+                member_map.setdefault(row.chore_id, []).append(row.kid_id)
+            member_ids = sorted({kid for kids in member_map.values() for kid in kids})
+            if member_ids:
+                child_lookup = {
+                    child.kid_id: child
+                    for child in session.exec(
+                        select(Child).where(Child.kid_id.in_(member_ids))
+                    ).all()
+                }
+            for chore in shared:
+                participants = member_map.get(chore.id or 0, [])
+                pairs: List[Tuple[str, str]] = []
+                names: List[str] = []
+                for participant in participants:
+                    child = child_lookup.get(participant)
+                    label = child.name if child else participant
+                    pairs.append((participant, label))
+                    names.append(label)
+                object.__setattr__(chore, "shared_member_pairs", pairs)
+                object.__setattr__(chore, "shared_member_names", names)
+        chores = personal + shared
         output: List[Tuple[Chore, Optional[ChoreInstance]]] = []
         for chore in chores:
             if not is_chore_in_window(chore, today):
                 continue
+            chore_type = normalize_chore_type(chore.type)
             insts = session.exec(
                 select(ChoreInstance)
                 .where(ChoreInstance.chore_id == chore.id)
                 .order_by(desc(ChoreInstance.id))
             ).all()
+            shared_slots_remaining: Optional[int] = None
+            if chore.kid_id == SHARED_CHORE_KID_ID:
+                insts = [inst for inst in insts if inst.completing_kid_id == kid_id]
+                if chore.id is not None and chore.max_claimants is not None:
+                    shared_period_key = (
+                        "SPECIAL"
+                        if chore_type == "special"
+                        else period_key_for(chore_type, moment)
+                    )
+                    shared_submissions = session.exec(
+                        select(ChoreInstance)
+                        .where(ChoreInstance.chore_id == chore.id)
+                        .where(ChoreInstance.period_key == shared_period_key)
+                        .where(
+                            ChoreInstance.status.in_(
+                                ["pending", "paid", CHORE_STATUS_PENDING_MARKETPLACE]
+                            )
+                        )
+                    ).all()
+                    shared_slots_remaining = max(
+                        0, chore.max_claimants - len(shared_submissions)
+                    )
+                    object.__setattr__(
+                        chore, "shared_slots_remaining", shared_slots_remaining
+                    )
             current: Optional[ChoreInstance]
-            chore_type = normalize_chore_type(chore.type)
             if chore_type == "daily":
                 current = next((i for i in insts if i.period_key == pk_daily), None)
             elif chore_type == "weekly":
@@ -2208,7 +2339,24 @@ def sunday_key(moment: datetime) -> str:
 def chores_completion_for_week(session: Session, kid_id: str, week_iso: str) -> Tuple[int, int]:
     week_start = date.fromisoformat(week_iso)
     week_end = week_start + timedelta(days=6)
-    chores = session.exec(select(Chore).where(Chore.kid_id == kid_id, Chore.active == True)).all()  # noqa: E712
+    shared_rows = session.exec(
+        select(SharedChoreMember).where(SharedChoreMember.kid_id == kid_id)
+    ).all()
+    shared_ids = [row.chore_id for row in shared_rows]
+    if shared_ids:
+        chore_query = (
+            select(Chore)
+            .where(
+                or_(
+                    Chore.kid_id == kid_id,
+                    and_(Chore.kid_id == SHARED_CHORE_KID_ID, Chore.id.in_(shared_ids)),
+                )
+            )
+            .where(Chore.active == True)
+        )
+    else:
+        chore_query = select(Chore).where(Chore.kid_id == kid_id, Chore.active == True)
+    chores = session.exec(chore_query).all()  # noqa: E712
     expected = 0
     paid = 0
     for chore in chores:
@@ -2236,6 +2384,17 @@ def chores_completion_for_week(session: Session, kid_id: str, week_iso: str) -> 
         elif chore.type == "weekly":
             expected += 1
             pk = f"{week_start.isoformat()}-WEEK"
+            inst = session.exec(
+                select(ChoreInstance)
+                .where(ChoreInstance.chore_id == chore.id)
+                .where(ChoreInstance.period_key == pk)
+                .where(ChoreInstance.status == "paid")
+            ).first()
+            if inst:
+                paid += 1
+        elif chore.type == "monthly":
+            expected += 1
+            pk = week_start.strftime("%Y-%m")
             inst = session.exec(
                 select(ChoreInstance)
                 .where(ChoreInstance.chore_id == chore.id)
@@ -3329,6 +3488,29 @@ def kid_home(
                 .order_by(desc(MarketplaceListing.created_at)),
             )
 
+            dismissed_marketplace_ids = _get_dismissed_marketplace_ids(request, kid_id)
+            if dismissed_marketplace_ids:
+                def _is_dismissed(listing: MarketplaceListing) -> bool:
+                    try:
+                        listing_id = int(listing.id) if listing.id is not None else 0
+                    except (TypeError, ValueError):
+                        return False
+                    return (
+                        listing_id in dismissed_marketplace_ids
+                        and listing.status in _MARKETPLACE_DISMISSIBLE_STATUSES
+                    )
+
+                marketplace_my_listings = [
+                    listing
+                    for listing in marketplace_my_listings
+                    if not _is_dismissed(listing)
+                ]
+                marketplace_claimed_by_me = [
+                    listing
+                    for listing in marketplace_claimed_by_me
+                    if not _is_dismissed(listing)
+                ]
+
             for claim in kid_global_claims:
                 if claim.chore_id not in global_chore_lookup:
                     chore_ref = session.get(Chore, claim.chore_id)
@@ -3433,12 +3615,26 @@ def kid_home(
                 in {"pending", CHORE_STATUS_PENDING_MARKETPLACE}
             ):
                 special_note_html = "<div class='muted chore-item__schedule'>Available again tomorrow.</div>"
+            shared_slots_remaining = None
+            if chore.kid_id == SHARED_CHORE_KID_ID:
+                shared_slots_remaining = getattr(chore, "shared_slots_remaining", None)
             if is_selected_today and status == "available":
-                action_html = (
-                    f"<form class='inline' method='post' action='/kid/checkoff'>"
-                    f"<input type='hidden' name='chore_id' value='{chore.id}'>"
-                    "<button type='submit'>Mark complete</button></form>"
-                )
+                if (
+                    chore.kid_id == SHARED_CHORE_KID_ID
+                    and shared_slots_remaining is not None
+                    and shared_slots_remaining <= 0
+                ):
+                    action_html = (
+                        f"<form class='inline' method='post' action='/kid/checkoff'>"
+                        f"<input type='hidden' name='chore_id' value='{chore.id}'>"
+                        "<button type='submit' disabled>All spots taken</button></form>"
+                    )
+                else:
+                    action_html = (
+                        f"<form class='inline' method='post' action='/kid/checkoff'>"
+                        f"<input type='hidden' name='chore_id' value='{chore.id}'>"
+                        "<button type='submit'>Mark complete</button></form>"
+                    )
             elif is_selected_today and status in {"pending", CHORE_STATUS_PENDING_MARKETPLACE}:
                 action_html = "<span class='pill status-pending'>Awaiting review</span>" + special_note_html
             elif is_selected_today and status == "paid":
@@ -3461,6 +3657,17 @@ def kid_home(
             month_days = chore_specific_month_days(chore)
             if month_days:
                 schedule_bits.append(f"Month days: {format_month_days(month_days)}")
+            if chore.kid_id == SHARED_CHORE_KID_ID:
+                member_pairs = getattr(chore, "shared_member_pairs", [])
+                shared_other_names = [name for kid, name in member_pairs if kid != kid_id]
+                if not shared_other_names:
+                    shared_other_names = [name for _, name in member_pairs]
+                if shared_other_names:
+                    schedule_bits.append(
+                        "Shared with: "
+                        + ", ".join(html_escape(name) for name in shared_other_names)
+                    )
+                schedule_bits.append(f"Max claimants: {chore.max_claimants}")
             if getattr(chore, "marketplace_blocked", False):
                 schedule_bits.append("Job board listing disabled")
             schedule_line = (
@@ -4488,6 +4695,17 @@ def kid_home(
             except Exception:
                 return str(value)
 
+        def _dismiss_action(listing: MarketplaceListing) -> str:
+            if not listing.id:
+                return ""
+            return (
+                "<form method='post' action='/kid/marketplace/dismiss' class='inline'>"
+                f"<input type='hidden' name='listing_id' value='{listing.id}'>"
+                "<input type='hidden' name='redirect' value='/kid?section=marketplace'>"
+                "<button type='submit' class='secondary'>Dismiss</button>"
+                "</form>"
+            )
+
         available_rows = []
         for listing in marketplace_open_listings:
             owner = kid_lookup.get(listing.owner_kid_id)
@@ -4548,6 +4766,11 @@ def kid_home(
                 if note:
                     status_html += f"<div class='muted'>{note}</div>"
 
+            dismiss_action = (
+                _dismiss_action(listing)
+                if listing.status in _MARKETPLACE_DISMISSIBLE_STATUSES
+                else ""
+            )
             actions_html = ""
             if listing.status == MARKETPLACE_STATUS_OPEN:
                 actions_html = (
@@ -4556,6 +4779,8 @@ def kid_home(
                     "<button type='submit' class='danger'>Cancel</button>"
                     "</form>"
                 )
+            elif dismiss_action:
+                actions_html = dismiss_action
             my_listing_rows.append(
                 "<tr>"
                 f"<td data-label='Chore'><b>{html_escape(listing.chore_name)}</b><div class='muted'>Award {usd(listing.chore_award_cents)}</div></td>"
@@ -4591,6 +4816,11 @@ def kid_home(
                 if note:
                     status_html += f"<div class='muted'>{note}</div>"
 
+            dismiss_action = (
+                _dismiss_action(listing)
+                if listing.status in _MARKETPLACE_DISMISSIBLE_STATUSES
+                else ""
+            )
             actions_html = ""
             if listing.status == MARKETPLACE_STATUS_CLAIMED and listing.claimed_by == kid_id:
                 actions_html = (
@@ -4599,6 +4829,8 @@ def kid_home(
                     "<button type='submit'>Mark completed</button>"
                     "</form>"
                 )
+            elif dismiss_action:
+                actions_html = dismiss_action
             my_claim_rows.append(
                 "<tr>"
                 f"<td data-label='Chore'><b>{html_escape(listing.chore_name)}</b><div class='muted'>From {owner_name}</div></td>"
@@ -5241,33 +5473,49 @@ def kid_checkoff(request: Request, chore_id: int = Form(...)):
     today = moment.date()
     with Session(engine) as session:
         chore = session.get(Chore, chore_id)
-        if not chore or chore.kid_id != kid_id or not chore.active:
+        if not chore or not chore.active:
             set_kid_notice(request, "That chore isn't available right now.", "error")
             return RedirectResponse("/kid?section=chores", status_code=302)
-        active_listing = _safe_marketplace_first(
-            session,
+        is_shared = chore.kid_id == SHARED_CHORE_KID_ID
+        if chore.kid_id == kid_id:
+            allowed = True
+        elif is_shared:
+            membership = session.exec(
+                select(SharedChoreMember)
+                .where(SharedChoreMember.chore_id == chore.id)
+                .where(SharedChoreMember.kid_id == kid_id)
+            ).first()
+            allowed = membership is not None
+        else:
+            allowed = False
+        if not allowed:
+            set_kid_notice(request, "That chore isn't available right now.", "error")
+            return RedirectResponse("/kid?section=chores", status_code=302)
+        if not is_shared:
+            active_listing = _safe_marketplace_first(
+                session,
 
-            select(MarketplaceListing)
-            .where(MarketplaceListing.chore_id == chore.id)
-            .where(MarketplaceListing.owner_kid_id == kid_id)
-            .where(
-                MarketplaceListing.status.in_(
-                    [
-                        MARKETPLACE_STATUS_OPEN,
-                        MARKETPLACE_STATUS_CLAIMED,
-                        MARKETPLACE_STATUS_SUBMITTED,
-                    ]
-                )
-            ),
-        )
-
-        if active_listing:
-            set_kid_notice(
-                request,
-                "That chore is currently listed on the job board.",
-                "error",
+                select(MarketplaceListing)
+                .where(MarketplaceListing.chore_id == chore.id)
+                .where(MarketplaceListing.owner_kid_id == kid_id)
+                .where(
+                    MarketplaceListing.status.in_(
+                        [
+                            MARKETPLACE_STATUS_OPEN,
+                            MARKETPLACE_STATUS_CLAIMED,
+                            MARKETPLACE_STATUS_SUBMITTED,
+                        ]
+                    )
+                ),
             )
-            return RedirectResponse("/kid?section=marketplace", status_code=302)
+
+            if active_listing:
+                set_kid_notice(
+                    request,
+                    "That chore is currently listed on the job board.",
+                    "error",
+                )
+                return RedirectResponse("/kid?section=marketplace", status_code=302)
         if not is_chore_in_window(chore, today):
             set_kid_notice(request, "That chore can't be completed today.", "error")
             return RedirectResponse("/kid?section=chores", status_code=302)
@@ -5290,6 +5538,7 @@ def kid_checkoff(request: Request, chore_id: int = Form(...)):
                     and inst.completed_at.date() == today
                     and inst.status
                     in {"pending", "paid", CHORE_STATUS_PENDING_MARKETPLACE}
+                    and (inst.completing_kid_id in {None, kid_id})
                     for inst in recent_instances
                 )
                 if already_completed:
@@ -5311,16 +5560,70 @@ def kid_checkoff(request: Request, chore_id: int = Form(...)):
             session.add(inst)
             session.commit()
             session.refresh(inst)
-        if inst.status == "available":
-            inst.status = "pending"
-            inst.completed_at = datetime.utcnow()
-            session.add(inst)
+        if is_shared:
+            existing_for_kid = session.exec(
+                select(ChoreInstance)
+                .where(ChoreInstance.chore_id == chore.id)
+                .where(ChoreInstance.period_key == pk)
+                .where(ChoreInstance.completing_kid_id == kid_id)
+                .where(ChoreInstance.status.in_(["pending", "paid"]))
+            ).first()
+            if existing_for_kid:
+                set_kid_notice(
+                    request,
+                    "You already submitted this shared chore for this period.",
+                    "error",
+                )
+                return RedirectResponse("/kid?section=chores", status_code=302)
+            legacy_submission = session.exec(
+                select(ChoreInstance)
+                .where(ChoreInstance.chore_id == chore.id)
+                .where(ChoreInstance.period_key == pk)
+                .where(ChoreInstance.status.in_(["pending", "paid"]))
+                .where(ChoreInstance.completing_kid_id.is_(None))
+            ).first()
+            if legacy_submission:
+                set_kid_notice(
+                    request,
+                    "This shared chore already has a pending submission for this period.",
+                    "error",
+                )
+                return RedirectResponse("/kid?section=chores", status_code=302)
+            total_submissions = session.exec(
+                select(ChoreInstance)
+                .where(ChoreInstance.chore_id == chore.id)
+                .where(ChoreInstance.period_key == pk)
+                .where(ChoreInstance.status.in_(["pending", "paid"]))
+            ).all()
+            if len(total_submissions) >= chore.max_claimants:
+                set_kid_notice(
+                    request,
+                    "All spots are taken for that chore.",
+                    "error",
+                )
+                return RedirectResponse("/kid?section=chores", status_code=302)
+            new_inst = ChoreInstance(
+                chore_id=chore.id,
+                period_key=pk,
+                status="pending",
+                completed_at=datetime.utcnow(),
+                completing_kid_id=kid_id,
+            )
+            session.add(new_inst)
             session.commit()
             set_kid_notice(request, f"Sent '{chore.name}' for approval!", "success")
-        elif inst.status in {"pending", CHORE_STATUS_PENDING_MARKETPLACE}:
-            set_kid_notice(request, "That chore is already waiting for approval.", "error")
         else:
-            set_kid_notice(request, "That chore has already been paid out.", "error")
+            if inst.status == "available":
+                inst.status = "pending"
+                inst.completed_at = datetime.utcnow()
+                inst.completing_kid_id = kid_id
+                session.add(inst)
+                session.commit()
+                set_kid_notice(request, f"Sent '{chore.name}' for approval!", "success")
+            elif inst.status in {"pending", CHORE_STATUS_PENDING_MARKETPLACE}:
+                set_kid_notice(request, "That chore is already waiting for approval.", "error")
+            else:
+                set_kid_notice(request, "That chore has already been paid out.", "error")
     return RedirectResponse("/kid?section=chores", status_code=302)
 
 
@@ -5791,6 +6094,38 @@ def kid_marketplace_complete(request: Request, listing_id: int = Form(...)):
     )
 
     return RedirectResponse("/kid?section=marketplace", status_code=302)
+
+
+@app.post("/kid/marketplace/dismiss")
+def kid_marketplace_dismiss(
+    request: Request,
+    listing_id: int = Form(...),
+    redirect: str = Form("/kid?section=marketplace"),
+):
+    if (redirect_resp := require_kid(request)) is not None:
+        return redirect_resp
+    kid_id = kid_authed(request)
+    assert kid_id
+    redirect_target = (redirect or "/kid?section=marketplace").strip()
+    if not redirect_target.startswith("/"):
+        redirect_target = "/kid?section=marketplace"
+    notice_message = "That job board listing can't be dismissed right now."
+    notice_kind = "error"
+    with Session(engine) as session:
+        listing = session.get(MarketplaceListing, listing_id)
+        if (
+            listing
+            and listing.id
+            and listing.status in _MARKETPLACE_DISMISSIBLE_STATUSES
+            and (listing.owner_kid_id == kid_id or listing.claimed_by == kid_id)
+        ):
+            _record_marketplace_dismissal(request, kid_id, int(listing.id))
+            notice_message = "Dismissed that job board listing."
+            notice_kind = "success"
+        elif listing is None:
+            notice_message = "Could not find that job board listing."
+    set_kid_notice(request, notice_message, notice_kind)
+    return RedirectResponse(redirect_target, status_code=303)
 
 
 @app.post("/kid/logout")
@@ -7007,7 +7342,12 @@ def admin_home(
             select(ChoreInstance, Chore, Child)
             .where(ChoreInstance.status == "pending")
             .where(ChoreInstance.chore_id == Chore.id)
-            .where(Chore.kid_id == Child.kid_id)
+            .where(
+                or_(
+                    and_(Chore.kid_id != SHARED_CHORE_KID_ID, Chore.kid_id == Child.kid_id),
+                    and_(Chore.kid_id == SHARED_CHORE_KID_ID, ChoreInstance.completing_kid_id == Child.kid_id),
+                )
+            )
             .order_by(desc(ChoreInstance.completed_at))
         ).all()
         approval_pairs = session.exec(
@@ -8522,11 +8862,17 @@ def admin_home(
     )
     multi_assign_options: List[str] = [
         (
+            f"<label class='chore-multi-option chore-multi-option--shared' style='{multi_label_style}'>"
+            f"<input type='checkbox' name='kid_ids' value='{SHARED_CHORE_KID_ID}' data-shared-checkbox> "
+            "Shared (single chore)"
+            "</label>"
+        ),
+        (
             f"<label class='chore-multi-option chore-multi-option--global' style='{multi_label_style}'>"
             f"<input type='checkbox' name='kid_ids' value='{GLOBAL_CHORE_KID_ID}' data-global-checkbox> "
             "Free-for-all (global)"
             "</label>"
-        )
+        ),
     ]
     for kid in kids:
         multi_assign_options.append(
@@ -8538,10 +8884,10 @@ def admin_home(
     multi_assign_box = (
         "<div class='chore-multi-assign' id='chore-create-assignees-container'>"
         "<div class='chore-multi-assign__label'>Multi-assign</div>"
-        f"<div class='chore-multi-assign__box' id='chore-create-assignees' data-global-option='{GLOBAL_CHORE_KID_ID}' style='display:grid; gap:6px; grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); padding:12px; border:1px solid #cbd5f5; border-radius:10px; background:#f8fafc;'>"
+        f"<div class='chore-multi-assign__box' id='chore-create-assignees' data-global-option='{GLOBAL_CHORE_KID_ID}' data-shared-option='{SHARED_CHORE_KID_ID}' style='display:grid; gap:6px; grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); padding:12px; border:1px solid #cbd5f5; border-radius:10px; background:#f8fafc;'>"
         + "".join(multi_assign_options)
         + "</div>"
-        + "<div class='muted' style='margin-top:6px;'>Check one or more kids to publish the chore. Include Free-for-all to create a shared task. When you also select kids, only those names can claim the shared chore.</div>"
+        + "<div class='muted' style='margin-top:6px;'>Check one or more kids to publish the chore. Choose Shared to post a single chore for the selected kids. Include Free-for-all to create a global challenge; when specific kids are selected only they can claim it.</div>"
         + "</div>"
     )
     chores_card = (
@@ -8555,7 +8901,7 @@ def admin_home(
         + "<div><label>Type</label><select name='type' id='chore-create-type' class='chore-type-select' data-schedule-root='chore-create-schedule'><option value='daily'>Daily</option><option value='weekly'>Weekly</option><option value='monthly'>Monthly</option><option value='special'>Special</option></select></div>"
         + "<div><label>Award (dollars)</label><input name='award' type='text' data-money value='0.50'></div>"
         + "<div><label>Penalty if missed</label><div style='display:flex; align-items:center; gap:6px; margin-top:4px;'><label style='display:flex; align-items:center; gap:4px; font-weight:400;'><input type='checkbox' name='penalty_enabled' value='1'> Apply</label><input name='penalty_amount' type='text' data-money value='0.00' placeholder='penalty $'></div></div>"
-        + f"<div class='chore-max-claimants' data-global-only style='display:none;'><label>Max claimants (global)</label><input name='max_claimants' type='number' min='1' value='1'></div>"
+        + f"<div class='chore-max-claimants' data-shared-only style='display:none;'><label>Max claimants</label><input name='max_claimants' type='number' min='1' value='1'></div>"
         + "</div>"
         + "<div class='grid' style='grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:8px;'>"
         + "<div><label>Start Date (optional)</label><input name='start_date' type='date'></div>"
@@ -8570,10 +8916,10 @@ def admin_home(
         + "</div>"
         + "<label>Notes</label><input name='notes' placeholder='Any details'>"
         + "<label style='display:flex; align-items:center; gap:6px; margin-top:6px;'><input type='checkbox' name='block_marketplace' value='1'> Prevent job board listing</label>"
-        + "<p class='muted'>Global chores appear for all kids under “Free-for-all”. Use max claimants to set how many kids can share the reward per period.</p>"
+        + "<p class='muted'>Shared chores appear in each selected kid's list. Use max claimants to cap how many teammates can earn credit per period.</p>"
         + "<button type='submit'>Add Chore</button>"
         + "</form>"
-        + "<script>(function(){function applySchedule(select){var rootId=select.getAttribute('data-schedule-root');if(!rootId){return;}var root=document.getElementById(rootId);if(!root){return;}var value=(select.value||'').toLowerCase();root.querySelectorAll('[data-schedule-group]').forEach(function(el){var group=el.getAttribute('data-schedule-group');var show=false;if(group==='weekly'){show=value==='weekly';}else if(group==='monthly'){show=value==='monthly';}else if(group==='special'){show=value==='special';}el.style.display=show?'':'none';});}function toggleGlobal(){var assignRoot=document.getElementById('chore-create-assignees');if(!assignRoot){return;}var globalValue=assignRoot.getAttribute('data-global-option');var hasGlobal=false;assignRoot.querySelectorAll(\"input[name='kid_ids']\").forEach(function(box){if(box.value===globalValue&&box.checked){hasGlobal=true;}});document.querySelectorAll('[data-global-only]').forEach(function(el){el.style.display=hasGlobal?'':'none';});assignRoot.style.borderColor=hasGlobal?'#f59e0b':'#cbd5f5';assignRoot.style.boxShadow=hasGlobal?'0 0 0 2px rgba(245,158,11,0.2)':'none';var container=document.getElementById('chore-create-assignees-container');if(container){container.classList.toggle('has-global',hasGlobal);}}var selects=document.querySelectorAll('.chore-type-select');selects.forEach(function(select){var handler=function(){applySchedule(select);};select.addEventListener('change',handler);handler();});var assignRoot=document.getElementById('chore-create-assignees');if(assignRoot){assignRoot.querySelectorAll(\"input[name='kid_ids']\").forEach(function(box){box.addEventListener('change',toggleGlobal);});toggleGlobal();}})();</script>"
+        + "<script>(function(){function applySchedule(select){var rootId=select.getAttribute('data-schedule-root');if(!rootId){return;}var root=document.getElementById(rootId);if(!root){return;}var value=(select.value||'').toLowerCase();root.querySelectorAll('[data-schedule-group]').forEach(function(el){var group=el.getAttribute('data-schedule-group');var show=false;if(group==='weekly'){show=value==='weekly';}else if(group==='monthly'){show=value==='monthly';}else if(group==='special'){show=value==='special';}el.style.display=show?'':'none';});}function toggleShared(){var assignRoot=document.getElementById('chore-create-assignees');if(!assignRoot){return;}var globalValue=assignRoot.getAttribute('data-global-option');var sharedValue=assignRoot.getAttribute('data-shared-option');var highlight=false;assignRoot.querySelectorAll(\"input[name='kid_ids']\").forEach(function(box){if((box.value===globalValue||box.value===sharedValue)&&box.checked){highlight=true;}});document.querySelectorAll('[data-shared-only]').forEach(function(el){el.style.display=highlight?'':'none';});assignRoot.style.borderColor=highlight?'#f59e0b':'#cbd5f5';assignRoot.style.boxShadow=highlight?'0 0 0 2px rgba(245,158,11,0.2)':'none';var container=document.getElementById('chore-create-assignees-container');if(container){container.classList.toggle('has-global',highlight);}}var selects=document.querySelectorAll('.chore-type-select');selects.forEach(function(select){var handler=function(){applySchedule(select);};select.addEventListener('change',handler);handler();});var assignRoot=document.getElementById('chore-create-assignees');if(assignRoot){assignRoot.querySelectorAll(\"input[name='kid_ids']\").forEach(function(box){box.addEventListener('change',toggleShared);});toggleShared();}})();</script>"
         + "</div>"
     )
     admin_pref_controls = preference_controls_html(request)
@@ -8759,11 +9105,48 @@ def admin_manage_chores(request: Request, kid_id: str = Query(...)):
             child = session.exec(select(Child).where(Child.kid_id == kid_id)).first()
             if not child:
                 return render_page(request, "Chores", "<div class='card'>Kid not found.</div>")
-            chores = session.exec(
-                select(Chore)
-                .where(Chore.kid_id == kid_id)
-                .order_by(desc(Chore.created_at))
+            shared_links = session.exec(
+                select(SharedChoreMember).where(SharedChoreMember.kid_id == kid_id)
             ).all()
+            shared_ids = [link.chore_id for link in shared_links]
+            if shared_ids:
+                chore_query = (
+                    select(Chore)
+                    .where(
+                        or_(
+                            Chore.kid_id == kid_id,
+                            and_(Chore.kid_id == SHARED_CHORE_KID_ID, Chore.id.in_(shared_ids)),
+                        )
+                    )
+                    .order_by(desc(Chore.created_at))
+                )
+            else:
+                chore_query = (
+                    select(Chore)
+                    .where(Chore.kid_id == kid_id)
+                    .order_by(desc(Chore.created_at))
+                )
+            chores = session.exec(chore_query).all()
+    shared_member_map: Dict[int, List[str]] = {}
+    if not is_global:
+        shared_ids = [ch.id for ch in chores if ch.kid_id == SHARED_CHORE_KID_ID and ch.id]
+        if shared_ids:
+            member_rows = session.exec(
+                select(SharedChoreMember).where(SharedChoreMember.chore_id.in_(shared_ids))
+            ).all()
+            member_lookup: Dict[int, List[str]] = {}
+            for row in member_rows:
+                member_lookup.setdefault(row.chore_id, []).append(row.kid_id)
+            kid_ids_needed = sorted({kid for kids in member_lookup.values() for kid in kids})
+            kid_lookup = {
+                child.kid_id: child
+                for child in session.exec(select(Child).where(Child.kid_id.in_(kid_ids_needed))).all()
+            }
+            for chore_id, member_ids in member_lookup.items():
+                shared_member_map[chore_id] = [
+                    kid_lookup.get(pid).name if kid_lookup.get(pid) else pid
+                    for pid in member_ids
+                ]
     rows_parts: List[str] = []
     for chore in chores:
         form_id = f"chore-form-{chore.id}"
@@ -8779,6 +9162,7 @@ def admin_manage_chores(request: Request, kid_id: str = Query(...)):
         name_value = html_escape(chore.name)
         notes_value = html_escape(chore.notes or "")
         is_global_chore = chore.kid_id == GLOBAL_CHORE_KID_ID
+        is_shared_chore = chore.kid_id == SHARED_CHORE_KID_ID
         chore_type = normalize_chore_type(chore.type, is_global=is_global_chore)
         weekly_style = "" if chore_type == "weekly" else "display:none;"
         monthly_style = "" if chore_type == "monthly" else "display:none;"
@@ -8807,7 +9191,15 @@ def admin_manage_chores(request: Request, kid_id: str = Query(...)):
         penalty_checked = " checked" if penalty_cents > 0 else ""
         penalty_value = dollars_value(penalty_cents)
         marketplace_checked = " checked" if getattr(chore, "marketplace_blocked", False) else ""
-        max_spots_style = "" if is_global_chore else "display:none;"
+        max_spots_style = "" if (is_global_chore or is_shared_chore) else "display:none;"
+        shared_info_html = ""
+        if is_shared_chore:
+            member_names = shared_member_map.get(chore.id or 0, [])
+            names_text = ", ".join(html_escape(name) for name in member_names) if member_names else "—"
+            shared_info_html = (
+                "<div class='chore-card__field'><label>Shared with</label>"
+                f"<div>{names_text}</div></div>"
+            )
         action_items = [f"<button type='submit' form='{form_id}'>Save</button>"]
         if not is_global_chore:
             action_items.append(
@@ -8852,7 +9244,8 @@ def admin_manage_chores(request: Request, kid_id: str = Query(...)):
             "<div class='chore-card__field'><label>Penalty ($)</label>"
             f"<div style='display:flex; align-items:center; gap:8px; flex-wrap:wrap;'><label style='display:flex; align-items:center; gap:4px; font-weight:400;'><input type='checkbox' name='penalty_enabled' value='1'{penalty_checked} form='{form_id}'> Apply</label><input name='penalty_amount' type='text' data-money value='{penalty_value}' form='{form_id}' class='chore-field--compact'></div>"
             "</div>"
-            f"<div class='chore-card__field' data-global-only style='{max_spots_style}'><label>Max spots</label><input name='max_claimants' type='number' min='1' value='{max(1, chore.max_claimants)}' form='{form_id}'></div>"
+            f"<div class='chore-card__field' data-shared-only style='{max_spots_style}'><label>Max spots</label><input name='max_claimants' type='number' min='1' value='{max(1, chore.max_claimants)}' form='{form_id}'></div>"
+            f"{shared_info_html}"
             f"<div class='chore-card__field'><label>Job Board</label><div style='display:flex; align-items:center; gap:8px; font-weight:400;'><input type='checkbox' name='block_marketplace' value='1'{marketplace_checked} form='{form_id}' id='marketplace-{chore.id}'><label for='marketplace-{chore.id}' style='margin:0;'>Block listing</label></div></div>"
             f"<div class='chore-card__field chore-card__field--wide'><label>Schedule</label>{schedule_html}</div>"
             f"<div class='chore-card__field chore-card__field--wide'><label>Notes</label><textarea name='notes' form='{form_id}' rows='2'>{notes_value}</textarea></div>"
@@ -9039,13 +9432,29 @@ def admin_chore_create(
         set_admin_notice(request, "Select at least one kid for the chore.", "error")
         return RedirectResponse("/admin?section=chores", status_code=302)
     global_selected = False
+    shared_selected = False
     personal_targets: List[str] = []
     for kid_value in unique_ids:
         if kid_value == GLOBAL_CHORE_KID_ID:
             global_selected = True
+        elif kid_value == SHARED_CHORE_KID_ID:
+            shared_selected = True
         else:
             personal_targets.append(kid_value)
-    creation_targets = [GLOBAL_CHORE_KID_ID] if global_selected else personal_targets
+    if shared_selected and not personal_targets:
+        set_admin_notice(
+            request,
+            "Choose at least one kid to share the chore with.",
+            "error",
+        )
+        return RedirectResponse("/admin?section=chores", status_code=302)
+    creation_targets: List[str] = []
+    if global_selected:
+        creation_targets.append(GLOBAL_CHORE_KID_ID)
+    if shared_selected:
+        creation_targets.append(SHARED_CHORE_KID_ID)
+    if personal_targets and not shared_selected:
+        creation_targets.extend(personal_targets)
     if not creation_targets:
         set_admin_notice(request, "Select at least one kid for the chore.", "error")
         return RedirectResponse("/admin?section=chores", status_code=302)
@@ -9065,13 +9474,15 @@ def admin_chore_create(
             ).first()
             if target_child:
                 child_lookup[kid_value] = target_child
+        shared_member_ids = personal_targets if shared_selected else []
         for kid_value in creation_targets:
             is_global = kid_value == GLOBAL_CHORE_KID_ID
+            is_shared = kid_value == SHARED_CHORE_KID_ID
             normalized_type = normalize_chore_type(type, is_global=is_global)
             weekday_value = weekday_csv if normalized_type == "weekly" else None
             dates_value = dates_csv if normalized_type == "special" else None
             month_days_value = month_days_csv if normalized_type == "monthly" else None
-            max_claims = max_claims_value if is_global else 1
+            max_claims = max_claims_value if (is_global or is_shared) else 1
             if is_global:
                 if global_selected and personal_targets:
                     audience_names = [
@@ -9085,6 +9496,19 @@ def admin_chore_create(
                     kid_label = f"Free-for-all ({display})"
                 else:
                     kid_label = "Free-for-all"
+            elif is_shared:
+                member_names = [
+                    child_lookup.get(pid).name if child_lookup.get(pid) else pid
+                    for pid in shared_member_ids
+                ]
+                if member_names:
+                    if len(member_names) > 3:
+                        display = ", ".join(member_names[:3]) + f" +{len(member_names) - 3} more"
+                    else:
+                        display = ", ".join(member_names)
+                    kid_label = f"Shared ({display})"
+                else:
+                    kid_label = "Shared"
             else:
                 kid_label = kid_value or "Unknown"
                 target_child = child_lookup.get(kid_value)
@@ -9110,6 +9534,9 @@ def admin_chore_create(
             if is_global and global_selected and personal_targets:
                 for kid in personal_targets:
                     session.add(GlobalChoreAudience(chore_id=chore.id, kid_id=kid))
+            if is_shared and shared_member_ids:
+                for member_id in shared_member_ids:
+                    session.add(SharedChoreMember(chore_id=chore.id, kid_id=member_id))
             kid_labels.append(kid_label)
         session.commit()
     if kid_labels:
@@ -9189,7 +9616,11 @@ def admin_chore_update(
         chore.notes = notes.strip() or None
         chore.start_date = date.fromisoformat(start_date) if start_date else None
         chore.end_date = date.fromisoformat(end_date) if end_date else None
-        chore.max_claimants = max_claims_value if chore.kid_id == GLOBAL_CHORE_KID_ID else 1
+        chore.max_claimants = (
+            max_claims_value
+            if chore.kid_id in {GLOBAL_CHORE_KID_ID, SHARED_CHORE_KID_ID}
+            else 1
+        )
         chore.weekdays = weekday_csv
         chore.specific_dates = dates_csv
         chore.specific_month_days = month_days_csv
@@ -10542,7 +10973,13 @@ def admin_chore_payout(
         if not chore:
             set_admin_notice(request, "Chore information was missing.", "error")
             return RedirectResponse(redirect_target, status_code=302)
-        child = session.exec(select(Child).where(Child.kid_id == chore.kid_id)).first()
+        payout_kid_id = chore.kid_id
+        if chore.kid_id == SHARED_CHORE_KID_ID:
+            if not instance.completing_kid_id:
+                set_admin_notice(request, "Shared chore submission was missing the kid who completed it.", "error")
+                return RedirectResponse(redirect_target, status_code=302)
+            payout_kid_id = instance.completing_kid_id
+        child = session.exec(select(Child).where(Child.kid_id == payout_kid_id)).first()
         if not child:
             set_admin_notice(request, "Kid account could not be found.", "error")
             return RedirectResponse(redirect_target, status_code=302)
