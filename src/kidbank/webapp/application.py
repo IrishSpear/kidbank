@@ -889,17 +889,19 @@ def base_styles() -> str:
       .status-dot{display:inline-block; width:14px; height:14px; border-radius:999px;}
       .status-dot--active{background:#16a34a; box-shadow:0 0 0 2px rgba(22,163,74,0.3);}
       .status-dot--inactive{background:#dc2626; box-shadow:0 0 0 2px rgba(220,38,38,0.3);}
+      .card.card--transfer{background:#ffffff; color:#0f172a;}
+      .card.card--transfer .muted{color:#334155;}
       .transfer-alerts{display:flex; flex-direction:column; gap:12px; margin-top:12px;}
-      .transfer-alert{display:flex; gap:16px; align-items:stretch; justify-content:space-between; padding:16px; border-radius:16px; background:#fff; border:1px solid rgba(15,23,42,0.08); box-shadow:0 24px 45px -24px rgba(15,23,42,0.25); flex-wrap:wrap; color:#000;}
-      .transfer-alert__badge{min-width:140px; background:linear-gradient(135deg, rgba(226,232,240,0.75), rgba(226,232,240,0.35)); border-radius:12px; padding:14px 16px; display:flex; flex-direction:column; justify-content:center; text-align:center; box-shadow:inset 0 0 0 1px rgba(148,163,184,0.35); color:#000;}
-      .transfer-alert__amount{font-size:26px; font-weight:700; color:#000; letter-spacing:0.01em;}
-      .transfer-alert__label{font-size:12px; text-transform:uppercase; letter-spacing:0.18em; color:#000; margin-top:6px;}
-      .transfer-alert__info{flex:1; min-width:220px; display:flex; flex-direction:column; gap:8px; color:#000;}
-      .transfer-alert__headline{font-size:18px; font-weight:650; letter-spacing:0.01em; color:#000;}
-      .transfer-alert__sender{color:#000; font-weight:700;}
-      .transfer-alert__note{font-size:14px; background:rgba(226,232,240,0.6); border-radius:10px; padding:10px 12px; color:#000;}
-      .transfer-alert__note-label{font-weight:600; color:#000; margin-right:6px; text-transform:uppercase; letter-spacing:0.12em; font-size:11px; display:inline-block;}
-      .transfer-alert__meta{font-size:13px; color:#000;}
+      .transfer-alert{display:flex; gap:16px; align-items:stretch; justify-content:space-between; padding:16px; border-radius:16px; background:#fff; border:1px solid rgba(15,23,42,0.08); box-shadow:0 24px 45px -24px rgba(15,23,42,0.25); flex-wrap:wrap; color:#0f172a;}
+      .transfer-alert__badge{min-width:140px; background:linear-gradient(135deg, rgba(226,232,240,0.75), rgba(226,232,240,0.35)); border-radius:12px; padding:14px 16px; display:flex; flex-direction:column; justify-content:center; text-align:center; box-shadow:inset 0 0 0 1px rgba(148,163,184,0.35); color:#0f172a;}
+      .transfer-alert__amount{font-size:26px; font-weight:700; color:#0f172a; letter-spacing:0.01em;}
+      .transfer-alert__label{font-size:12px; text-transform:uppercase; letter-spacing:0.18em; color:#0f172a; margin-top:6px;}
+      .transfer-alert__info{flex:1; min-width:220px; display:flex; flex-direction:column; gap:8px; color:#0f172a;}
+      .transfer-alert__headline{font-size:18px; font-weight:650; letter-spacing:0.01em; color:#0f172a;}
+      .transfer-alert__sender{color:#0f172a; font-weight:700;}
+      .transfer-alert__note{font-size:14px; background:rgba(226,232,240,0.6); border-radius:10px; padding:10px 12px; color:#0f172a;}
+      .transfer-alert__note-label{font-weight:600; color:#0f172a; margin-right:6px; text-transform:uppercase; letter-spacing:0.12em; font-size:11px; display:inline-block;}
+      .transfer-alert__meta{font-size:13px; color:#0f172a;}
       .transfer-alert__actions{display:flex; align-items:center; justify-content:flex-end; gap:10px; flex:0 0 auto;}
       .transfer-alert__dismiss{background:rgba(34,197,94,0.14); color:#22c55e; border:1px solid rgba(34,197,94,0.35); border-radius:999px; padding:10px 18px; font-weight:700; cursor:pointer; text-transform:uppercase; letter-spacing:0.12em; font-size:11px; transition:filter .15s ease, transform .15s ease;}
       .transfer-alert__dismiss:hover{filter:brightness(1.08); transform:translateY(-1px);}
@@ -4049,7 +4051,7 @@ def kid_home(
                     + "</div>"
                 )
             transfer_notice_card = (
-                "<div class='card'>"
+                "<div class='card card--transfer'>"
                 "<h3>Money received</h3>"
                 "<div class='muted'>Recent transfers from other kids.</div>"
                 + "<div class='transfer-alerts'>"
