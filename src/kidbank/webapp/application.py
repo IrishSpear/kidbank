@@ -8471,7 +8471,10 @@ def admin_home(
         f"<label style='margin-right:6px;'><input type='checkbox' name='weekdays' value='{day}'> {label}</label>"
         for day, label in WEEKDAY_OPTIONS
     )
-    multi_label_style = "display:flex; align-items:center; gap:6px; padding:6px 8px; border-radius:8px; border:1px solid #e2e8f0; background:#fff;"
+    multi_label_style = (
+        "display:flex; align-items:center; gap:6px; padding:6px 8px; border-radius:8px;"
+        " border:1px solid #e2e8f0; background:#fff; color:#0f172a;"
+    )
     multi_assign_options: List[str] = [
         (
             f"<label class='chore-multi-option chore-multi-option--global' style='{multi_label_style}'>"
