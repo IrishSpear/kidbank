@@ -7898,6 +7898,22 @@ def admin_home(
             else "background:#dcfce7; border-left:4px solid #86efac; color:#166534;"
         )
         notice_html = f"<div class='card' style='margin-bottom:12px; {style}'><div>{html_escape(notice_msg)}</div></div>"
+        if notice_kind == "success" and notice_msg.startswith("Paid "):
+            notice_html += (
+                "<script>(function(){try{"
+                "var C=window.AudioContext||window.webkitAudioContext;"
+                "if(C){var ctx=new C();var play=function(){var now=ctx.currentTime;"
+                "var gain=ctx.createGain();gain.gain.setValueAtTime(0.0001,now);"
+                "gain.connect(ctx.destination);var osc=ctx.createOscillator();"
+                "osc.type='triangle';osc.frequency.setValueAtTime(880,now);"
+                "osc.frequency.exponentialRampToValueAtTime(1320,now+0.18);"
+                "osc.connect(gain);gain.gain.exponentialRampToValueAtTime(0.35,now+0.02);"
+                "gain.gain.exponentialRampToValueAtTime(0.0001,now+0.35);"
+                "osc.start(now);osc.stop(now+0.36);};"
+                "if(ctx.state==='suspended'){ctx.resume().then(play).catch(function(){})}else{play();}}"
+                "if(navigator.vibrate){navigator.vibrate([18,60,24]);}"
+                "}catch(e){}})();</script>"
+            )
     penalty_chore_lookup: Dict[int, Chore] = {}
     with Session(engine) as session:
         kids = session.exec(select(Child).order_by(Child.name)).all()
