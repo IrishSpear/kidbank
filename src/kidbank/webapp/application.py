@@ -10327,9 +10327,6 @@ def admin_chore_payout(
         instance.status = "paid"
         instance.paid_event_id = event.id
         session.add(instance)
-        if is_one_time_special(chore):
-            chore.active = False
-            session.add(chore)
         session.commit()
         child_name = child.name
         chore_name = chore.name

@@ -973,8 +973,8 @@ def test_serialize_specific_month_days_filters_invalid_tokens() -> None:
     assert serialize_specific_month_days("   ") is None
 
 
-def test_one_time_special_chore_deactivates_after_payout() -> None:
-    client = TestClient(app)
+def test_one_time_special_chore_stays_visible_after_payout() -> None:
+    admin_client = TestClient(app)
     with Session(engine) as session:
         child = Child(kid_id="solo", name="Solo", balance_cents=0, kid_pin="0000")
         session.add(child)
@@ -1001,9 +1001,9 @@ def test_one_time_special_chore_deactivates_after_payout() -> None:
         instance_id = instance.id
         chore_id = chore.id
 
-    login = client.post("/admin/login", data={"pin": DAD_PIN}, follow_redirects=False)
+    login = admin_client.post("/admin/login", data={"pin": DAD_PIN}, follow_redirects=False)
     assert login.status_code == 302
-    payout = client.post(
+    payout = admin_client.post(
         "/admin/chore_payout",
         data={"instance_id": instance_id, "redirect": "/admin?section=payouts"},
         follow_redirects=False,
@@ -1014,7 +1014,17 @@ def test_one_time_special_chore_deactivates_after_payout() -> None:
     with Session(engine) as session:
         updated_chore = session.get(Chore, chore_id)
         assert updated_chore is not None
-        assert updated_chore.active is False
+        assert updated_chore.active is True
         refreshed_instance = session.get(ChoreInstance, instance_id)
         assert refreshed_instance is not None
         assert refreshed_instance.status == "paid"
+
+    kid_client = TestClient(app)
+    kid_login = kid_client.post(
+        "/kid/login", data={"kid_id": "solo", "kid_pin": "0000"}, follow_redirects=False
+    )
+    assert kid_login.status_code == 302
+    chores_page = kid_client.get("/kid?section=chores")
+    assert chores_page.status_code == 200
+    assert "Build volcano" in chores_page.text
+    assert "<span class='pill status-paid'>Completed</span>" in chores_page.text
