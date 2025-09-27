@@ -74,6 +74,45 @@ app.add_middleware(
 _time_provider: Callable[[], datetime] = datetime.now
 
 
+PORTFOLIO_STYLE_RULES = """
+.portfolio-modal__card{max-width:1120px;width:calc(100% - 24px);}
+.portfolio-modal__body{padding:12px 4px 20px;}
+.portfolio-summary-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin-bottom:16px;}
+.portfolio-summary-card{background:#f8fafc;border:1px solid #e2e8f0;border-radius:12px;padding:12px;}
+.portfolio-summary-card__label{font-size:13px;color:#475569;text-transform:uppercase;letter-spacing:0.04em;}
+.portfolio-summary-card__value{font-size:22px;font-weight:700;margin-top:4px;}
+.portfolio-summary-card__meta{font-size:13px;color:#64748b;margin-top:4px;}
+.portfolio-section{margin-top:18px;}
+.portfolio-section__header{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:10px;}
+.portfolio-table-wrap{overflow:auto;border-radius:12px;border:1px solid #e2e8f0;box-shadow:0 1px 2px rgba(15,23,42,0.08);}
+.portfolio-table{width:100%;border-collapse:separate;border-spacing:0;min-width:720px;background:#fff;}
+.portfolio-table thead th{position:sticky;top:0;background:#0f172a;color:#f8fafc;text-transform:uppercase;font-size:12px;letter-spacing:0.05em;padding:10px 12px;text-align:left;z-index:1;}
+.portfolio-table tbody td{padding:10px 12px;border-top:1px solid #e2e8f0;font-size:14px;vertical-align:middle;}
+.portfolio-table tbody tr:first-child td{border-top:none;}
+.portfolio-table tbody tr:hover td{background:#f1f5f9;}
+.portfolio-row--gain td{background:rgba(22,163,74,0.08);}
+.portfolio-row--loss td{background:rgba(220,38,38,0.08);}
+.portfolio-row--even td{background:rgba(15,23,42,0.04);}
+.portfolio-table tbody tr:hover.portfolio-row--gain td{background:rgba(22,163,74,0.15);}
+.portfolio-table tbody tr:hover.portfolio-row--loss td{background:rgba(220,38,38,0.15);}
+.portfolio-symbol{font-weight:700;font-size:15px;color:#0f172a;}
+.portfolio-company{color:#475569;font-size:13px;}
+.portfolio-actions{display:flex;flex-direction:column;gap:6px;}
+.portfolio-actions form{display:flex;flex-wrap:wrap;gap:6px;align-items:center;}
+.portfolio-actions input[data-money]{width:110px;}
+.portfolio-list{list-style:none;padding:0;margin:10px 0 0 0;display:flex;flex-direction:column;gap:10px;}
+.portfolio-item{border:1px solid #e2e8f0;border-radius:12px;padding:12px;background:#fff;box-shadow:0 1px 2px rgba(15,23,42,0.08);}
+.portfolio-item__meta{display:flex;flex-wrap:wrap;gap:8px;font-size:13px;color:#475569;margin-top:6px;}
+.portfolio-item__actions{display:flex;flex-wrap:wrap;gap:10px;margin-top:10px;}
+.portfolio-item__actions form{display:flex;flex-wrap:wrap;gap:6px;align-items:center;}
+.portfolio-item__actions input[data-money]{width:110px;}
+.portfolio-modal .pill{background:#0f172a;color:#fff;}
+.portfolio-cd-open select{min-width:150px;}
+.portfolio-page{display:flex;justify-content:center;padding:0 12px 24px;}
+.portfolio-page__card{max-width:1120px;width:100%;}
+"""
+
+
 def now_local() -> datetime:
     """Return naive local time using the configured provider."""
 
@@ -363,6 +402,15 @@ def usd(cents: int) -> str:
         return f"${(cents or 0) / 100:.2f}"
     except Exception:  # pragma: no cover - defensive fallback
         return "$0.00"
+
+
+def _format_multiline_note(note: str) -> str:
+    """Render multiline chore notes for HTML display."""
+
+    # Preserve intentional line breaks by splitting on newline characters,
+    # escaping each segment individually, then joining with ``<br>`` tags.
+    parts = [html_escape(segment) for segment in note.splitlines()]
+    return "<br>".join(parts)
 
 
 def dollars_value(cents: int) -> str:
@@ -3055,6 +3103,17 @@ def compute_holdings_metrics(kid_id: str, symbol: str) -> dict:
     }
 
 
+def price_history_growth_percent(history: Sequence[Mapping[str, Any]]) -> Optional[float]:
+    prices = [point.get("p") for point in history if isinstance(point.get("p"), int)]
+    if len(prices) < 2:
+        return None
+    start, end = prices[0], prices[-1]
+    if start == 0:
+        return None
+    change = (end - start) / start * 100
+    return float(change)
+
+
 def sparkline_svg_from_history(hist: Iterable[dict], width: int = 320, height: int = 64, pad: int = 6) -> str:
     prices = [point.get("p") for point in hist if isinstance(point.get("p"), int)]
     svg_attrs = (
@@ -3676,7 +3735,7 @@ def kid_home(
                 else ""
             )
             note_line = (
-                f"<div class='muted chore-item__notes'>{html_escape(chore.notes or '')}</div>"
+                f"<div class='muted chore-item__notes'>{_format_multiline_note(chore.notes)}</div>"
                 if chore.notes
                 else ""
             )
@@ -3803,7 +3862,7 @@ def kid_home(
             spots_left = max(0, chore.max_claimants - total_claims)
             name_html = html_escape(chore.name)
             notes_line = (
-                f"<div class='muted' style='margin-top:4px;'>{html_escape(chore.notes or '')}</div>"
+                f"<div class='muted' style='margin-top:4px;'>{_format_multiline_note(chore.notes)}</div>"
                 if chore.notes
                 else ""
             )
@@ -6266,6 +6325,7 @@ def _kid_invest_dashboard_inner(
     chart_mode = normalize_chart_view(chart_view)
     metrics = compute_holdings_metrics(kid_id, selected_symbol)
     history = fetch_price_history_range(selected_symbol, selected_range)
+    growth_pct = price_history_growth_percent(history)
     if chart_mode == CHART_VIEW_DETAIL:
         svg = detailed_history_chart_svg(history, width=640, height=260)
         enlarged_svg = detailed_history_chart_svg(history, width=1024, height=420)
@@ -6531,15 +6591,56 @@ def _kid_invest_dashboard_inner(
         </div>
     """
 
-    back_link_html = ""
+    if growth_pct is not None:
+        growth_color = "16a34a" if growth_pct >= 0 else "dc2626"
+        growth_line_html = (
+            "<div style='margin-top:6px;'>Window growth: "
+            + f"<span style='color:#{growth_color}; font-weight:600;'>{growth_pct:+.2f}%</span>"
+            + "</div>"
+        )
+    else:
+        growth_line_html = "<div class='muted' style='margin-top:6px;'>Window growth: —</div>"
+
+    portfolio_modal_html = _build_portfolio_modal_html(
+        kid_id,
+        instruments,
+        certificates,
+        link_builder=link_url,
+        selected_range=selected_range,
+        chart_mode=chart_mode,
+        active_symbol=instrument_symbol_raw,
+        cd_rates_bps=cd_rates_bps,
+        penalty_days_by_term=penalty_days_by_term,
+    )
+
+    nav_links: List[str] = []
     if include_back_link:
-        back_link_html = "<div style='margin-bottom:10px;'><a href='/kid' class='button-link secondary'>← Back to My Account</a></div>"
+        nav_links.append("<a href='/kid' class='button-link secondary'>← Back to My Account</a>")
+    if not embed:
+        nav_links.append("<a href='#portfolio-modal'><button type='button'>View Portfolio</button></a>")
+        portfolio_page_url = _invest_build_url(
+            "/kid/invest/portfolio",
+            {},
+            symbol=instrument_symbol_raw,
+            range=selected_range,
+            chart=chart_mode,
+        )
+        nav_links.append(
+            f"<a href='{portfolio_page_url}'><button type='button'>Open Portfolio Page</button></a>"
+        )
+    nav_links_html = ""
+    if nav_links:
+        nav_links_html = (
+            "<div style='margin-bottom:10px; display:flex; flex-wrap:wrap; gap:8px;'>"
+            + "".join(nav_links)
+            + "</div>"
+        )
     footer_back_html = ""
     if not embed:
         footer_back_html = "<p class='muted' style='margin-top:10px;'><a href='/kid'>← Back to My Account</a></p>"
 
     inner = f"""
-        {notice_html}{back_link_html}{search_card_html}
+        {notice_html}{nav_links_html}{search_card_html}
         {tabs_html}
         <div class='card'>
           <h3>Investing — {instrument_label}</h3>
@@ -6553,6 +6654,7 @@ def _kid_invest_dashboard_inner(
               {chart_display_html}
               {chart_hint_html}
               {range_selector_html}
+              {growth_line_html}
               {chart_toggle_html}
             </div>
             <div class='card'>
@@ -6608,6 +6710,7 @@ def _kid_invest_dashboard_inner(
         </div>
         {footer_back_html}
         {chart_modal_html}
+        {portfolio_modal_html}
     """
     return inner, active_instrument.name or instrument_symbol_raw
 
@@ -6639,7 +6742,13 @@ def kid_invest_home(
             notice_message=notice_msg,
             notice_kind=notice_kind,
         )
-        invest_styles = "<style>body[data-page='kid-invest']{overflow:hidden;}</style>"
+        invest_styles = f"""
+        <style>
+        body[data-page='kid-invest']{{overflow:hidden;}}
+        body[data-page='kid-invest'] .portfolio-modal__body{{max-height:70vh;overflow:auto;}}
+        {PORTFOLIO_STYLE_RULES}
+        </style>
+        """
         body_attrs = f"{body_pref_attrs(request)} data-page='kid-invest'"
         page_title = html_escape(title_label)
         html = frame(
@@ -6658,6 +6767,423 @@ def kid_invest_home(
         </div>
         """
         return render_page(request, "Investing — Error", body)
+
+
+def _instrument_portfolio_category(instrument: MarketInstrument) -> str:
+    if instrument.kind == INSTRUMENT_KIND_CRYPTO:
+        return "Crypto"
+    name_lower = (instrument.name or "").lower()
+    symbol_upper = (instrument.symbol or "").upper()
+    if "fund" in name_lower or "etf" in name_lower or symbol_upper.endswith("ETF"):
+        return "Funds"
+    return "Stock"
+
+
+def _build_portfolio_content_html(
+    kid_id: str,
+    instruments: Sequence[MarketInstrument],
+    certificates: Sequence[Certificate],
+    *,
+    link_builder: Callable[..., str],
+    selected_range: str,
+    chart_mode: str,
+    active_symbol: str,
+    cd_rates_bps: Mapping[str, int],
+    penalty_days_by_term: Mapping[str, int],
+    return_anchor: str,
+) -> str:
+    categories = ["Stock", "Funds", "Crypto"]
+    holdings_by_category: Dict[str, List[Tuple[MarketInstrument, Dict[str, Any]]]] = {
+        key: [] for key in categories
+    }
+    totals_by_category: Dict[str, Dict[str, int]] = {
+        key: {"value": 0, "invested": 0, "unrealized": 0, "realized": 0} for key in categories
+    }
+
+    for instrument in instruments:
+        metrics = compute_holdings_metrics(kid_id, instrument.symbol)
+        category = _instrument_portfolio_category(instrument)
+        entries = holdings_by_category.setdefault(category, [])
+        totals = totals_by_category.setdefault(
+            category, {"value": 0, "invested": 0, "unrealized": 0, "realized": 0}
+        )
+        entries.append((instrument, metrics))
+        totals["value"] += metrics["market_value_c"]
+        totals["invested"] += metrics["invested_cost_c"]
+        totals["unrealized"] += metrics["unrealized_pl_c"]
+        totals["realized"] += metrics["realized_pl_c"]
+
+    for entry_list in holdings_by_category.values():
+        entry_list.sort(
+            key=lambda entry: (
+                _normalize_symbol(entry[0].symbol),
+                entry[0].name or "",
+            )
+        )
+
+    def fmt_signed(value: int) -> str:
+        if value > 0:
+            return f"+{usd(value)}"
+        if value < 0:
+            return usd(value)
+        return usd(0)
+
+    def fmt_pct(value: float) -> str:
+        prefix = "+" if value >= 0 else ""
+        return f"{prefix}{value:.2f}%"
+
+    def portfolio_return_hidden(target_symbol: str) -> str:
+        target_url = link_builder(
+            symbol=target_symbol,
+            range=selected_range,
+            chart=chart_mode,
+        )
+        if return_anchor:
+            target_url += return_anchor
+        return f"<input type='hidden' name='return_to' value='{html_escape(target_url)}'>"
+
+    insight_cards: List[str] = []
+    for key, label in (("Stock", "Stocks"), ("Funds", "Funds"), ("Crypto", "Crypto")):
+        totals = totals_by_category.get(key) or {"value": 0, "invested": 0, "unrealized": 0, "realized": 0}
+        change_c = totals["unrealized"] + totals["realized"]
+        insight_cards.append(
+            "<div class='portfolio-summary-card'>"
+            + f"<div class='portfolio-summary-card__label'>{label}</div>"
+            + f"<div class='portfolio-summary-card__value'>{usd(totals['value'])}</div>"
+            + f"<div class='portfolio-summary-card__meta'>Invested {usd(totals['invested'])} • Change {fmt_signed(change_c)}</div>"
+            + "</div>"
+        )
+
+    moment = _time_provider()
+    cd_totals = {"value": 0, "principal": 0, "count": 0, "ready": 0}
+    cd_items: List[str] = []
+    for certificate in certificates:
+        value_c = certificate_value_cents(certificate, at=moment)
+        maturity = certificate_maturity_date(certificate)
+        cd_totals["value"] += value_c
+        cd_totals["principal"] += certificate.principal_cents
+        cd_totals["count"] += 1
+        if certificate.matured_at:
+            status = f"Cashed out on {certificate.matured_at:%Y-%m-%d}"
+            button_label = "Remove"
+            button_class_attr = ""
+        elif moment >= maturity:
+            status = "Matured — ready to cash out"
+            cd_totals["ready"] += 1
+            button_label = "Cash out"
+            button_class_attr = ""
+        else:
+            days_left = max(0, (maturity.date() - moment.date()).days)
+            status = f"Matures {maturity:%Y-%m-%d} ({days_left} days left)"
+            button_label = "Cash out"
+            button_class_attr = " class='danger'"
+        cd_items.append(
+            "<li class='portfolio-item'>"
+            + f"<div><b>{usd(certificate.principal_cents)}</b> principal • {certificate.rate_bps / 100:.2f}% APR</div>"
+            + "<div class='portfolio-item__meta'>"
+            + f"<span>Value {usd(value_c)}</span>"
+            + f"<span>Term {html_escape(certificate_term_label(certificate))}</span>"
+            + f"<span>{status}</span>"
+            + "</div>"
+            + "<div class='portfolio-item__actions'>"
+            + "<form method='post' action='/kid/invest/cd/cashout' class='inline'>"
+            + f"<input type='hidden' name='certificate_id' value='{certificate.id}'>"
+            + f"<input type='hidden' name='symbol' value='{html_escape(active_symbol)}'>"
+            + f"<input type='hidden' name='range' value='{html_escape(selected_range)}'>"
+            + f"<input type='hidden' name='chart' value='{html_escape(chart_mode)}'>"
+            + portfolio_return_hidden(active_symbol)
+            + f"<button type='submit'{button_class_attr}>{button_label}</button>"
+            + "</form>"
+            + "</div>"
+            + "</li>"
+        )
+
+    cd_change = cd_totals["value"] - cd_totals["principal"]
+    cd_meta_parts = [f"Principal {usd(cd_totals['principal'])}"]
+    if cd_totals["ready"]:
+        ready = cd_totals["ready"]
+        cd_meta_parts.append(f"{ready} ready to cash out")
+    insight_cards.append(
+        "<div class='portfolio-summary-card'>"
+        + "<div class='portfolio-summary-card__label'>CDs</div>"
+        + f"<div class='portfolio-summary-card__value'>{usd(cd_totals['value'])}</div>"
+        + f"<div class='portfolio-summary-card__meta'>{' • '.join(cd_meta_parts)} • Change {fmt_signed(cd_change)}</div>"
+        + "</div>"
+    )
+
+    category_sections: List[str] = []
+    for key, label in (("Stock", "Stocks"), ("Funds", "Funds"), ("Crypto", "Crypto")):
+        entries = holdings_by_category.get(key, [])
+        totals = totals_by_category.get(key) or {"value": 0, "invested": 0}
+        header = (
+            "<div class='portfolio-section__header'>"
+            + f"<h4>{label}</h4>"
+            + f"<div class='muted'>Positions {len(entries)} • Value {usd(totals['value'])}</div>"
+            + "</div>"
+        )
+        if entries:
+            rows: List[str] = []
+            for idx, (instrument, metrics) in enumerate(entries):
+                invested_c = metrics["invested_cost_c"]
+                total_return_c = metrics["unrealized_pl_c"] + metrics["realized_pl_c"]
+                return_pct_text = "—"
+                if invested_c:
+                    return_pct_text = fmt_pct(total_return_c / invested_c * 100)
+                buy_form = (
+                    "<form method='post' action='/kid/invest/buy' class='inline portfolio-actions__form'>"
+                    + f"<input type='hidden' name='symbol' value='{html_escape(instrument.symbol)}'>"
+                    + f"<input type='hidden' name='range' value='{html_escape(selected_range)}'>"
+                    + f"<input type='hidden' name='chart' value='{html_escape(chart_mode)}'>"
+                    + portfolio_return_hidden(instrument.symbol)
+                    + "<input name='amount' type='text' data-money placeholder='amount $' required>"
+                    + "<button type='submit'>Buy</button>"
+                    + "</form>"
+                )
+                sell_form = (
+                    "<form method='post' action='/kid/invest/sell' class='inline portfolio-actions__form'>"
+                    + f"<input type='hidden' name='symbol' value='{html_escape(instrument.symbol)}'>"
+                    + f"<input type='hidden' name='range' value='{html_escape(selected_range)}'>"
+                    + f"<input type='hidden' name='chart' value='{html_escape(chart_mode)}'>"
+                    + portfolio_return_hidden(instrument.symbol)
+                    + "<input name='amount' type='text' data-money placeholder='amount $' required>"
+                    + "<button type='submit' class='danger'>Sell</button>"
+                    + "</form>"
+                )
+                row_classes: List[str] = []
+                if total_return_c > 0:
+                    row_classes.append("portfolio-row--gain")
+                elif total_return_c < 0:
+                    row_classes.append("portfolio-row--loss")
+                else:
+                    row_classes.append("portfolio-row--even")
+                class_attr = f" class='{' '.join(row_classes)}'" if row_classes else ""
+                rows.append(
+                    f"<tr{class_attr}>"
+                    + "<td>"
+                    + f"<div class='portfolio-symbol'>{html_escape(instrument.symbol)}</div>"
+                    + f"<div class='portfolio-company'>{html_escape(instrument.name or instrument.symbol)}</div>"
+                    + "</td>"
+                    + f"<td>{usd(metrics['price_c'])}</td>"
+                    + f"<td>{usd(metrics['avg_cost_c'])}</td>"
+                    + f"<td>{metrics['shares']:.4f}</td>"
+                    + f"<td>{usd(metrics['market_value_c'])}</td>"
+                    + f"<td>{usd(invested_c)}</td>"
+                    + f"<td>{fmt_signed(total_return_c)}</td>"
+                    + f"<td>{return_pct_text}</td>"
+                    + "<td><div class='portfolio-actions'>"
+                    + buy_form
+                    + sell_form
+                    + "</div></td>"
+                    + "</tr>"
+                )
+            table_head = (
+                "<thead><tr><th>Ticker</th><th>Price</th><th>Avg Cost</th><th>Shares</th><th>Value</th><th>Invested</th><th>P/L</th><th>Return %</th><th>Actions</th></tr></thead>"
+            )
+            items_html = (
+                "<div class='portfolio-table-wrap'>"
+                + f"<table class='portfolio-table'>{table_head}<tbody>{''.join(rows)}</tbody></table>"
+                + "</div>"
+            )
+        else:
+            items_html = "<p class='muted'>No holdings yet in this category.</p>"
+        category_sections.append(
+            "<section class='portfolio-section'>" + header + items_html + "</section>"
+        )
+
+    cd_rates_pct = {code: rate / 100 for code, rate in cd_rates_bps.items()}
+    term_options = "".join(
+        f"<option value='{code}'{' selected' if code == DEFAULT_CD_TERM_CODE else ''}>{label} — {cd_rates_pct.get(code, DEFAULT_CD_RATE_BPS / 100):.2f}% APR</option>"
+        for code, label, _ in CD_TERM_OPTIONS
+    )
+
+    penalty_active = any(days > 0 for days in penalty_days_by_term.values())
+    if penalty_active:
+        penalty_parts = []
+        for code, label, _ in CD_TERM_OPTIONS:
+            days = penalty_days_by_term.get(code, 0)
+            penalty_parts.append(f"{label}: {days} day{'s' if days != 1 else ''}")
+        penalty_line = "Early withdrawal penalty: " + ", ".join(penalty_parts)
+    else:
+        penalty_line = "No penalty for early withdrawals right now."
+
+    cd_section = (
+        "<section class='portfolio-section'>"
+        + "<div class='portfolio-section__header'>"
+        + "<h4>Certificates of Deposit</h4>"
+        + f"<div class='muted'>Active {cd_totals['count']} • Value {usd(cd_totals['value'])}</div>"
+        + "</div>"
+        + "<div class='portfolio-item'>"
+        + "<div><b>Open a certificate</b></div>"
+        + "<form method='post' action='/kid/invest/cd/open' class='inline portfolio-cd-open'>"
+        + f"<input type='hidden' name='symbol' value='{html_escape(active_symbol)}'>"
+        + f"<input type='hidden' name='range' value='{html_escape(selected_range)}'>"
+        + f"<input type='hidden' name='chart' value='{html_escape(chart_mode)}'>"
+        + portfolio_return_hidden(active_symbol)
+        + "<input name='amount' type='text' data-money placeholder='amount $' required>"
+        + "<select name='term_choice'>"
+        + term_options
+        + "</select>"
+        + "<button type='submit'>Open</button>"
+        + "</form>"
+        + f"<div class='muted' style='margin-top:6px;'>{html_escape(penalty_line)}</div>"
+        + "</div>"
+        + (
+            "<ul class='portfolio-list'>" + "".join(cd_items) + "</ul>"
+            if cd_items
+            else "<p class='muted' style='margin-top:8px;'>No certificates yet.</p>"
+        )
+        + (
+            "<form method='post' action='/kid/invest/cd/mature' class='inline' style='margin-top:10px;'>"
+            + f"<input type='hidden' name='symbol' value='{html_escape(active_symbol)}'>"
+            + f"<input type='hidden' name='range' value='{html_escape(selected_range)}'>"
+            + f"<input type='hidden' name='chart' value='{html_escape(chart_mode)}'>"
+            + portfolio_return_hidden(active_symbol)
+            + "<button type='submit'>Cash out matured certificates</button>"
+            + "</form>"
+            if cd_totals["ready"]
+            else ""
+        )
+        + "</section>"
+    )
+
+    modal_body = (
+        "<div class='portfolio-summary-grid'>"
+        + "".join(insight_cards)
+        + "</div>"
+        + "".join(category_sections)
+        + cd_section
+    )
+
+    return modal_body
+
+
+def _build_portfolio_modal_html(
+    kid_id: str,
+    instruments: Sequence[MarketInstrument],
+    certificates: Sequence[Certificate],
+    *,
+    link_builder: Callable[..., str],
+    selected_range: str,
+    chart_mode: str,
+    active_symbol: str,
+    cd_rates_bps: Mapping[str, int],
+    penalty_days_by_term: Mapping[str, int],
+) -> str:
+    modal_body = _build_portfolio_content_html(
+        kid_id,
+        instruments,
+        certificates,
+        link_builder=link_builder,
+        selected_range=selected_range,
+        chart_mode=chart_mode,
+        active_symbol=active_symbol,
+        cd_rates_bps=cd_rates_bps,
+        penalty_days_by_term=penalty_days_by_term,
+        return_anchor="#portfolio-modal",
+    )
+    return (
+        "<div id='portfolio-modal' class='modal-overlay portfolio-modal'>"
+        "<div class='modal-card portfolio-modal__card'>"
+        "<div class='modal-head'><h3>Your portfolio</h3><a href='#' class='pill'>Close</a></div>"
+        + f"<div class='portfolio-modal__body'>{modal_body}</div>"
+        + "</div>"
+        + "</div>"
+    )
+
+
+@app.get("/kid/invest/portfolio", response_class=HTMLResponse)
+def kid_invest_portfolio_page(
+    request: Request,
+    symbol: Optional[str] = Query(None),
+    range_code: str = Query(DEFAULT_PRICE_RANGE, alias="range"),
+    chart_view: str = Query(DEFAULT_CHART_VIEW, alias="chart"),
+) -> HTMLResponse:
+    if (redirect := require_kid(request)) is not None:
+        return redirect
+    kid_id = kid_authed(request)
+    assert kid_id
+    notice_msg, notice_kind = pop_kid_notice(request)
+    instruments = list_market_instruments_for_kid(kid_id)
+    instrument_map = {_normalize_symbol(inst.symbol): inst for inst in instruments}
+    requested_symbol = _normalize_symbol(symbol) if symbol else ""
+    default_symbol = _normalize_symbol(DEFAULT_MARKET_SYMBOL)
+    active_instrument: Optional[MarketInstrument] = None
+    if requested_symbol and requested_symbol in instrument_map:
+        active_instrument = instrument_map[requested_symbol]
+    elif default_symbol in instrument_map:
+        active_instrument = instrument_map[default_symbol]
+    elif instrument_map:
+        active_instrument = next(iter(instrument_map.values()))
+    active_symbol = active_instrument.symbol if active_instrument else DEFAULT_MARKET_SYMBOL
+    selected_range = normalize_history_range(range_code)
+    chart_mode = normalize_chart_view(chart_view)
+    with Session(engine) as session:
+        child = session.exec(select(Child).where(Child.kid_id == kid_id)).first()
+        certificates = session.exec(
+            select(Certificate)
+            .where(Certificate.kid_id == kid_id)
+            .order_by(desc(Certificate.opened_at))
+        ).all()
+        cd_rates_bps = get_all_cd_rate_bps(session)
+        penalty_days_by_term = get_all_cd_penalty_days(session)
+    request_query = request.url.query
+    base_path = request.url.path
+    if request_query:
+        base_path = f"{base_path}?{request_query}"
+    base_url, base_query = _invest_base_config(base_path)
+    link_builder = lambda **params: _invest_build_url(
+        base_url, base_query, **params
+    )
+    portfolio_body = _build_portfolio_content_html(
+        kid_id,
+        instruments,
+        certificates,
+        link_builder=link_builder,
+        selected_range=selected_range,
+        chart_mode=chart_mode,
+        active_symbol=active_symbol,
+        cd_rates_bps=cd_rates_bps,
+        penalty_days_by_term=penalty_days_by_term,
+        return_anchor="",
+    )
+    notice_html = ""
+    if notice_msg:
+        notice_class = "error" if notice_kind == "error" else "success"
+        notice_html = f"<div class='notice {notice_class}'>{html_escape(notice_msg)}</div>"
+    raw_child_name = child.name if child else kid_id
+    child_name = html_escape(raw_child_name)
+    if raw_child_name and raw_child_name[-1].lower() == "s":
+        heading_text = f"{child_name}' Portfolio"
+    else:
+        heading_text = f"{child_name}'s Portfolio"
+    portfolio_styles = f"""
+    <style>
+    body[data-page='kid-portfolio'] .portfolio-modal__body{{max-height:none;overflow:visible;}}
+    body[data-page='kid-portfolio'] .portfolio-page__card{{margin-top:16px;}}
+    {PORTFOLIO_STYLE_RULES}
+    </style>
+    """
+    inner = f"""
+    <div class='topbar'><h3>{heading_text}</h3>
+      <a href='/kid/invest'><button>Back to Investing</button></a>
+    </div>
+    {notice_html}
+    <div class='portfolio-page'>
+      <div class='card portfolio-page__card'>
+        <div class='portfolio-modal__body'>{portfolio_body}</div>
+      </div>
+    </div>
+    """
+    body_attrs = f"{body_pref_attrs(request)} data-page='kid-portfolio'"
+    html = frame(
+        "Investing — Portfolio",
+        inner,
+        head_extra=portfolio_styles,
+        body_attrs=body_attrs,
+    )
+    return HTMLResponse(html)
+
+
 @app.post("/kid/invest/track")
 def kid_invest_track(
     request: Request,
