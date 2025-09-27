@@ -919,25 +919,61 @@ def base_styles() -> str:
         .chore-columns{grid-template-columns:1fr;}
         .calendar-nav{flex-wrap:wrap;}
         .calendar-table a{width:32px; height:32px;}
-        table, thead, tbody, th, td, tr { display:block; width:100%; }
-        thead { display:none; }
-        tr { margin-bottom:12px; border:1px solid #243041; border-radius:8px; padding:8px; background:var(--card); }
-        td {
-          border:none; border-bottom:1px solid #243041;
-          position:relative; padding-left:52%; text-align:left !important;
+        .content table{ width:100%; border-collapse:separate; border-spacing:0; }
+        .content table:not(.calendar-table),
+        .content table:not(.calendar-table) tbody,
+        .content table:not(.calendar-table) tr,
+        .content table:not(.calendar-table) td{ display:block; width:100%; }
+        .content table:not(.calendar-table) thead{ display:none; }
+        .content table:not(.calendar-table) th{ display:none; }
+        .content table:not(.calendar-table) tr{
+          margin-bottom:12px;
+          border:1px solid #243041;
+          border-radius:12px;
+          padding:12px;
+          background:rgba(148,163,184,0.08);
+          box-shadow:inset 0 0 0 1px rgba(15,23,42,0.25);
+        }
+        .content table:not(.calendar-table) tr:first-child{ display:none; }
+        .content table:not(.calendar-table) td{
+          border:none;
+          border-bottom:1px solid rgba(36,48,65,0.6);
+          padding:10px 0;
+          display:grid;
+          grid-template-columns:minmax(120px, 45%) 1fr;
+          align-items:flex-start;
+          gap:12px;
+          text-align:left !important;
           white-space:normal;
         }
-        td:last-child { border-bottom:none; }
-        td::before {
-          position:absolute; top:8px; left:8px; width:45%;
-          white-space:nowrap; font-weight:600; color:var(--muted);
-          content: attr(data-label);
+        .content table:not(.calendar-table) td:last-child{ border-bottom:none; }
+        .content table:not(.calendar-table) td::before{
+          content:attr(data-label);
+          font-weight:600;
+          color:var(--muted);
+          text-transform:uppercase;
+          font-size:12px;
+          letter-spacing:0.04em;
         }
-        td[data-label="Actions"]{ padding-left:12px; }
-        td[data-label="Actions"]::before{ position:static; display:block; margin-bottom:6px; width:auto; }
-        td[data-label="Actions"] .right{ text-align:left; }
-        td[data-label="Actions"] form,
-        td[data-label="Actions"] a{ display:block; width:100%; margin:6px 0 0 0; }
+        .content table:not(.calendar-table) td:not([data-label]){
+          display:block;
+          border-bottom:none;
+          padding:4px 0 0 0;
+        }
+        .content table:not(.calendar-table) td:not([data-label])::before{ content:none; }
+        .content table:not(.calendar-table) td[data-label="Actions"]{
+          grid-template-columns:1fr;
+          gap:8px;
+        }
+        .content table:not(.calendar-table) td[data-label="Actions"]::before{
+          margin-bottom:4px;
+        }
+        .content table:not(.calendar-table) td[data-label="Actions"] .actions,
+        .content table:not(.calendar-table) td[data-label="Actions"] form,
+        .content table:not(.calendar-table) td[data-label="Actions"] a,
+        .content table:not(.calendar-table) td[data-label="Actions"] button{
+          width:100%;
+        }
         .calendar-table,
         .calendar-table thead,
         .calendar-table tbody,
