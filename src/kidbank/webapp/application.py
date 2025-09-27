@@ -1473,8 +1473,8 @@ def list_chore_instances_for_kid(
             select(Chore).where(Chore.kid_id == kid_id, Chore.active == True)
         ).all()  # noqa: E712
         for chore in personal:
-            setattr(chore, "shared_member_names", [])
-            setattr(chore, "shared_member_pairs", [])
+            object.__setattr__(chore, "shared_member_names", [])
+            object.__setattr__(chore, "shared_member_pairs", [])
         shared_links = session.exec(
             select(SharedChoreMember).where(SharedChoreMember.kid_id == kid_id)
         ).all()
@@ -1510,8 +1510,8 @@ def list_chore_instances_for_kid(
                     label = child.name if child else participant
                     pairs.append((participant, label))
                     names.append(label)
-                setattr(chore, "shared_member_pairs", pairs)
-                setattr(chore, "shared_member_names", names)
+                object.__setattr__(chore, "shared_member_pairs", pairs)
+                object.__setattr__(chore, "shared_member_names", names)
         chores = personal + shared
         output: List[Tuple[Chore, Optional[ChoreInstance]]] = []
         for chore in chores:
