@@ -734,9 +734,11 @@ def base_styles() -> str:
       .sidebar a{display:block; padding:10px 12px; border-radius:10px; text-decoration:none; color:var(--text); background:rgba(255,255,255,0.04); transition:filter .15s ease, transform .15s ease;}
       .sidebar a:hover{filter:brightness(1.05); transform:translateX(2px);}
       .sidebar a.active{background:var(--accent); color:#fff; box-shadow:0 10px 24px rgba(37,99,235,0.25);}
-      .button-link{display:inline-flex; align-items:center; justify-content:center; padding:10px 14px; border-radius:10px; text-decoration:none; font-weight:600; background:rgba(255,255,255,0.06); color:var(--text);} 
-      .button-link.secondary{background:rgba(148,163,184,0.16); color:var(--text);} 
+      .button-link{display:inline-flex; align-items:center; justify-content:center; padding:10px 14px; border-radius:10px; text-decoration:none; font-weight:600; background:rgba(255,255,255,0.06); color:var(--text);}
+      .button-link.secondary{background:rgba(148,163,184,0.16); color:var(--text);}
       .button-link.danger{background:var(--bad); color:#fff;}
+      .link-danger{background:none; border:none; color:#f87171; cursor:pointer; font:inherit; padding:0;}
+      .link-danger:hover{text-decoration:underline;}
       .button-link:hover{filter:brightness(1.05);}
       .grid{
         display:grid;
@@ -778,6 +780,8 @@ def base_styles() -> str:
       .muted{color:var(--muted)}
       .topbar{display:flex; justify-content:space-between; align-items:center; margin-bottom:8px}
       .pill{display:inline-block; padding:4px 8px; border-radius:999px; background:#1f2937; color:#cbd5e1; font-size:12px}
+      .pill--stacked{display:inline-flex; flex-direction:column; align-items:center; line-height:1.2; gap:2px; padding:6px 10px}
+      .pill__subtext{font-size:10px; opacity:0.85}
       .kiosk{display:flex; gap:16px; align-items:center; justify-content:space-between}
       .kiosk .balance{font-size:52px; font-weight:900}
       .hero-card{display:flex; gap:24px; align-items:flex-start; justify-content:space-between;}
@@ -1452,6 +1456,10 @@ def list_chore_instances_for_kid(
                     ),
                     None,
                 )
+                if current and current.completed_at and current.status in {"pending", CHORE_STATUS_PENDING_MARKETPLACE, "paid"}:
+                    completion_day = current.completed_at.date()
+                    if completion_day != today:
+                        continue
             output.append((chore, current))
         return output
 
@@ -3387,6 +3395,9 @@ def kid_home(
         }
         chore_tiles: List[str] = []
         for chore, inst in chores:
+            chore_type = normalize_chore_type(
+                chore.type, is_global=chore.kid_id == GLOBAL_CHORE_KID_ID
+            )
             status = (inst.status if inst else "available") or "available"
             status_class, status_text = status_lookup.get(status, ("available", status.title()))
             is_special_once = is_one_time_special(chore)
@@ -3439,11 +3450,27 @@ def kid_home(
                     f"<div class='muted chore-item__schedule'>Marked "
                     f"{inst.completed_at.strftime('%b %d %H:%M')}</div>"
                 )
+            type_top_label = chore_type.title()
+            type_bottom_label: Optional[str] = None
+            if chore_type == "weekly":
+                if weekday_set:
+                    type_top_label = day_label
+                    type_bottom_label = "Weekly"
+                else:
+                    type_top_label = "Weekly"
+                    type_bottom_label = "By Sunday 12 AM"
+            type_top_html = html_escape(type_top_label)
+            type_html = (
+                f"<span class='pill chore-item__type pill--stacked'><span>{type_top_html}</span>"
+                f"<span class='pill__subtext'>{html_escape(type_bottom_label)}</span></span>"
+                if type_bottom_label
+                else f"<span class='pill chore-item__type'>{type_top_html}</span>"
+            )
             chore_tiles.append(
                 "<div class='chore-item'>"
                 + "<div class='chore-item__info'>"
                 + f"<div class='chore-item__title'><b>{html_escape(chore.name)}</b>"
-                + f"<span class='pill chore-item__type'>{html_escape(chore.type.title())}</span></div>"
+                + f"{type_html}</div>"
                 + f"<div class='muted chore-item__meta'>Reward {usd(chore.award_cents)}</div>"
                 + schedule_line
                 + completed_line
@@ -7829,21 +7856,28 @@ def admin_home(
         kid_lookup=kids_by_id,
         kid_filter=admin_events_kid,
     )
-    event_rows = "".join(
-        (
-            "<tr><td data-label='When'>"
-            + event.timestamp.strftime("%Y-%m-%d %H:%M")
-            + "</td><td data-label='Kid'>"
-            + html_escape(event.child_id)
-            + "</td><td data-label='Δ Amount' class='right'>"
-            + ("+" if event.change_cents >= 0 else "")
-            + usd(event.change_cents)
-            + "</td><td data-label='Reason'>"
-            + html_escape(format_event_reason(event, penalty_chore_lookup))
-            + "</td></tr>"
+    event_rows_parts: List[str] = []
+    for event in filtered_admin_events:
+        delete_form = (
+            "<form method='post' action='/admin/events/delete' class='inline' "
+            "onsubmit=\"return confirm('Delete this event?');\">"
+            + f"<input type='hidden' name='event_id' value='{event.id}'>"
+            + "<button type='submit' class='link-danger'>Delete</button>"
+            + "</form>"
         )
-        for event in filtered_admin_events
-    ) or "<tr><td colspan='4' class='muted'>No events matched these filters.</td></tr>"
+        event_rows_parts.append(
+            "<tr>"
+            + f"<td data-label='When'>{event.timestamp.strftime('%Y-%m-%d %H:%M')}</td>"
+            + f"<td data-label='Kid'>{html_escape(event.child_id)}</td>"
+            + f"<td data-label='Δ Amount' class='right'>{'+' if event.change_cents >= 0 else ''}{usd(event.change_cents)}</td>"
+            + f"<td data-label='Reason'>{html_escape(format_event_reason(event, penalty_chore_lookup))}</td>"
+            + f"<td data-label='Actions' class='right'>{delete_form}</td>"
+            + "</tr>"
+        )
+    event_rows = (
+        "".join(event_rows_parts)
+        or "<tr><td colspan='5' class='muted'>No events matched these filters.</td></tr>"
+    )
     if filtered_admin_events:
         if admin_events_query or admin_events_dir != "all" or admin_events_kid:
             events_summary_html = (
@@ -7895,7 +7929,7 @@ def admin_home(
         "</form>"
         f"{events_summary_html}"
         "<p class='muted'>Need a CSV? <a href='/admin/ledger.csv'>Download ledger</a></p>"
-        f"<table><tr><th>When</th><th>Kid</th><th>Δ Amount</th><th>Reason</th></tr>{event_rows}</table>"
+        f"<table><tr><th>When</th><th>Kid</th><th>Δ Amount</th><th>Reason</th><th>Actions</th></tr>{event_rows}</table>"
         "</div>"
     )
     create_kid_card = (
@@ -8435,13 +8469,15 @@ def admin_home(
         "<div class='card'>"
         "<h3>Add a Chore</h3>"
         "<form method='post' action='/admin/chores/create' class='stacked-form'>"
-        f"<label>kid_id</label><select name='kid_id' required>{kid_options_html}<option value='{GLOBAL_CHORE_KID_ID}'>Global (Free-for-all)</option></select>"
+        f"<label>Assign to kids</label><select name='kid_ids' id='chore-create-kids' multiple required data-global-option='{GLOBAL_CHORE_KID_ID}' size='{max(4, min(8, len(kids) + 1))}'>"
+        f"{kid_options_html}<option value='{GLOBAL_CHORE_KID_ID}'>Free-for-all (global)</option></select>"
+        "<div class='muted' style='margin-top:4px;'>Hold Ctrl (Windows) or Command (Mac) to pick multiple kids. Include “Free-for-all (global)” to publish a shared task.</div>"
         "<label>Name</label><input name='name' placeholder='Take out trash' required>"
         "<div class='grid' style='grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:8px;'>"
         "<div><label>Type</label><select name='type' id='chore-create-type' class='chore-type-select' data-schedule-root='chore-create-schedule'><option value='daily'>Daily</option><option value='weekly'>Weekly</option><option value='monthly'>Monthly</option><option value='special'>Special</option></select></div>"
         "<div><label>Award (dollars)</label><input name='award' type='text' data-money value='0.50'></div>"
         "<div><label>Penalty if missed</label><div style='display:flex; align-items:center; gap:6px; margin-top:4px;'><label style='display:flex; align-items:center; gap:4px; font-weight:400;'><input type='checkbox' name='penalty_enabled' value='1'> Apply</label><input name='penalty_amount' type='text' data-money value='0.00' placeholder='penalty $'></div></div>"
-        "<div><label>Max claimants (global)</label><input name='max_claimants' type='number' min='1' value='1'></div>"
+        f"<div class='chore-max-claimants' data-global-only style='display:none;'><label>Max claimants (global)</label><input name='max_claimants' type='number' min='1' value='1'></div>"
         "</div>"
         "<div class='grid' style='grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:8px;'>"
         "<div><label>Start Date (optional)</label><input name='start_date' type='date'></div>"
@@ -8459,7 +8495,7 @@ def admin_home(
         "<p class='muted'>Global chores appear for all kids under “Free-for-all”. Use max claimants to set how many kids can share the reward per period.</p>"
         "<button type='submit'>Add Chore</button>"
         "</form>"
-        "<script>(function(){function applySchedule(select){var rootId=select.getAttribute('data-schedule-root');if(!rootId){return;}var root=document.getElementById(rootId);if(!root){return;}var value=(select.value||'').toLowerCase();root.querySelectorAll('[data-schedule-group]').forEach(function(el){var group=el.getAttribute('data-schedule-group');var show=false;if(group==='weekly'){show=value==='weekly';}else if(group==='monthly'){show=value==='monthly';}else if(group==='special'){show=value==='special';}el.style.display=show?'':'none';});}var selects=document.querySelectorAll('.chore-type-select');selects.forEach(function(select){var handler=function(){applySchedule(select);};select.addEventListener('change',handler);handler();});})();</script>"
+        "<script>(function(){function applySchedule(select){var rootId=select.getAttribute('data-schedule-root');if(!rootId){return;}var root=document.getElementById(rootId);if(!root){return;}var value=(select.value||'').toLowerCase();root.querySelectorAll('[data-schedule-group]').forEach(function(el){var group=el.getAttribute('data-schedule-group');var show=false;if(group==='weekly'){show=value==='weekly';}else if(group==='monthly'){show=value==='monthly';}else if(group==='special'){show=value==='special';}el.style.display=show?'':'none';});}function toggleGlobal(){var select=document.getElementById('chore-create-kids');if(!select){return;}var globalValue=select.getAttribute('data-global-option');var hasGlobal=false;Array.prototype.slice.call(select.selectedOptions||[]).forEach(function(opt){if(opt.value===globalValue){hasGlobal=true;}});document.querySelectorAll('[data-global-only]').forEach(function(el){el.style.display=hasGlobal?'':'none';});}var selects=document.querySelectorAll('.chore-type-select');selects.forEach(function(select){var handler=function(){applySchedule(select);};select.addEventListener('change',handler);handler();});var kidSelect=document.getElementById('chore-create-kids');if(kidSelect){kidSelect.addEventListener('change',toggleGlobal);toggleGlobal();}})();</script>"
         "</div>"
     )
     admin_pref_controls = preference_controls_html(request)
@@ -8693,6 +8729,7 @@ def admin_manage_chores(request: Request, kid_id: str = Query(...)):
         penalty_checked = " checked" if penalty_cents > 0 else ""
         penalty_value = dollars_value(penalty_cents)
         marketplace_checked = " checked" if getattr(chore, "marketplace_blocked", False) else ""
+        max_spots_style = "" if is_global_chore else "display:none;"
         action_items = [f"<button type='submit' form='{form_id}'>Save</button>"]
         if not is_global_chore:
             action_items.append(
@@ -8737,7 +8774,7 @@ def admin_manage_chores(request: Request, kid_id: str = Query(...)):
             "<div class='chore-card__field'><label>Penalty ($)</label>"
             f"<div style='display:flex; align-items:center; gap:8px; flex-wrap:wrap;'><label style='display:flex; align-items:center; gap:4px; font-weight:400;'><input type='checkbox' name='penalty_enabled' value='1'{penalty_checked} form='{form_id}'> Apply</label><input name='penalty_amount' type='text' data-money value='{penalty_value}' form='{form_id}' class='chore-field--compact'></div>"
             "</div>"
-            f"<div class='chore-card__field'><label>Max spots</label><input name='max_claimants' type='number' min='1' value='{max(1, chore.max_claimants)}' form='{form_id}'></div>"
+            f"<div class='chore-card__field' data-global-only style='{max_spots_style}'><label>Max spots</label><input name='max_claimants' type='number' min='1' value='{max(1, chore.max_claimants)}' form='{form_id}'></div>"
             f"<div class='chore-card__field'><label>Job Board</label><div style='display:flex; align-items:center; gap:8px; font-weight:400;'><input type='checkbox' name='block_marketplace' value='1'{marketplace_checked} form='{form_id}' id='marketplace-{chore.id}'><label for='marketplace-{chore.id}' style='margin:0;'>Block listing</label></div></div>"
             f"<div class='chore-card__field chore-card__field--wide'><label>Schedule</label>{schedule_html}</div>"
             f"<div class='chore-card__field chore-card__field--wide'><label>Notes</label><textarea name='notes' form='{form_id}' rows='2'>{notes_value}</textarea></div>"
@@ -8876,7 +8913,7 @@ def admin_manage_chores(request: Request, kid_id: str = Query(...)):
 @app.post("/admin/chores/create")
 def admin_chore_create(
     request: Request,
-    kid_id: str = Form(...),
+    kid_ids: List[str] = Form([]),
     name: str = Form(...),
     type: str = Form(...),
     award: str = Form(...),
@@ -8909,50 +8946,74 @@ def admin_chore_create(
     weekday_csv = serialize_weekday_selection(weekdays) if weekdays else None
     dates_csv = serialize_specific_dates(specific_dates) if specific_dates else None
     month_days_csv = serialize_specific_month_days(specific_month_days)
-    kid_value = (kid_id or "").strip()
-    if kid_value and kid_value != GLOBAL_CHORE_KID_ID:
-        if (
-            denied := ensure_admin_kid_access(
-                request, kid_value, redirect="/admin?section=chores"
-            )
-        ) is not None:
-            return denied
-    normalized_type = normalize_chore_type(type, is_global=kid_value == GLOBAL_CHORE_KID_ID)
-    if normalized_type != "weekly":
-        weekday_csv = None
-    if normalized_type != "special":
-        dates_csv = None
-    if normalized_type != "monthly":
-        month_days_csv = None
+    unique_ids: List[str] = []
+    seen_ids: Set[str] = set()
+    for raw in kid_ids:
+        value = (raw or "").strip()
+        if not value:
+            continue
+        key = value.lower()
+        if key in seen_ids:
+            continue
+        seen_ids.add(key)
+        unique_ids.append(value)
+    if not unique_ids:
+        set_admin_notice(request, "Select at least one kid for the chore.", "error")
+        return RedirectResponse("/admin?section=chores", status_code=302)
     prevent_marketplace = bool(block_marketplace)
-    kid_label = "Free-for-all" if kid_value == GLOBAL_CHORE_KID_ID else kid_value or "Unknown"
+    kid_labels: List[str] = []
     with Session(engine) as session:
-        if kid_value and kid_value != GLOBAL_CHORE_KID_ID:
-            target_child = session.exec(select(Child).where(Child.kid_id == kid_value)).first()
-            if target_child:
-                kid_label = target_child.name
-        chore = Chore(
-            kid_id=kid_value,
-            name=name.strip(),
-            type=normalized_type,
-            award_cents=award_c,
-            penalty_cents=penalty_c,
-            notes=notes.strip() or None,
-            start_date=date.fromisoformat(start_date) if start_date else None,
-            end_date=date.fromisoformat(end_date) if end_date else None,
-            max_claimants=max_claims_value,
-            weekdays=weekday_csv,
-            specific_dates=dates_csv,
-            specific_month_days=month_days_csv,
-            marketplace_blocked=prevent_marketplace,
-        )
-        session.add(chore)
+        for kid_value in unique_ids:
+            is_global = kid_value == GLOBAL_CHORE_KID_ID
+            if not is_global:
+                if (
+                    denied := ensure_admin_kid_access(
+                        request, kid_value, redirect="/admin?section=chores"
+                    )
+                ) is not None:
+                    return denied
+            normalized_type = normalize_chore_type(type, is_global=is_global)
+            weekday_value = weekday_csv if normalized_type == "weekly" else None
+            dates_value = dates_csv if normalized_type == "special" else None
+            month_days_value = month_days_csv if normalized_type == "monthly" else None
+            max_claims = max_claims_value if is_global else 1
+            kid_label = "Free-for-all" if is_global else kid_value or "Unknown"
+            if not is_global:
+                target_child = session.exec(
+                    select(Child).where(Child.kid_id == kid_value)
+                ).first()
+                if target_child:
+                    kid_label = target_child.name
+            chore = Chore(
+                kid_id=kid_value,
+                name=name.strip(),
+                type=normalized_type,
+                award_cents=award_c,
+                penalty_cents=penalty_c,
+                notes=notes.strip() or None,
+                start_date=date.fromisoformat(start_date) if start_date else None,
+                end_date=date.fromisoformat(end_date) if end_date else None,
+                max_claimants=max_claims,
+                weekdays=weekday_value,
+                specific_dates=dates_value,
+                specific_month_days=month_days_value,
+                marketplace_blocked=prevent_marketplace,
+            )
+            session.add(chore)
+            kid_labels.append(kid_label)
         session.commit()
-    set_admin_notice(
-        request,
-        f"Added chore '{name.strip()}' for {html_escape(kid_label)}.",
-        "success",
-    )
+    if kid_labels:
+        if len(kid_labels) == 1:
+            target_label = kid_labels[0]
+        else:
+            target_label = ", ".join(kid_labels[:3])
+            if len(kid_labels) > 3:
+                target_label += f" +{len(kid_labels) - 3} more"
+        set_admin_notice(
+            request,
+            f"Added chore '{name.strip()}' for {target_label}.",
+            "success",
+        )
     return RedirectResponse("/admin?section=chores", status_code=302)
 
 
@@ -9018,7 +9079,7 @@ def admin_chore_update(
         chore.notes = notes.strip() or None
         chore.start_date = date.fromisoformat(start_date) if start_date else None
         chore.end_date = date.fromisoformat(end_date) if end_date else None
-        chore.max_claimants = max_claims_value
+        chore.max_claimants = max_claims_value if chore.kid_id == GLOBAL_CHORE_KID_ID else 1
         chore.weekdays = weekday_csv
         chore.specific_dates = dates_csv
         chore.specific_month_days = month_days_csv
@@ -9026,6 +9087,36 @@ def admin_chore_update(
         session.add(chore)
         session.commit()
     return RedirectResponse(f"/admin/chores?kid_id={target_kid}", status_code=302)
+
+
+@app.post("/admin/events/delete")
+def admin_event_delete(
+    request: Request,
+    event_id: int = Form(...),
+    redirect: str = Form("/admin?section=events"),
+):
+    target_redirect = redirect if redirect.startswith("/") else "/admin?section=events"
+    if (
+        redirect_response := require_admin_permission(
+            request, "can_adjust_balances", redirect=target_redirect
+        )
+    ) is not None:
+        return redirect_response
+    with Session(engine) as session:
+        event = session.get(Event, event_id)
+        if not event:
+            set_admin_notice(request, "Event not found.", "error")
+            return RedirectResponse(target_redirect, status_code=302)
+        linked_instances = session.exec(
+            select(ChoreInstance).where(ChoreInstance.paid_event_id == event.id)
+        ).all()
+        for inst in linked_instances:
+            inst.paid_event_id = None
+            session.add(inst)
+        session.delete(event)
+        session.commit()
+    set_admin_notice(request, "Deleted the selected event.", "success")
+    return RedirectResponse(target_redirect, status_code=302)
 
 
 @app.post("/admin/global_chore/claims")
