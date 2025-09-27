@@ -608,15 +608,30 @@ def require_kid(request: Request) -> Optional[RedirectResponse]:
     return None
 
 
+_KID_CONFETTI_SESSION_KEY = "kid_confetti"
+
+
 def set_kid_notice(request: Request, message: str, kind: str = "info") -> None:
     request.session["kid_notice"] = message
     request.session["kid_notice_kind"] = kind
+
+
+def trigger_kid_confetti(request: Request) -> None:
+    """Mark the current kid session to celebrate with confetti on next load."""
+
+    request.session[_KID_CONFETTI_SESSION_KEY] = True
 
 
 def pop_kid_notice(request: Request) -> Tuple[Optional[str], str]:
     message = request.session.pop("kid_notice", None)
     kind = request.session.pop("kid_notice_kind", "info")
     return message, kind
+
+
+def pop_kid_confetti(request: Request) -> bool:
+    """Return whether the next kid page should show a confetti celebration."""
+
+    return bool(request.session.pop(_KID_CONFETTI_SESSION_KEY, None))
 
 
 def _invest_base_config(base_path: str) -> Tuple[str, Dict[str, str]]:
@@ -4141,6 +4156,7 @@ def kid_home(
         """
         investing_snapshot = _kid_investing_snapshot(kid_id)
         notice_msg, notice_kind = pop_kid_notice(request)
+        celebrate_confetti = pop_kid_confetti(request)
         notice_html = ""
         if notice_msg:
             if notice_kind == "error":
@@ -4149,6 +4165,41 @@ def kid_home(
                 notice_style = "background:#dcfce7; border-left:4px solid #86efac; color:#166534;"
             notice_html = (
                 f"<div class='card' style='margin-top:12px; {notice_style}'><div>{notice_msg}</div></div>"
+            )
+        if celebrate_confetti:
+            notice_html += textwrap.dedent(
+                """
+                <style id='kid-confetti-style'>
+                  .kid-confetti-layer{pointer-events:none;position:fixed;inset:0;overflow:hidden;z-index:2000;}
+                  .kid-confetti-piece{position:absolute;top:-12px;width:10px;height:16px;border-radius:2px;opacity:0;animation:kid-confetti-fall linear forwards;}
+                  @keyframes kid-confetti-fall{
+                    0%{transform:translate3d(0,-110vh,0) rotate(0deg);opacity:0;}
+                    10%{opacity:1;}
+                    100%{transform:translate3d(var(--kid-confetti-drift,0),110vh,0) rotate(720deg);opacity:0;}
+                  }
+                </style>
+                <script>
+                  (function(){
+                    const layer=document.createElement('div');
+                    layer.className='kid-confetti-layer';
+                    const colors=['#f97316','#facc15','#22c55e','#38bdf8','#a855f7','#f472b6'];
+                    const pieces=140;
+                    for(let i=0;i<pieces;i++){
+                      const piece=document.createElement('span');
+                      piece.className='kid-confetti-piece';
+                      piece.style.backgroundColor=colors[i%colors.length];
+                      piece.style.left=(Math.random()*100)+'%';
+                      piece.style.animationDelay=(Math.random()*0.25)+'s';
+                      piece.style.animationDuration=(2.6+Math.random()*0.9)+'s';
+                      piece.style.setProperty('--kid-confetti-drift',(Math.random()*160-80)+'vw');
+                      piece.style.transform='rotate('+(Math.random()*360)+'deg)';
+                      layer.appendChild(piece);
+                    }
+                    document.body.appendChild(layer);
+                    setTimeout(function(){layer.remove();},3600);
+                  })();
+                </script>
+                """
             )
         invest_query_params = {key: request.query_params.get(key) for key in request.query_params}
         embed_params = {"section": "investing"}
@@ -5671,6 +5722,7 @@ def kid_checkoff(request: Request, chore_id: int = Form(...)):
             session.add(new_inst)
             session.commit()
             set_kid_notice(request, f"Sent '{chore.name}' for approval!", "success")
+            trigger_kid_confetti(request)
         else:
             if inst.status == "available":
                 inst.status = "pending"
@@ -5679,6 +5731,7 @@ def kid_checkoff(request: Request, chore_id: int = Form(...)):
                 session.add(inst)
                 session.commit()
                 set_kid_notice(request, f"Sent '{chore.name}' for approval!", "success")
+                trigger_kid_confetti(request)
             elif inst.status in {"pending", CHORE_STATUS_PENDING_MARKETPLACE}:
                 set_kid_notice(request, "That chore is already waiting for approval.", "error")
             else:
