@@ -365,6 +365,15 @@ def usd(cents: int) -> str:
         return "$0.00"
 
 
+def _format_multiline_note(note: str) -> str:
+    """Render multiline chore notes for HTML display."""
+
+    # Preserve intentional line breaks by splitting on newline characters,
+    # escaping each segment individually, then joining with ``<br>`` tags.
+    parts = [html_escape(segment) for segment in note.splitlines()]
+    return "<br>".join(parts)
+
+
 def dollars_value(cents: int) -> str:
     try:
         return f"{(cents or 0) / 100:.2f}"
@@ -3676,7 +3685,7 @@ def kid_home(
                 else ""
             )
             note_line = (
-                f"<div class='muted chore-item__notes'>{html_escape(chore.notes or '')}</div>"
+                f"<div class='muted chore-item__notes'>{_format_multiline_note(chore.notes)}</div>"
                 if chore.notes
                 else ""
             )
@@ -3803,7 +3812,7 @@ def kid_home(
             spots_left = max(0, chore.max_claimants - total_claims)
             name_html = html_escape(chore.name)
             notes_line = (
-                f"<div class='muted' style='margin-top:4px;'>{html_escape(chore.notes or '')}</div>"
+                f"<div class='muted' style='margin-top:4px;'>{_format_multiline_note(chore.notes)}</div>"
                 if chore.notes
                 else ""
             )
