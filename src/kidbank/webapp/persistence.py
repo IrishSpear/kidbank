@@ -98,6 +98,7 @@ class Chore(SQLModel, table=True):
     weekdays: Optional[str] = None
     specific_dates: Optional[str] = None
     specific_month_days: Optional[str] = None
+    marketplace_blocked: bool = False
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
 
@@ -351,6 +352,10 @@ def run_migrations() -> None:
             raw.execute("ALTER TABLE chore ADD COLUMN penalty_cents INTEGER DEFAULT 0;")
         if not _column_exists(raw, "chore", "penalty_last_date"):
             raw.execute("ALTER TABLE chore ADD COLUMN penalty_last_date TEXT;")
+        if not _column_exists(raw, "chore", "marketplace_blocked"):
+            raw.execute(
+                "ALTER TABLE chore ADD COLUMN marketplace_blocked INTEGER DEFAULT 0;"
+            )
         if not _column_exists(raw, "certificate", "term_days"):
             raw.execute("ALTER TABLE certificate ADD COLUMN term_days INTEGER DEFAULT 0;")
             raw.execute(

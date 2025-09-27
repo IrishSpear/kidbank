@@ -29,6 +29,7 @@ from kidbank.webapp import (  # noqa: E402
     app,
     detailed_history_chart_svg,
     engine,
+    format_event_reason,
     ensure_default_learning_content,
     filter_events,
     list_kid_market_symbols,
@@ -192,6 +193,8 @@ def test_admin_chore_payout_zero_override_uses_default_award() -> None:
     assert updated_child is not None and updated_child.balance_cents == 150
     assert updated_instance is not None and updated_instance.status == "paid"
     assert payout_event is not None and payout_event.change_cents == 150
+    assert "|approved_by:" in payout_event.reason
+    assert "Approved by" in format_event_reason(payout_event)
 
 
 def test_marketplace_completion_skips_standard_pending_entry() -> None:
@@ -249,6 +252,79 @@ def test_marketplace_completion_skips_standard_pending_entry() -> None:
             .where(Chore.kid_id == Child.kid_id)
         ).all()
     assert not standard_pending
+
+
+def test_marketplace_blocked_chore_not_listed() -> None:
+    client = TestClient(app)
+    with Session(engine) as session:
+        child = Child(kid_id="owner", name="Owner", balance_cents=2_000, kid_pin="1234")
+        chore = Chore(
+            kid_id=child.kid_id,
+            name="Dishes",
+            type="daily",
+            award_cents=250,
+            marketplace_blocked=True,
+        )
+        session.add_all([child, chore])
+        session.commit()
+        session.refresh(chore)
+        chore_id = chore.id
+    login = client.post(
+        "/kid/login", data={"kid_id": "owner", "kid_pin": "1234"}, follow_redirects=False
+    )
+    assert login.status_code == 302
+    response = client.post(
+        "/kid/marketplace/list",
+        data={"chore_id": chore_id, "offer": "1.00"},
+        follow_redirects=False,
+    )
+    assert response.status_code == 302
+    assert response.headers["location"] == "/kid?section=marketplace"
+    with Session(engine) as session:
+        listing = session.exec(
+            select(MarketplaceListing).where(MarketplaceListing.chore_id == chore_id)
+        ).first()
+    assert listing is None
+
+
+def test_money_received_notification_shows_in_money_section() -> None:
+    client = TestClient(app)
+    with Session(engine) as session:
+        child = Child(kid_id="kid1", name="Kid One", balance_cents=1_000, kid_pin="0000")
+        other = Child(kid_id="kid2", name="Kid Two", balance_cents=500, kid_pin="1111")
+        event = Event(
+            child_id="kid1",
+            change_cents=500,
+            reason="Received from Kid Two: Birthday gift",
+            timestamp=datetime.utcnow(),
+        )
+        session.add_all([child, other, event])
+        session.commit()
+    login = client.post(
+        "/kid/login", data={"kid_id": "kid1", "kid_pin": "0000"}, follow_redirects=False
+    )
+    assert login.status_code == 302
+    page = client.get("/kid?section=money")
+    assert page.status_code == 200
+    assert "Money received" in page.text
+    assert "Kid Two" in page.text
+    assert "sent you $5.00" in page.text
+
+
+def test_kid_goals_page_shows_balance() -> None:
+    client = TestClient(app)
+    with Session(engine) as session:
+        child = Child(kid_id="kid1", name="Kid One", balance_cents=2_500, kid_pin="1234")
+        goal = Goal(kid_id="kid1", name="Lego", target_cents=5_000, saved_cents=1_200)
+        session.add_all([child, goal])
+        session.commit()
+    login = client.post(
+        "/kid/login", data={"kid_id": "kid1", "kid_pin": "1234"}, follow_redirects=False
+    )
+    assert login.status_code == 302
+    page = client.get("/kid?section=goals")
+    assert page.status_code == 200
+    assert "Current balance: <b>$25.00</b>" in page.text
 
 
 def test_marketplace_payout_includes_award_and_offer() -> None:
@@ -311,7 +387,10 @@ def test_marketplace_payout_includes_award_and_offer() -> None:
     assert owner is not None and owner.balance_cents == 5_000 - 550
     assert worker is not None and worker.balance_cents == 1_500 + 550
     assert listing is not None and listing.final_payout_cents == 1_500 + 550
-    assert any(evt.change_cents == 1_500 + 550 for evt in events)
+    worker_event = next((evt for evt in events if evt.change_cents == 1_500 + 550), None)
+    assert worker_event is not None
+    assert "|approved_by:" in worker_event.reason
+    assert "Approved by" in format_event_reason(worker_event)
 
 
 def test_marketplace_payout_zero_override_defaults_to_total() -> None:
