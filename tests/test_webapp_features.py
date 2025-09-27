@@ -36,6 +36,7 @@ from kidbank.webapp import (  # noqa: E402
     list_kid_market_symbols,
     load_admin_privileges,
     run_migrations,
+    period_key_for,
 )
 from kidbank.webapp import (
     Certificate,
@@ -924,6 +925,54 @@ def test_kid_dashboard_renders_shared_chore_details() -> None:
     assert "We hit a snag" not in dashboard.text
     assert "Shared with:" in dashboard.text
     assert "Max claimants: 2" in dashboard.text
+
+
+def test_shared_chore_button_disabled_when_spots_taken() -> None:
+    client = TestClient(app)
+    today = date.today()
+    period_moment = datetime.combine(today, datetime.min.time())
+    with Session(engine) as session:
+        kids = [
+            Child(kid_id="avery", name="Avery", kid_pin="1111", balance_cents=0),
+            Child(kid_id="blake", name="Blake", kid_pin="2222", balance_cents=0),
+        ]
+        session.add_all(kids)
+        session.commit()
+        shared_chore = Chore(
+            kid_id=SHARED_CHORE_KID_ID,
+            name="Clean Kitchen",
+            type="daily",
+            award_cents=400,
+            max_claimants=1,
+        )
+        session.add(shared_chore)
+        session.commit()
+        session.refresh(shared_chore)
+        session.add_all(
+            [
+                SharedChoreMember(chore_id=shared_chore.id, kid_id="avery"),
+                SharedChoreMember(chore_id=shared_chore.id, kid_id="blake"),
+            ]
+        )
+        taken_instance = ChoreInstance(
+            chore_id=shared_chore.id,
+            period_key=period_key_for("daily", period_moment),
+            status="pending",
+            completing_kid_id="blake",
+            completed_at=datetime.utcnow(),
+        )
+        session.add(taken_instance)
+        session.commit()
+    login = client.post(
+        "/kid/login",
+        data={"kid_id": "avery", "kid_pin": "1111"},
+        follow_redirects=False,
+    )
+    assert login.status_code == 302
+    dashboard = client.get("/kid?section=chores")
+    assert dashboard.status_code == 200
+    assert "<button type='submit' disabled>All spots taken</button>" in dashboard.text
+    assert "<button type='submit'>Mark complete</button>" not in dashboard.text
 
 
 def test_global_chore_multiple_claims_split_evenly() -> None:

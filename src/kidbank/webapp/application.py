@@ -1517,15 +1517,38 @@ def list_chore_instances_for_kid(
         for chore in chores:
             if not is_chore_in_window(chore, today):
                 continue
+            chore_type = normalize_chore_type(chore.type)
             insts = session.exec(
                 select(ChoreInstance)
                 .where(ChoreInstance.chore_id == chore.id)
                 .order_by(desc(ChoreInstance.id))
             ).all()
+            shared_slots_remaining: Optional[int] = None
             if chore.kid_id == SHARED_CHORE_KID_ID:
                 insts = [inst for inst in insts if inst.completing_kid_id == kid_id]
+                if chore.id is not None and chore.max_claimants is not None:
+                    shared_period_key = (
+                        "SPECIAL"
+                        if chore_type == "special"
+                        else period_key_for(chore_type, moment)
+                    )
+                    shared_submissions = session.exec(
+                        select(ChoreInstance)
+                        .where(ChoreInstance.chore_id == chore.id)
+                        .where(ChoreInstance.period_key == shared_period_key)
+                        .where(
+                            ChoreInstance.status.in_(
+                                ["pending", "paid", CHORE_STATUS_PENDING_MARKETPLACE]
+                            )
+                        )
+                    ).all()
+                    shared_slots_remaining = max(
+                        0, chore.max_claimants - len(shared_submissions)
+                    )
+                    object.__setattr__(
+                        chore, "shared_slots_remaining", shared_slots_remaining
+                    )
             current: Optional[ChoreInstance]
-            chore_type = normalize_chore_type(chore.type)
             if chore_type == "daily":
                 current = next((i for i in insts if i.period_key == pk_daily), None)
             elif chore_type == "weekly":
@@ -3532,12 +3555,26 @@ def kid_home(
                 in {"pending", CHORE_STATUS_PENDING_MARKETPLACE}
             ):
                 special_note_html = "<div class='muted chore-item__schedule'>Available again tomorrow.</div>"
+            shared_slots_remaining = None
+            if chore.kid_id == SHARED_CHORE_KID_ID:
+                shared_slots_remaining = getattr(chore, "shared_slots_remaining", None)
             if is_selected_today and status == "available":
-                action_html = (
-                    f"<form class='inline' method='post' action='/kid/checkoff'>"
-                    f"<input type='hidden' name='chore_id' value='{chore.id}'>"
-                    "<button type='submit'>Mark complete</button></form>"
-                )
+                if (
+                    chore.kid_id == SHARED_CHORE_KID_ID
+                    and shared_slots_remaining is not None
+                    and shared_slots_remaining <= 0
+                ):
+                    action_html = (
+                        f"<form class='inline' method='post' action='/kid/checkoff'>"
+                        f"<input type='hidden' name='chore_id' value='{chore.id}'>"
+                        "<button type='submit' disabled>All spots taken</button></form>"
+                    )
+                else:
+                    action_html = (
+                        f"<form class='inline' method='post' action='/kid/checkoff'>"
+                        f"<input type='hidden' name='chore_id' value='{chore.id}'>"
+                        "<button type='submit'>Mark complete</button></form>"
+                    )
             elif is_selected_today and status in {"pending", CHORE_STATUS_PENDING_MARKETPLACE}:
                 action_html = "<span class='pill status-pending'>Awaiting review</span>" + special_note_html
             elif is_selected_today and status == "paid":
