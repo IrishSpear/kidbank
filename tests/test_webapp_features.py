@@ -67,6 +67,7 @@ def clean_database() -> None:
             Investment,
             KidMarketInstrument,
             GlobalChoreClaim,
+            GlobalChoreAudience,
             MarketplaceListing,
             ChoreInstance,
             Chore,

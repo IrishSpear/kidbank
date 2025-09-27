@@ -613,6 +613,7 @@ __all__ = [
     "MarketInstrument",
     "KidMarketInstrument",
     "GlobalChoreClaim",
+    "GlobalChoreAudience",
     "Lesson",
     "Quiz",
     "QuizAttempt",
