@@ -113,6 +113,52 @@ def _record_transfer_dismissal(request: Request, kid_id: str, event_id: int) -> 
     request.session[_TRANSFER_DISMISS_SESSION_KEY] = raw_store
 
 
+_TRANSFER_REASON_PREFIXES = {
+    "direct": "Received from ",
+    "request": "Request accepted by ",
+    "admin": "transfer_from:",
+}
+
+
+def _transfer_event_details(event: Event) -> Optional[Dict[str, str]]:
+    """Return who sent a transfer event and any optional note."""
+
+    reason_text = (event.reason or "").strip()
+    if not reason_text:
+        return None
+    sender = ""
+    note = ""
+    if reason_text.startswith(_TRANSFER_REASON_PREFIXES["direct"]):
+        rest = reason_text[len(_TRANSFER_REASON_PREFIXES["direct"]):]
+        sender, _, remainder = rest.partition(":")
+        sender = sender.strip()
+        note = remainder.strip()
+    elif reason_text.startswith(_TRANSFER_REASON_PREFIXES["request"]):
+        rest = reason_text[len(_TRANSFER_REASON_PREFIXES["request"]):]
+        sender, _, remainder = rest.partition(":")
+        sender = sender.strip()
+        remainder = remainder.strip()
+        if "—" in remainder:
+            _, _, detail = remainder.partition("—")
+            note = detail.strip()
+    elif reason_text.startswith(_TRANSFER_REASON_PREFIXES["admin"]):
+        rest = reason_text[len(_TRANSFER_REASON_PREFIXES["admin"]):].strip()
+        if not rest:
+            return None
+        if rest.endswith(")") and "(" in rest:
+            sender_part, _, note_part = rest.partition("(")
+            sender = sender_part.strip()
+            note = note_part[:-1].strip()
+        else:
+            sender = rest
+    if not sender:
+        return None
+    note_clean = note.strip()
+    if note_clean.lower() in {"", "shared money"}:
+        note_clean = ""
+    return {"sender": sender, "note": note_clean}
+
+
 def _penalty_event_reason(chore_id: int, target_day: date) -> str:
     return f"chore_penalty_missed:{chore_id}:{target_day.isoformat()}"
 
@@ -3961,37 +4007,15 @@ def kid_home(
                 continue
             if event.id in dismissed_transfer_ids:
                 continue
-            reason_text = (event.reason or "").strip()
-            sender_name = ""
-            note_text = ""
-            if reason_text.startswith("Received from "):
-                rest = reason_text[len("Received from ") :]
-                sender_name, _, remainder = rest.partition(":")
-                sender_name = sender_name.strip()
-                note_text = remainder.strip()
-            elif reason_text.startswith("Request accepted by "):
-                rest = reason_text[len("Request accepted by ") :]
-                sender_name, _, remainder = rest.partition(":")
-                sender_name = sender_name.strip()
-                amount_and_note = remainder.strip()
-                _, _, note_part = amount_and_note.partition("—")
-                note_text = note_part.strip()
-            else:
+            details = _transfer_event_details(event)
+            if not details:
                 continue
-            if not sender_name:
-                continue
-            transfer_notices.append(
-                {
-                    "event": event,
-                    "sender": sender_name,
-                    "note": note_text,
-                }
-            )
+            transfer_notices.append({"event": event, **details})
             if len(transfer_notices) >= 3:
                 break
         if transfer_notices:
             blocks: List[str] = []
-            redirect_target = html_escape("/kid?section=overview")
+            redirect_target = html_escape("/kid")
             for info in transfer_notices:
                 event = info["event"]
                 sender = html_escape(info["sender"])
