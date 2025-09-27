@@ -26,6 +26,7 @@ from kidbank.webapp import (  # noqa: E402
     KidMarketInstrument,
     MarketplaceListing,
     MoneyRequest,
+    MARKETPLACE_STATUS_COMPLETED,
     REMEMBER_NAME_COOKIE,
     app,
     detailed_history_chart_svg,
@@ -291,6 +292,51 @@ def test_marketplace_blocked_chore_not_listed() -> None:
             select(MarketplaceListing).where(MarketplaceListing.chore_id == chore_id)
         ).first()
     assert listing is None
+
+
+def test_marketplace_completed_listing_can_be_dismissed() -> None:
+    client = TestClient(app)
+    with Session(engine) as session:
+        owner = Child(kid_id="owner", name="Owner", balance_cents=1_000, kid_pin="1111")
+        worker = Child(kid_id="worker", name="Worker", balance_cents=500, kid_pin="2222")
+        chore = Chore(kid_id=owner.kid_id, name="Laundry", type="weekly", award_cents=300)
+        session.add_all([owner, worker, chore])
+        session.commit()
+        session.refresh(chore)
+        listing = MarketplaceListing(
+            owner_kid_id=owner.kid_id,
+            chore_id=chore.id,
+            chore_name=chore.name,
+            chore_award_cents=chore.award_cents,
+            offer_cents=150,
+            status=MARKETPLACE_STATUS_COMPLETED,
+            claimed_by=worker.kid_id,
+            completed_at=datetime.utcnow(),
+        )
+        session.add(listing)
+        session.commit()
+        session.refresh(listing)
+        listing_id = listing.id
+    assert listing_id is not None
+    login = client.post(
+        "/kid/login", data={"kid_id": "worker", "kid_pin": "2222"}, follow_redirects=False
+    )
+    assert login.status_code == 302
+    page = client.get("/kid?section=marketplace")
+    assert page.status_code == 200
+    assert "Laundry" in page.text
+    assert "Dismiss" in page.text
+    dismiss = client.post(
+        "/kid/marketplace/dismiss",
+        data={"listing_id": listing_id, "redirect": "/kid?section=marketplace"},
+        follow_redirects=False,
+    )
+    assert dismiss.status_code == 303
+    assert dismiss.headers["location"] == "/kid?section=marketplace"
+    refreshed = client.get("/kid?section=marketplace")
+    assert refreshed.status_code == 200
+    assert "Laundry" not in refreshed.text
+    assert "Claim a listing to see it here." in refreshed.text
 
 
 def test_special_chore_completion_stays_visible() -> None:

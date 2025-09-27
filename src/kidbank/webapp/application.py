@@ -81,6 +81,12 @@ def now_local() -> datetime:
 
 
 _TRANSFER_DISMISS_SESSION_KEY = "kid_transfer_dismissals"
+_MARKETPLACE_DISMISS_SESSION_KEY = "kid_marketplace_dismissals"
+_MARKETPLACE_DISMISSIBLE_STATUSES = {
+    MARKETPLACE_STATUS_COMPLETED,
+    MARKETPLACE_STATUS_CANCELLED,
+    MARKETPLACE_STATUS_REJECTED,
+}
 
 
 def _get_dismissed_transfer_ids(request: Request, kid_id: str) -> Set[int]:
@@ -111,6 +117,37 @@ def _record_transfer_dismissal(request: Request, kid_id: str, event_id: int) -> 
         raw_values.append(event_id)
     raw_store[kid_id] = raw_values
     request.session[_TRANSFER_DISMISS_SESSION_KEY] = raw_store
+
+
+def _get_dismissed_marketplace_ids(request: Request, kid_id: str) -> Set[int]:
+    raw_store = request.session.get(_MARKETPLACE_DISMISS_SESSION_KEY)
+    if isinstance(raw_store, dict):
+        raw_values = raw_store.get(kid_id)
+        if isinstance(raw_values, list):
+            dismissed: Set[int] = set()
+            for value in raw_values:
+                try:
+                    dismissed.add(int(value))
+                except (TypeError, ValueError):
+                    continue
+            return dismissed
+    return set()
+
+
+def _record_marketplace_dismissal(request: Request, kid_id: str, listing_id: int) -> None:
+    if listing_id <= 0:
+        return
+    raw_store = request.session.get(_MARKETPLACE_DISMISS_SESSION_KEY)
+    if not isinstance(raw_store, dict):
+        raw_store = {}
+    raw_values = raw_store.get(kid_id)
+    if not isinstance(raw_values, list):
+        raw_values = []
+    if listing_id not in raw_values:
+        raw_values.append(listing_id)
+        raw_values = raw_values[-60:]
+    raw_store[kid_id] = raw_values
+    request.session[_MARKETPLACE_DISMISS_SESSION_KEY] = raw_store
 
 
 def _penalty_event_reason(chore_id: int, target_day: date) -> str:
@@ -3451,6 +3488,29 @@ def kid_home(
                 .order_by(desc(MarketplaceListing.created_at)),
             )
 
+            dismissed_marketplace_ids = _get_dismissed_marketplace_ids(request, kid_id)
+            if dismissed_marketplace_ids:
+                def _is_dismissed(listing: MarketplaceListing) -> bool:
+                    try:
+                        listing_id = int(listing.id) if listing.id is not None else 0
+                    except (TypeError, ValueError):
+                        return False
+                    return (
+                        listing_id in dismissed_marketplace_ids
+                        and listing.status in _MARKETPLACE_DISMISSIBLE_STATUSES
+                    )
+
+                marketplace_my_listings = [
+                    listing
+                    for listing in marketplace_my_listings
+                    if not _is_dismissed(listing)
+                ]
+                marketplace_claimed_by_me = [
+                    listing
+                    for listing in marketplace_claimed_by_me
+                    if not _is_dismissed(listing)
+                ]
+
             for claim in kid_global_claims:
                 if claim.chore_id not in global_chore_lookup:
                     chore_ref = session.get(Chore, claim.chore_id)
@@ -4635,6 +4695,17 @@ def kid_home(
             except Exception:
                 return str(value)
 
+        def _dismiss_action(listing: MarketplaceListing) -> str:
+            if not listing.id:
+                return ""
+            return (
+                "<form method='post' action='/kid/marketplace/dismiss' class='inline'>"
+                f"<input type='hidden' name='listing_id' value='{listing.id}'>"
+                "<input type='hidden' name='redirect' value='/kid?section=marketplace'>"
+                "<button type='submit' class='secondary'>Dismiss</button>"
+                "</form>"
+            )
+
         available_rows = []
         for listing in marketplace_open_listings:
             owner = kid_lookup.get(listing.owner_kid_id)
@@ -4695,6 +4766,11 @@ def kid_home(
                 if note:
                     status_html += f"<div class='muted'>{note}</div>"
 
+            dismiss_action = (
+                _dismiss_action(listing)
+                if listing.status in _MARKETPLACE_DISMISSIBLE_STATUSES
+                else ""
+            )
             actions_html = ""
             if listing.status == MARKETPLACE_STATUS_OPEN:
                 actions_html = (
@@ -4703,6 +4779,8 @@ def kid_home(
                     "<button type='submit' class='danger'>Cancel</button>"
                     "</form>"
                 )
+            elif dismiss_action:
+                actions_html = dismiss_action
             my_listing_rows.append(
                 "<tr>"
                 f"<td data-label='Chore'><b>{html_escape(listing.chore_name)}</b><div class='muted'>Award {usd(listing.chore_award_cents)}</div></td>"
@@ -4738,6 +4816,11 @@ def kid_home(
                 if note:
                     status_html += f"<div class='muted'>{note}</div>"
 
+            dismiss_action = (
+                _dismiss_action(listing)
+                if listing.status in _MARKETPLACE_DISMISSIBLE_STATUSES
+                else ""
+            )
             actions_html = ""
             if listing.status == MARKETPLACE_STATUS_CLAIMED and listing.claimed_by == kid_id:
                 actions_html = (
@@ -4746,6 +4829,8 @@ def kid_home(
                     "<button type='submit'>Mark completed</button>"
                     "</form>"
                 )
+            elif dismiss_action:
+                actions_html = dismiss_action
             my_claim_rows.append(
                 "<tr>"
                 f"<td data-label='Chore'><b>{html_escape(listing.chore_name)}</b><div class='muted'>From {owner_name}</div></td>"
@@ -6009,6 +6094,38 @@ def kid_marketplace_complete(request: Request, listing_id: int = Form(...)):
     )
 
     return RedirectResponse("/kid?section=marketplace", status_code=302)
+
+
+@app.post("/kid/marketplace/dismiss")
+def kid_marketplace_dismiss(
+    request: Request,
+    listing_id: int = Form(...),
+    redirect: str = Form("/kid?section=marketplace"),
+):
+    if (redirect_resp := require_kid(request)) is not None:
+        return redirect_resp
+    kid_id = kid_authed(request)
+    assert kid_id
+    redirect_target = (redirect or "/kid?section=marketplace").strip()
+    if not redirect_target.startswith("/"):
+        redirect_target = "/kid?section=marketplace"
+    notice_message = "That job board listing can't be dismissed right now."
+    notice_kind = "error"
+    with Session(engine) as session:
+        listing = session.get(MarketplaceListing, listing_id)
+        if (
+            listing
+            and listing.id
+            and listing.status in _MARKETPLACE_DISMISSIBLE_STATUSES
+            and (listing.owner_kid_id == kid_id or listing.claimed_by == kid_id)
+        ):
+            _record_marketplace_dismissal(request, kid_id, int(listing.id))
+            notice_message = "Dismissed that job board listing."
+            notice_kind = "success"
+        elif listing is None:
+            notice_message = "Could not find that job board listing."
+    set_kid_notice(request, notice_message, notice_kind)
+    return RedirectResponse(redirect_target, status_code=303)
 
 
 @app.post("/kid/logout")
