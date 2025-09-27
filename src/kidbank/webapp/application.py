@@ -7901,16 +7901,12 @@ def admin_home(
         if notice_kind == "success" and notice_msg.startswith("Paid "):
             notice_html += (
                 "<script>(function(){try{"
-                "var C=window.AudioContext||window.webkitAudioContext;"
-                "if(C){var ctx=new C();var play=function(){var now=ctx.currentTime;"
-                "var gain=ctx.createGain();gain.gain.setValueAtTime(0.0001,now);"
-                "gain.connect(ctx.destination);var osc=ctx.createOscillator();"
-                "osc.type='triangle';osc.frequency.setValueAtTime(880,now);"
-                "osc.frequency.exponentialRampToValueAtTime(1320,now+0.18);"
-                "osc.connect(gain);gain.gain.exponentialRampToValueAtTime(0.35,now+0.02);"
-                "gain.gain.exponentialRampToValueAtTime(0.0001,now+0.35);"
-                "osc.start(now);osc.stop(now+0.36);};"
-                "if(ctx.state==='suspended'){ctx.resume().then(play).catch(function(){})}else{play();}}"
+                "var url='https://cdn.pixabay.com/download/audio/2025/07/18/audio_f1c1d0ad73.mp3?filename=cash-register-kaching-376867.mp3';"
+                "var audio=window.__kidbankChaChingAudio;"
+                "if(!audio){audio=new Audio(url);audio.preload='auto';audio.volume=0.75;window.__kidbankChaChingAudio=audio;}"
+                "try{if(!audio.paused){audio.pause();}audio.currentTime=0;}catch(seekErr){}"
+                "var playPromise=audio.play();"
+                "if(playPromise&&typeof playPromise.then==='function'){playPromise.catch(function(){});}" 
                 "if(navigator.vibrate){navigator.vibrate([18,60,24]);}"
                 "}catch(e){}})();</script>"
             )
