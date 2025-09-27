@@ -74,6 +74,45 @@ app.add_middleware(
 _time_provider: Callable[[], datetime] = datetime.now
 
 
+PORTFOLIO_STYLE_RULES = """
+.portfolio-modal__card{max-width:1120px;width:calc(100% - 24px);}
+.portfolio-modal__body{padding:12px 4px 20px;}
+.portfolio-summary-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin-bottom:16px;}
+.portfolio-summary-card{background:#f8fafc;border:1px solid #e2e8f0;border-radius:12px;padding:12px;}
+.portfolio-summary-card__label{font-size:13px;color:#475569;text-transform:uppercase;letter-spacing:0.04em;}
+.portfolio-summary-card__value{font-size:22px;font-weight:700;margin-top:4px;}
+.portfolio-summary-card__meta{font-size:13px;color:#64748b;margin-top:4px;}
+.portfolio-section{margin-top:18px;}
+.portfolio-section__header{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:10px;}
+.portfolio-table-wrap{overflow:auto;border-radius:12px;border:1px solid #e2e8f0;box-shadow:0 1px 2px rgba(15,23,42,0.08);}
+.portfolio-table{width:100%;border-collapse:separate;border-spacing:0;min-width:720px;background:#fff;}
+.portfolio-table thead th{position:sticky;top:0;background:#0f172a;color:#f8fafc;text-transform:uppercase;font-size:12px;letter-spacing:0.05em;padding:10px 12px;text-align:left;z-index:1;}
+.portfolio-table tbody td{padding:10px 12px;border-top:1px solid #e2e8f0;font-size:14px;vertical-align:middle;}
+.portfolio-table tbody tr:first-child td{border-top:none;}
+.portfolio-table tbody tr:hover td{background:#f1f5f9;}
+.portfolio-row--gain td{background:rgba(22,163,74,0.08);}
+.portfolio-row--loss td{background:rgba(220,38,38,0.08);}
+.portfolio-row--even td{background:rgba(15,23,42,0.04);}
+.portfolio-table tbody tr:hover.portfolio-row--gain td{background:rgba(22,163,74,0.15);}
+.portfolio-table tbody tr:hover.portfolio-row--loss td{background:rgba(220,38,38,0.15);}
+.portfolio-symbol{font-weight:700;font-size:15px;color:#0f172a;}
+.portfolio-company{color:#475569;font-size:13px;}
+.portfolio-actions{display:flex;flex-direction:column;gap:6px;}
+.portfolio-actions form{display:flex;flex-wrap:wrap;gap:6px;align-items:center;}
+.portfolio-actions input[data-money]{width:110px;}
+.portfolio-list{list-style:none;padding:0;margin:10px 0 0 0;display:flex;flex-direction:column;gap:10px;}
+.portfolio-item{border:1px solid #e2e8f0;border-radius:12px;padding:12px;background:#fff;box-shadow:0 1px 2px rgba(15,23,42,0.08);}
+.portfolio-item__meta{display:flex;flex-wrap:wrap;gap:8px;font-size:13px;color:#475569;margin-top:6px;}
+.portfolio-item__actions{display:flex;flex-wrap:wrap;gap:10px;margin-top:10px;}
+.portfolio-item__actions form{display:flex;flex-wrap:wrap;gap:6px;align-items:center;}
+.portfolio-item__actions input[data-money]{width:110px;}
+.portfolio-modal .pill{background:#0f172a;color:#fff;}
+.portfolio-cd-open select{min-width:150px;}
+.portfolio-page{display:flex;justify-content:center;padding:0 12px 24px;}
+.portfolio-page__card{max-width:1120px;width:100%;}
+"""
+
+
 def now_local() -> datetime:
     """Return naive local time using the configured provider."""
 
@@ -6579,6 +6618,16 @@ def _kid_invest_dashboard_inner(
         nav_links.append("<a href='/kid' class='button-link secondary'>← Back to My Account</a>")
     if not embed:
         nav_links.append("<a href='#portfolio-modal'><button type='button'>View Portfolio</button></a>")
+        portfolio_page_url = _invest_build_url(
+            "/kid/invest/portfolio",
+            {},
+            symbol=instrument_symbol_raw,
+            range=selected_range,
+            chart=chart_mode,
+        )
+        nav_links.append(
+            f"<a href='{portfolio_page_url}'><button type='button'>Open Portfolio Page</button></a>"
+        )
     nav_links_html = ""
     if nav_links:
         nav_links_html = (
@@ -6693,42 +6742,11 @@ def kid_invest_home(
             notice_message=notice_msg,
             notice_kind=notice_kind,
         )
-        invest_styles = """
+        invest_styles = f"""
         <style>
-        body[data-page='kid-invest']{overflow:hidden;}
-        .portfolio-modal__card{max-width:1120px;width:calc(100% - 24px);}
-        .portfolio-modal__body{max-height:70vh;overflow:auto;padding:12px 4px 20px;}
-        .portfolio-summary-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin-bottom:16px;}
-        .portfolio-summary-card{background:#f8fafc;border:1px solid #e2e8f0;border-radius:12px;padding:12px;}
-        .portfolio-summary-card__label{font-size:13px;color:#475569;text-transform:uppercase;letter-spacing:0.04em;}
-        .portfolio-summary-card__value{font-size:22px;font-weight:700;margin-top:4px;}
-        .portfolio-summary-card__meta{font-size:13px;color:#64748b;margin-top:4px;}
-        .portfolio-section{margin-top:18px;}
-        .portfolio-section__header{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:10px;}
-        .portfolio-table-wrap{overflow:auto;border-radius:12px;border:1px solid #e2e8f0;box-shadow:0 1px 2px rgba(15,23,42,0.08);}
-        .portfolio-table{width:100%;border-collapse:separate;border-spacing:0;min-width:720px;background:#fff;}
-        .portfolio-table thead th{position:sticky;top:0;background:#0f172a;color:#f8fafc;text-transform:uppercase;font-size:12px;letter-spacing:0.05em;padding:10px 12px;text-align:left;z-index:1;}
-        .portfolio-table tbody td{padding:10px 12px;border-top:1px solid #e2e8f0;font-size:14px;vertical-align:middle;}
-        .portfolio-table tbody tr:first-child td{border-top:none;}
-        .portfolio-table tbody tr:hover td{background:#f1f5f9;}
-        .portfolio-row--gain td{background:rgba(22,163,74,0.08);}
-        .portfolio-row--loss td{background:rgba(220,38,38,0.08);}
-        .portfolio-row--even td{background:rgba(15,23,42,0.04);}
-        .portfolio-table tbody tr:hover.portfolio-row--gain td{background:rgba(22,163,74,0.15);}
-        .portfolio-table tbody tr:hover.portfolio-row--loss td{background:rgba(220,38,38,0.15);}
-        .portfolio-symbol{font-weight:700;font-size:15px;color:#0f172a;}
-        .portfolio-company{color:#475569;font-size:13px;}
-        .portfolio-actions{display:flex;flex-direction:column;gap:6px;}
-        .portfolio-actions form{display:flex;flex-wrap:wrap;gap:6px;align-items:center;}
-        .portfolio-actions input[data-money]{width:110px;}
-        .portfolio-list{list-style:none;padding:0;margin:10px 0 0 0;display:flex;flex-direction:column;gap:10px;}
-        .portfolio-item{border:1px solid #e2e8f0;border-radius:12px;padding:12px;background:#fff;box-shadow:0 1px 2px rgba(15,23,42,0.08);}
-        .portfolio-item__meta{display:flex;flex-wrap:wrap;gap:8px;font-size:13px;color:#475569;margin-top:6px;}
-        .portfolio-item__actions{display:flex;flex-wrap:wrap;gap:10px;margin-top:10px;}
-        .portfolio-item__actions form{display:flex;flex-wrap:wrap;gap:6px;align-items:center;}
-        .portfolio-item__actions input[data-money]{width:110px;}
-        .portfolio-modal .pill{background:#0f172a;color:#fff;}
-        .portfolio-cd-open select{min-width:150px;}
+        body[data-page='kid-invest']{{overflow:hidden;}}
+        body[data-page='kid-invest'] .portfolio-modal__body{{max-height:70vh;overflow:auto;}}
+        {PORTFOLIO_STYLE_RULES}
         </style>
         """
         body_attrs = f"{body_pref_attrs(request)} data-page='kid-invest'"
@@ -6761,7 +6779,7 @@ def _instrument_portfolio_category(instrument: MarketInstrument) -> str:
     return "Stock"
 
 
-def _build_portfolio_modal_html(
+def _build_portfolio_content_html(
     kid_id: str,
     instruments: Sequence[MarketInstrument],
     certificates: Sequence[Certificate],
@@ -6772,6 +6790,7 @@ def _build_portfolio_modal_html(
     active_symbol: str,
     cd_rates_bps: Mapping[str, int],
     penalty_days_by_term: Mapping[str, int],
+    return_anchor: str,
 ) -> str:
     categories = ["Stock", "Funds", "Crypto"]
     holdings_by_category: Dict[str, List[Tuple[MarketInstrument, Dict[str, Any]]]] = {
@@ -6819,7 +6838,8 @@ def _build_portfolio_modal_html(
             range=selected_range,
             chart=chart_mode,
         )
-        target_url += "#portfolio-modal"
+        if return_anchor:
+            target_url += return_anchor
         return f"<input type='hidden' name='return_to' value='{html_escape(target_url)}'>"
 
     insight_cards: List[str] = []
@@ -7034,6 +7054,33 @@ def _build_portfolio_modal_html(
         + cd_section
     )
 
+    return modal_body
+
+
+def _build_portfolio_modal_html(
+    kid_id: str,
+    instruments: Sequence[MarketInstrument],
+    certificates: Sequence[Certificate],
+    *,
+    link_builder: Callable[..., str],
+    selected_range: str,
+    chart_mode: str,
+    active_symbol: str,
+    cd_rates_bps: Mapping[str, int],
+    penalty_days_by_term: Mapping[str, int],
+) -> str:
+    modal_body = _build_portfolio_content_html(
+        kid_id,
+        instruments,
+        certificates,
+        link_builder=link_builder,
+        selected_range=selected_range,
+        chart_mode=chart_mode,
+        active_symbol=active_symbol,
+        cd_rates_bps=cd_rates_bps,
+        penalty_days_by_term=penalty_days_by_term,
+        return_anchor="#portfolio-modal",
+    )
     return (
         "<div id='portfolio-modal' class='modal-overlay portfolio-modal'>"
         "<div class='modal-card portfolio-modal__card'>"
@@ -7042,6 +7089,99 @@ def _build_portfolio_modal_html(
         + "</div>"
         + "</div>"
     )
+
+
+@app.get("/kid/invest/portfolio", response_class=HTMLResponse)
+def kid_invest_portfolio_page(
+    request: Request,
+    symbol: Optional[str] = Query(None),
+    range_code: str = Query(DEFAULT_PRICE_RANGE, alias="range"),
+    chart_view: str = Query(DEFAULT_CHART_VIEW, alias="chart"),
+) -> HTMLResponse:
+    if (redirect := require_kid(request)) is not None:
+        return redirect
+    kid_id = kid_authed(request)
+    assert kid_id
+    notice_msg, notice_kind = pop_kid_notice(request)
+    instruments = list_market_instruments_for_kid(kid_id)
+    instrument_map = {_normalize_symbol(inst.symbol): inst for inst in instruments}
+    requested_symbol = _normalize_symbol(symbol) if symbol else ""
+    default_symbol = _normalize_symbol(DEFAULT_MARKET_SYMBOL)
+    active_instrument: Optional[MarketInstrument] = None
+    if requested_symbol and requested_symbol in instrument_map:
+        active_instrument = instrument_map[requested_symbol]
+    elif default_symbol in instrument_map:
+        active_instrument = instrument_map[default_symbol]
+    elif instrument_map:
+        active_instrument = next(iter(instrument_map.values()))
+    active_symbol = active_instrument.symbol if active_instrument else DEFAULT_MARKET_SYMBOL
+    selected_range = normalize_history_range(range_code)
+    chart_mode = normalize_chart_view(chart_view)
+    with Session(engine) as session:
+        child = session.exec(select(Child).where(Child.kid_id == kid_id)).first()
+        certificates = session.exec(
+            select(Certificate)
+            .where(Certificate.kid_id == kid_id)
+            .order_by(desc(Certificate.opened_at))
+        ).all()
+        cd_rates_bps = get_all_cd_rate_bps(session)
+        penalty_days_by_term = get_all_cd_penalty_days(session)
+    request_query = request.url.query
+    base_path = request.url.path
+    if request_query:
+        base_path = f"{base_path}?{request_query}"
+    base_url, base_query = _invest_base_config(base_path)
+    link_builder = lambda **params: _invest_build_url(
+        base_url, base_query, **params
+    )
+    portfolio_body = _build_portfolio_content_html(
+        kid_id,
+        instruments,
+        certificates,
+        link_builder=link_builder,
+        selected_range=selected_range,
+        chart_mode=chart_mode,
+        active_symbol=active_symbol,
+        cd_rates_bps=cd_rates_bps,
+        penalty_days_by_term=penalty_days_by_term,
+        return_anchor="",
+    )
+    notice_html = ""
+    if notice_msg:
+        notice_class = "error" if notice_kind == "error" else "success"
+        notice_html = f"<div class='notice {notice_class}'>{html_escape(notice_msg)}</div>"
+    raw_child_name = child.name if child else kid_id
+    child_name = html_escape(raw_child_name)
+    if raw_child_name and raw_child_name[-1].lower() == "s":
+        heading_text = f"{child_name}' Portfolio"
+    else:
+        heading_text = f"{child_name}'s Portfolio"
+    portfolio_styles = f"""
+    <style>
+    body[data-page='kid-portfolio'] .portfolio-modal__body{{max-height:none;overflow:visible;}}
+    body[data-page='kid-portfolio'] .portfolio-page__card{{margin-top:16px;}}
+    {PORTFOLIO_STYLE_RULES}
+    </style>
+    """
+    inner = f"""
+    <div class='topbar'><h3>{heading_text}</h3>
+      <a href='/kid/invest'><button>Back to Investing</button></a>
+    </div>
+    {notice_html}
+    <div class='portfolio-page'>
+      <div class='card portfolio-page__card'>
+        <div class='portfolio-modal__body'>{portfolio_body}</div>
+      </div>
+    </div>
+    """
+    body_attrs = f"{body_pref_attrs(request)} data-page='kid-portfolio'"
+    html = frame(
+        "Investing — Portfolio",
+        inner,
+        head_extra=portfolio_styles,
+        body_attrs=body_attrs,
+    )
+    return HTMLResponse(html)
 
 
 @app.post("/kid/invest/track")
