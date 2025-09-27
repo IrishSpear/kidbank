@@ -80,6 +80,39 @@ def now_local() -> datetime:
     return _time_provider()
 
 
+_TRANSFER_DISMISS_SESSION_KEY = "kid_transfer_dismissals"
+
+
+def _get_dismissed_transfer_ids(request: Request, kid_id: str) -> Set[int]:
+    raw_store = request.session.get(_TRANSFER_DISMISS_SESSION_KEY)
+    if isinstance(raw_store, dict):
+        raw_values = raw_store.get(kid_id)
+        if isinstance(raw_values, list):
+            dismissed: Set[int] = set()
+            for value in raw_values:
+                try:
+                    dismissed.add(int(value))
+                except (TypeError, ValueError):
+                    continue
+            return dismissed
+    return set()
+
+
+def _record_transfer_dismissal(request: Request, kid_id: str, event_id: int) -> None:
+    if event_id <= 0:
+        return
+    raw_store = request.session.get(_TRANSFER_DISMISS_SESSION_KEY)
+    if not isinstance(raw_store, dict):
+        raw_store = {}
+    raw_values = raw_store.get(kid_id)
+    if not isinstance(raw_values, list):
+        raw_values = []
+    if event_id not in raw_values:
+        raw_values.append(event_id)
+    raw_store[kid_id] = raw_values
+    request.session[_TRANSFER_DISMISS_SESSION_KEY] = raw_store
+
+
 def _penalty_event_reason(chore_id: int, target_day: date) -> str:
     return f"chore_penalty_missed:{chore_id}:{target_day.isoformat()}"
 
@@ -93,7 +126,9 @@ def format_event_reason(
     """Return a human-friendly description for an event reason."""
 
     raw_reason = event.reason or ""
-    match = _PENALTY_REASON_PATTERN.match(raw_reason)
+    base_reason, *meta_parts = raw_reason.split("|")
+    base_reason = base_reason.strip()
+    match = _PENALTY_REASON_PATTERN.match(base_reason)
     if match:
         chore_id = int(match.group(1))
         day_iso = match.group(2)
@@ -109,7 +144,21 @@ def format_event_reason(
         except ValueError:
             day_label = day_iso
         return f"Missed chore penalty for {chore_label} on {day_label}"
-    return raw_reason
+    formatted = base_reason
+    extras: List[str] = []
+    for part in meta_parts:
+        key, _, value = part.partition(":")
+        key = key.strip().lower()
+        value = value.strip()
+        if key == "approved_by" and value:
+            extras.append(f"Approved by {value}")
+        elif part.strip():
+            extras.append(part.strip())
+    if extras and formatted:
+        formatted = f"{formatted} — {'; '.join(extras)}"
+    elif extras:
+        formatted = "; ".join(extras)
+    return formatted or raw_reason
 
 
 def _chore_due_on_day(chore: Chore, day: date) -> bool:
@@ -668,7 +717,7 @@ def base_styles() -> str:
         --good:#16a34a; --bad:#dc2626; --text:#e5e7eb;
       }
       @media (prefers-color-scheme: light){
-        :root{ --bg:#f7fafc; --card:#ffffff; --muted:#64748b; --accent:#2563eb; --text:#0f172a; }
+    :root{ --bg:#f7fafc; --card:#ffffff; --muted:#000000; --accent:#2563eb; --text:#0f172a; }
       }
       html, body { overflow-x: hidden; }
       th, td, button, a, input { overflow-wrap:anywhere; word-break:break-word; }
@@ -703,8 +752,9 @@ def base_styles() -> str:
       }
       input,textarea,select{
         width:100%; padding:12px; border:1px solid #2b3545; border-radius:10px;
-        background:transparent; color:var(--text); box-sizing:border-box; font-size:16px;
+        background:#ffffff; color:#000000 !important; box-sizing:border-box; font-size:16px;
       }
+      select, select option{color:#000000;}
       input[type=checkbox], input[type=radio]{
         width:auto; min-width:0; padding:0; margin:0 6px 0 0;
       }
@@ -782,6 +832,24 @@ def base_styles() -> str:
       .chore-item__meta{font-size:13px;}
       .chore-item__schedule{font-size:12px; margin-top:4px;}
       .chore-item__action{display:flex; align-items:center;}
+      .chore-card-list{display:flex; flex-direction:column; gap:16px;}
+      .chore-card{background:rgba(148,163,184,0.12); border-radius:12px; padding:16px; display:flex; flex-direction:column; gap:16px;}
+      .chore-card__grid{display:grid; grid-template-columns:repeat(auto-fit,minmax(200px,1fr)); gap:16px;}
+      .chore-card__field{display:flex; flex-direction:column; gap:6px;}
+      .chore-card__field label{font-size:13px; font-weight:600; color:var(--muted);}
+      .chore-card__field--wide{grid-column:1/-1;}
+      .chore-card__footer{display:flex; justify-content:space-between; align-items:flex-end; flex-wrap:wrap; gap:12px;}
+      .chore-card__status{display:flex; align-items:center; gap:8px; font-weight:600;}
+      .status-dot{display:inline-block; width:14px; height:14px; border-radius:999px;}
+      .status-dot--active{background:#16a34a; box-shadow:0 0 0 2px rgba(22,163,74,0.3);}
+      .status-dot--inactive{background:#dc2626; box-shadow:0 0 0 2px rgba(220,38,38,0.3);}
+      .transfer-alerts{display:flex; flex-direction:column; gap:12px; margin-top:12px;}
+      .transfer-alert{display:flex; gap:12px; flex-wrap:wrap; align-items:flex-start; justify-content:space-between; padding:14px; border-radius:12px; background:#ecfdf5; border:1px solid #34d399;}
+      .transfer-alert__info{flex:1; min-width:220px;}
+      .transfer-alert__meta{font-size:13px; color:var(--muted); margin-top:4px;}
+      .transfer-alert__actions{display:flex; align-items:center; gap:8px;}
+      .transfer-alert__dismiss{background:rgba(16,185,129,0.12); color:#047857; border:none; border-radius:8px; padding:8px 12px; font-weight:600; cursor:pointer;}
+      .transfer-alert__dismiss:hover{filter:brightness(1.05);}
       .chore-table .chore-schedule{display:flex; flex-direction:column; gap:8px;}
       .chore-schedule__dates{display:flex; flex-wrap:wrap; gap:8px;}
       .chore-schedule__dates input{flex:1 1 140px; min-width:140px;}
@@ -1330,7 +1398,8 @@ def list_chore_instances_for_kid(
                     (
                         i
                         for i in insts
-                        if i.status in {"available", "pending", CHORE_STATUS_PENDING_MARKETPLACE}
+                        if i.status
+                        in {"available", "pending", CHORE_STATUS_PENDING_MARKETPLACE, "paid"}
                     ),
                     None,
                 )
@@ -3271,6 +3340,15 @@ def kid_home(
         for chore, inst in chores:
             status = (inst.status if inst else "available") or "available"
             status_class, status_text = status_lookup.get(status, ("available", status.title()))
+            is_special_once = is_one_time_special(chore)
+            special_note_html = ""
+            if (
+                is_special_once
+                and is_selected_today
+                and status
+                in {"pending", CHORE_STATUS_PENDING_MARKETPLACE}
+            ):
+                special_note_html = "<div class='muted chore-item__schedule'>Available again tomorrow.</div>"
             if is_selected_today and status == "available":
                 action_html = (
                     f"<form class='inline' method='post' action='/kid/checkoff'>"
@@ -3278,9 +3356,9 @@ def kid_home(
                     "<button type='submit'>Mark complete</button></form>"
                 )
             elif is_selected_today and status in {"pending", CHORE_STATUS_PENDING_MARKETPLACE}:
-                action_html = "<span class='pill status-pending'>Awaiting review</span>"
+                action_html = "<span class='pill status-pending'>Awaiting review</span>" + special_note_html
             elif is_selected_today and status == "paid":
-                action_html = "<span class='pill status-paid'>Completed</span>"
+                action_html = "<span class='pill status-paid'>Completed</span>" + special_note_html
             else:
                 action_html = f"<span class='pill status-{status_class}'>{status_text}</span>"
             schedule_bits: List[str] = []
@@ -3299,6 +3377,8 @@ def kid_home(
             month_days = chore_specific_month_days(chore)
             if month_days:
                 schedule_bits.append(f"Month days: {format_month_days(month_days)}")
+            if getattr(chore, "marketplace_blocked", False):
+                schedule_bits.append("Marketplace listing disabled")
             schedule_line = (
                 f"<div class='muted chore-item__schedule'>{' • '.join(schedule_bits)}</div>"
                 if schedule_bits
@@ -3807,6 +3887,83 @@ def kid_home(
           {''.join(request_blocks)}
         </div>
         """
+        dismissed_transfer_ids = _get_dismissed_transfer_ids(request, kid_id)
+        transfer_notice_card = ""
+        transfer_notices: List[Dict[str, Any]] = []
+        transfer_cutoff = moment - timedelta(days=2)
+        for event in events:
+            if event.change_cents <= 0 or not event.timestamp or not event.id:
+                continue
+            if event.timestamp < transfer_cutoff:
+                continue
+            if event.id in dismissed_transfer_ids:
+                continue
+            reason_text = (event.reason or "").strip()
+            sender_name = ""
+            note_text = ""
+            if reason_text.startswith("Received from "):
+                rest = reason_text[len("Received from ") :]
+                sender_name, _, remainder = rest.partition(":")
+                sender_name = sender_name.strip()
+                note_text = remainder.strip()
+            elif reason_text.startswith("Request accepted by "):
+                rest = reason_text[len("Request accepted by ") :]
+                sender_name, _, remainder = rest.partition(":")
+                sender_name = sender_name.strip()
+                amount_and_note = remainder.strip()
+                _, _, note_part = amount_and_note.partition("—")
+                note_text = note_part.strip()
+            else:
+                continue
+            if not sender_name:
+                continue
+            transfer_notices.append(
+                {
+                    "event": event,
+                    "sender": sender_name,
+                    "note": note_text,
+                }
+            )
+            if len(transfer_notices) >= 3:
+                break
+        if transfer_notices:
+            blocks: List[str] = []
+            redirect_target = html_escape("/kid?section=overview")
+            for info in transfer_notices:
+                event = info["event"]
+                sender = html_escape(info["sender"])
+                amount_text = usd(event.change_cents)
+                detail_line = ""
+                note_text = (info.get("note") or "").strip()
+                if note_text:
+                    detail_line = (
+                        "<div class='transfer-alert__meta'>Why: "
+                        + html_escape(note_text)
+                        + "</div>"
+                    )
+                received_label = event.timestamp.strftime("%Y-%m-%d %H:%M")
+                blocks.append(
+                    "<div class='transfer-alert'>"
+                    + "<div class='transfer-alert__info'>"
+                    + f"<div><b>{sender}</b> sent you {amount_text}</div>"
+                    + detail_line
+                    + f"<div class='transfer-alert__meta'>Received {received_label}</div>"
+                    + "</div>"
+                    + "<form method='post' action='/kid/transfer_notice/dismiss' class='transfer-alert__actions'>"
+                    + f"<input type='hidden' name='event_id' value='{event.id}'>"
+                    + f"<input type='hidden' name='redirect' value='{redirect_target}'>"
+                    + "<button type='submit' class='transfer-alert__dismiss'>Dismiss</button>"
+                    + "</form>"
+                    + "</div>"
+                )
+            transfer_notice_card = (
+                "<div class='card'>"
+                "<h3>Money received</h3>"
+                "<div class='muted'>Recent transfers from other kids.</div>"
+                + "<div class='transfer-alerts'>"
+                + "".join(blocks)
+                + "</div></div>"
+            )
         money_card = f"""
           <div class='card'>
             <h3>Send/Request <a href='#modal-money-help' class='help-icon' aria-label='How sending and requesting works'>?</a></h3>
@@ -4108,10 +4265,18 @@ def kid_home(
             </div>
           </div>
         """
-        overview_content = hero_html + overview_quick_html + money_insights_html + investing_overview_html + highlights_card
+        overview_content = (
+            hero_html
+            + (transfer_notice_card or "")
+            + overview_quick_html
+            + money_insights_html
+            + investing_overview_html
+            + highlights_card
+        )
         goals_content = f"""
           <div class='card'>
             <h3>My Goals <a href='#modal-goal-tips' class='help-icon' aria-label='Goal tips'>?</a></h3>
+            <div style='margin:6px 0 12px 0;'>Current balance: <b>{usd(child.balance_cents)}</b></div>
             <form method='post' action='/kid/goal_create' class='inline'>
               <input name='name' placeholder='e.g. Lego set' required>
               <input name='target' type='text' data-money placeholder='target $' required>
@@ -4150,6 +4315,8 @@ def kid_home(
         listing_options: List[str] = []
         for chore_obj, _ in chores_today:
             if not chore_obj.id or chore_obj.id in active_listing_chore_ids:
+                continue
+            if getattr(chore_obj, "marketplace_blocked", False):
                 continue
             option_label = html_escape(chore_obj.name)
             award_line = usd(chore_obj.award_cents)
@@ -4344,7 +4511,10 @@ def kid_home(
             <table><tr><th>Chore</th><th>You'll earn</th><th>Status</th><th>Actions</th></tr>{my_claims_table}</table>
           </div>
         """
-        money_content = (notifications_html if notifications_html else "") + money_card
+        money_content = (
+            (notifications_html if notifications_html else "")
+            + money_card
+        )
         pref_controls = preference_controls_html(request)
         settings_content = (
             "<div class='card'>"
@@ -4481,6 +4651,24 @@ def kid_home(
         </div>
         """
         return render_page(request, "Kid — Error", body)
+
+
+@app.post("/kid/transfer_notice/dismiss")
+def kid_transfer_notice_dismiss(
+    request: Request,
+    event_id: int = Form(...),
+    redirect: str = Form("/kid"),
+):
+    if (redirect_resp := require_kid(request)) is not None:
+        return redirect_resp
+    kid_id = kid_authed(request)
+    assert kid_id
+    if event_id:
+        _record_transfer_dismissal(request, kid_id, int(event_id))
+    redirect_target = (redirect or "/kid").strip()
+    if not redirect_target.startswith("/"):
+        redirect_target = "/kid"
+    return RedirectResponse(redirect_target, status_code=303)
 
 
 @app.get("/kid/lesson/{lesson_id}", response_class=HTMLResponse)
@@ -5300,6 +5488,9 @@ def kid_marketplace_list(
         if not chore.active or not is_chore_in_window(chore, today):
             set_kid_notice(request, "That chore isn't available to list today.", "error")
             return RedirectResponse("/kid?section=marketplace", status_code=302)
+        if getattr(chore, "marketplace_blocked", False):
+            set_kid_notice(request, "That chore can't be listed in the marketplace.", "error")
+            return RedirectResponse("/kid?section=marketplace", status_code=302)
         listed_chore_name = chore.name
         existing_listing = _safe_marketplace_first(
             session,
@@ -5744,6 +5935,7 @@ def _kid_invest_dashboard_inner(
     tabs_html = ""
     if len(instruments) > 1:
         links: List[str] = []
+        chart_anchor = "invest-chart"
         for inst in instruments:
             normalized = _normalize_symbol(inst.symbol)
             active_style = (
@@ -5756,6 +5948,7 @@ def _kid_invest_dashboard_inner(
                 range=selected_range,
                 chart=chart_mode,
             )
+            tab_url += f"#{chart_anchor}"
             links.append(
                 f"<a href='{tab_url}' class='pill' style='margin-right:6px;{active_style}'>"
                 f"{html_escape(inst.name or inst.symbol)}</a>"
@@ -5763,6 +5956,7 @@ def _kid_invest_dashboard_inner(
         tabs_html = "<div class='muted' style='margin-bottom:8px;'>Markets: " + "".join(links) + "</div>"
 
     range_links: List[str] = []
+    chart_anchor = "invest-chart"
     for code, cfg in PRICE_HISTORY_RANGES.items():
         label = cfg.get("label", code)
         active_style = (
@@ -5775,6 +5969,7 @@ def _kid_invest_dashboard_inner(
             range=code,
             chart=chart_mode,
         )
+        range_url += f"#{chart_anchor}"
         range_links.append(
             f"<a href='{range_url}' class='pill' style='margin-right:6px;{active_style}'>{label}</a>"
         )
@@ -5783,12 +5978,12 @@ def _kid_invest_dashboard_inner(
         symbol=active_instrument.symbol,
         range=selected_range,
         chart=CHART_VIEW_COMPACT,
-    )
+    ) + f"#{chart_anchor}"
     detail_url = link_url(
         symbol=active_instrument.symbol,
         range=selected_range,
         chart=CHART_VIEW_DETAIL,
-    )
+    ) + f"#{chart_anchor}"
     chart_toggle_html = (
         "<div class='chart-toggle'>Chart: "
         + f"<a href='{compact_url}' class='{'active' if chart_mode == CHART_VIEW_COMPACT else ''}'>Compact</a>"
@@ -5889,7 +6084,7 @@ def _kid_invest_dashboard_inner(
           <div class='muted'>{instrument_symbol} • {kind_label}</div>
           <div style='margin-bottom:12px;'><b>Available Balance:</b> {usd(balance_c)}</div>
           <div class='grid investing-grid'>
-            <div class='card investing-chart-card'>
+            <div class='card investing-chart-card' id='invest-chart'>
               <div><b>Current Price</b></div>
               <div style='font-size:28px; font-weight:800; margin-top:6px;'>{usd(metrics['price_c'])}</div>
               <div class='muted'>{unit_label}</div>
@@ -8211,6 +8406,7 @@ def admin_home(
         "<div class='chore-schedule-selector chore-schedule-selector--special' data-schedule-group='special' style='display:none;'><label>Specific dates (comma separated)</label><input name='specific_dates' placeholder='YYYY-MM-DD,YYYY-MM-DD'></div>"
         "</div>"
         "<label>Notes</label><input name='notes' placeholder='Any details'>"
+        "<label style='display:flex; align-items:center; gap:6px; margin-top:6px;'><input type='checkbox' name='block_marketplace' value='1'> Prevent marketplace listing</label>"
         "<p class='muted'>Global chores appear for all kids under “Free-for-all”. Use max claimants to set how many kids can share the reward per period.</p>"
         "<button type='submit'>Add Chore</button>"
         "</form>"
@@ -8447,6 +8643,7 @@ def admin_manage_chores(request: Request, kid_id: str = Query(...)):
         penalty_cents = getattr(chore, "penalty_cents", 0) or 0
         penalty_checked = " checked" if penalty_cents > 0 else ""
         penalty_value = dollars_value(penalty_cents)
+        marketplace_checked = " checked" if getattr(chore, "marketplace_blocked", False) else ""
         action_items = [f"<button type='submit' form='{form_id}'>Save</button>"]
         if not is_global_chore:
             action_items.append(
@@ -8474,22 +8671,35 @@ def admin_manage_chores(request: Request, kid_id: str = Query(...)):
             "</form>"
         )
         action_html = "<div class='chore-row__actions'>" + "".join(action_items) + "</div>"
-        rows_parts.append(
-            "<tr>"
-            f"<td data-label='Name'><form id='{form_id}' method='post' action='/admin/chores/update'></form>"
-            f"<input type='hidden' name='chore_id' value='{chore.id}' form='{form_id}'>"
-            f"<input name='name' value='{name_value}' form='{form_id}'></td>"
-            f"<td data-label='Type'><select name='type' form='{form_id}' class='chore-type-select' data-schedule-root='{schedule_id}'>{type_select}</select></td>"
-            f"<td data-label='Award ($)' class='right'><input name='award' type='text' data-money value='{dollars_value(chore.award_cents)}' form='{form_id}' class='chore-field--compact'></td>"
-            f"<td data-label='Penalty ($)' class='right'><div style='display:flex; align-items:center; justify-content:flex-end; gap:6px;'><label style='display:flex; align-items:center; gap:4px; font-weight:400;'><input type='checkbox' name='penalty_enabled' value='1'{penalty_checked} form='{form_id}'> Apply</label><input name='penalty_amount' type='text' data-money value='{penalty_value}' form='{form_id}' class='chore-field--compact'></div></td>"
-            f"<td data-label='Max Spots'><input name='max_claimants' type='number' min='1' value='{max(1, chore.max_claimants)}' form='{form_id}' class='chore-field--compact'></td>"
-            f"<td data-label='Schedule'>{schedule_html}</td>"
-            f"<td data-label='Notes'><input name='notes' value='{notes_value}' form='{form_id}'></td>"
-            f"<td data-label='Status'><span class='pill'>{'Active' if chore.active else 'Inactive'}</span></td>"
-            f"<td data-label='Actions' class='right'>{action_html}</td>"
-            "</tr>"
+        status_label = "Active" if chore.active else "Inactive"
+        status_indicator = (
+            "<span class='status-dot status-dot--active' title='Active' aria-label='Active'></span>"
+            if chore.active
+            else "<span class='status-dot status-dot--inactive' title='Inactive' aria-label='Inactive'></span>"
         )
-    rows = "".join(rows_parts) or "<tr><td colspan='9' class='muted'>(no chores yet)</td></tr>"
+        rows_parts.append(
+            "<div class='chore-card'>"
+            f"<form id='{form_id}' method='post' action='/admin/chores/update'></form>"
+            f"<input type='hidden' name='chore_id' value='{chore.id}' form='{form_id}'>"
+            "<div class='chore-card__grid'>"
+            f"<div class='chore-card__field'><label>Name</label><input name='name' value='{name_value}' form='{form_id}'></div>"
+            f"<div class='chore-card__field'><label>Type</label><select name='type' form='{form_id}' class='chore-type-select' data-schedule-root='{schedule_id}'>{type_select}</select></div>"
+            f"<div class='chore-card__field'><label>Award ($)</label><input name='award' type='text' data-money value='{dollars_value(chore.award_cents)}' form='{form_id}'></div>"
+            "<div class='chore-card__field'><label>Penalty ($)</label>"
+            f"<div style='display:flex; align-items:center; gap:8px; flex-wrap:wrap;'><label style='display:flex; align-items:center; gap:4px; font-weight:400;'><input type='checkbox' name='penalty_enabled' value='1'{penalty_checked} form='{form_id}'> Apply</label><input name='penalty_amount' type='text' data-money value='{penalty_value}' form='{form_id}' class='chore-field--compact'></div>"
+            "</div>"
+            f"<div class='chore-card__field'><label>Max spots</label><input name='max_claimants' type='number' min='1' value='{max(1, chore.max_claimants)}' form='{form_id}'></div>"
+            f"<div class='chore-card__field'><label>Marketplace</label><div style='display:flex; align-items:center; gap:8px; font-weight:400;'><input type='checkbox' name='block_marketplace' value='1'{marketplace_checked} form='{form_id}' id='marketplace-{chore.id}'><label for='marketplace-{chore.id}' style='margin:0;'>Block listing</label></div></div>"
+            f"<div class='chore-card__field chore-card__field--wide'><label>Schedule</label>{schedule_html}</div>"
+            f"<div class='chore-card__field chore-card__field--wide'><label>Notes</label><textarea name='notes' form='{form_id}' rows='2'>{notes_value}</textarea></div>"
+            "</div>"
+            "<div class='chore-card__footer'>"
+            f"<div class='chore-card__status'>{status_indicator}<span>{status_label}</span></div>"
+            f"{action_html}"
+            "</div>"
+            "</div>"
+        )
+    rows = "".join(rows_parts) or "<div class='muted chore-empty'>No chores yet.</div>"
     if is_global:
         heading = "Manage Global Chores"
         badge = f"<span class='pill' style='margin-left:8px;'>{GLOBAL_CHORE_KID_ID}</span>"
@@ -8500,10 +8710,9 @@ def admin_manage_chores(request: Request, kid_id: str = Query(...)):
         note_html = "<p class='muted' style='margin-top:6px;'>“Make Available Now” republishes the chore for the current period (within its active window).</p>"
     chores_table = f"""
     <div class='card'>
-      <table class='chore-table'>
-        <tr><th>Name</th><th>Type</th><th>Award ($)</th><th>Penalty ($)</th><th>Max Spots</th><th>Schedule</th><th>Notes</th><th>Status</th><th>Actions</th></tr>
+      <div class='chore-card-list'>
         {rows}
-      </table>
+      </div>
       {note_html}
     </div>
     """
@@ -8631,6 +8840,7 @@ def admin_chore_create(
     weekdays: List[str] = Form([]),
     specific_dates: str = Form(""),
     specific_month_days: str = Form(""),
+    block_marketplace: Optional[str] = Form(None),
 ):
     if (
         redirect := require_admin_permission(
@@ -8665,6 +8875,7 @@ def admin_chore_create(
         dates_csv = None
     if normalized_type != "monthly":
         month_days_csv = None
+    prevent_marketplace = bool(block_marketplace)
     kid_label = "Free-for-all" if kid_value == GLOBAL_CHORE_KID_ID else kid_value or "Unknown"
     with Session(engine) as session:
         if kid_value and kid_value != GLOBAL_CHORE_KID_ID:
@@ -8684,6 +8895,7 @@ def admin_chore_create(
             weekdays=weekday_csv,
             specific_dates=dates_csv,
             specific_month_days=month_days_csv,
+            marketplace_blocked=prevent_marketplace,
         )
         session.add(chore)
         session.commit()
@@ -8711,6 +8923,7 @@ def admin_chore_update(
     weekdays: List[str] = Form([]),
     specific_dates: str = Form(""),
     specific_month_days: str = Form(""),
+    block_marketplace: Optional[str] = Form(None),
 ):
     if (
         redirect := require_admin_permission(
@@ -8760,6 +8973,7 @@ def admin_chore_update(
         chore.weekdays = weekday_csv
         chore.specific_dates = dates_csv
         chore.specific_month_days = month_days_csv
+        chore.marketplace_blocked = bool(block_marketplace)
         session.add(chore)
         session.commit()
     return RedirectResponse(f"/admin/chores?kid_id={target_kid}", status_code=302)
@@ -10067,6 +10281,7 @@ def admin_chore_payout(
     child_name = ""
     chore_name = ""
     payout_c = 0
+    actor_label = (admin_role(request) or "guardian").strip() or "guardian"
     with Session(engine) as session:
         instance = session.get(ChoreInstance, instance_id)
         if not instance or instance.status != "pending":
@@ -10104,6 +10319,7 @@ def admin_chore_payout(
         _update_gamification(child, payout_c)
         reason_clean = (reason or "").strip()
         reason_text = f"chore:{chore.name}" + (f" ({reason_clean})" if reason_clean else "")
+        reason_text += f"|approved_by:{actor_label}"
         event = Event(child_id=child.kid_id, change_cents=payout_c, reason=reason_text)
         session.add(event)
         session.add(child)
@@ -10111,9 +10327,6 @@ def admin_chore_payout(
         instance.status = "paid"
         instance.paid_event_id = event.id
         session.add(instance)
-        if is_one_time_special(chore):
-            chore.active = False
-            session.add(chore)
         session.commit()
         child_name = child.name
         chore_name = chore.name
@@ -10143,7 +10356,7 @@ def admin_marketplace_payout(
         )
     ) is not None:
         return auth_redirect
-    actor = admin_role(request) or "guardian"
+    actor = (admin_role(request) or "guardian").strip() or "guardian"
     with Session(engine) as session:
         listing = session.get(MarketplaceListing, listing_id)
         if not listing or listing.status != MARKETPLACE_STATUS_SUBMITTED:
@@ -10209,6 +10422,7 @@ def admin_marketplace_payout(
             payout_reason = f"Marketplace payout: {listing.chore_name}"
             if note_clean:
                 payout_reason += f" ({note_clean})"
+            payout_reason += f"|approved_by:{actor}"
             payout_event = Event(
                 child_id=worker.kid_id,
                 change_cents=final_total_c,
