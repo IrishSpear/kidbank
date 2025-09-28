@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal, ROUND_HALF_UP
 from datetime import date, datetime, timedelta
 from html import escape as html_escape
+from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Literal, Mapping, Optional, Sequence, Set, Tuple
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode, parse_qsl
@@ -31,6 +32,7 @@ from urllib.request import Request as URLRequest, urlopen
 
 from fastapi import FastAPI, Form, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse, JSONResponse, Response
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy import and_, delete, inspect, or_
 from sqlmodel import Session, desc, select
 from starlette.middleware.sessions import SessionMiddleware
@@ -69,6 +71,11 @@ app.add_middleware(
     same_site="lax",
     max_age=None,
 )
+
+
+_STATIC_DIR = Path(__file__).resolve().parent / "static"
+_STATIC_DIR.mkdir(parents=True, exist_ok=True)
+app.mount("/static", StaticFiles(directory=_STATIC_DIR), name="static")
 
 
 _time_provider: Callable[[], datetime] = datetime.now
@@ -112,7 +119,11 @@ PORTFOLIO_STYLE_RULES = """
 .portfolio-page__card{max-width:1120px;width:100%;}
 """
 
-CHA_CHING_AUDIO_DATA_URI = (
+CHA_CHING_AUDIO_FILENAME = "cash-register-kaching-376867.mp3"
+# Drop the MP3 with this filename into `_STATIC_DIR` to override the fallback audio data URI.
+
+
+CHA_CHING_AUDIO_FALLBACK_DATA_URI = (
     "data:audio/mpeg;base64,//vQZAAGxwBuqIn4fIJqrIUiPOVuZMW4yqzrDkGstFrIxp7gBFQqJUqpUqI6SXCUCCCbnYpWZxdu"
     "EeeZzZE+XQaYVRMEOYgDaxK4jkrTiHgMQt64ezvG9dKk8FG8xK3Ik0isHQQs/GuFKvKVHINGM7hP"
     "FcllHqNWZ+6fNozgr04izYJiJsE4BYCRk8Sa8uVMhqbS6oj1akyUQhIWYDWDcH2mFK+exok29b1a"
@@ -732,10 +743,18 @@ CHA_CHING_AUDIO_DATA_URI = (
 )
 
 
+def _cha_ching_audio_url() -> str:
+    audio_path = _STATIC_DIR / CHA_CHING_AUDIO_FILENAME
+    if audio_path.exists():
+        return f"/static/{CHA_CHING_AUDIO_FILENAME}"
+    return CHA_CHING_AUDIO_FALLBACK_DATA_URI
+
+
 def _payout_celebration_script() -> str:
+    audio_url = _cha_ching_audio_url().replace("'", "\\'")
     return (
-        "<script>(function(){try;"
-        f"var url='{CHA_CHING_AUDIO_DATA_URI}';"
+        "<script>(function(){try{"
+        f"var url='{audio_url}';"
         "var audio=window.__kidbankChaChingAudio;"
         "if(!audio){audio=new Audio(url);audio.preload='auto';audio.volume=0.75;window.__kidbankChaChingAudio=audio;}"
         "try{if(!audio.paused){audio.pause();}audio.currentTime=0;}catch(seekErr){}"
