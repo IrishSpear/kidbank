@@ -751,18 +751,37 @@ def _cha_ching_audio_url() -> str:
 
 
 def _payout_celebration_script() -> str:
-    audio_url = _cha_ching_audio_url().replace("'", "\\'")
-    return (
-        "<script>(function(){try{"
-        f"var url='{audio_url}';"
-        "var audio=window.__kidbankChaChingAudio;"
-        "if(!audio){audio=new Audio(url);audio.preload='auto';audio.volume=0.75;window.__kidbankChaChingAudio=audio;}"
-        "try{if(!audio.paused){audio.pause();}audio.currentTime=0;}catch(seekErr){}"
-        "var playPromise=audio.play();"
-        "if(playPromise&&typeof playPromise.then==='function'){playPromise.catch(function(){});}"
-        "if(navigator.vibrate){navigator.vibrate([18,60,24]);}"
-        "}catch(e){}})();</script>"
-    )
+    audio_url = _cha_ching_audio_url().replace("'", "\'")
+    script_parts = [
+        "<script>(function(){try{",
+        f"var url='{audio_url}';",
+        "var audio=window.__kidbankChaChingAudio;",
+        "if(!audio){audio=new Audio(url);audio.preload='auto';audio.volume=0.75;window.__kidbankChaChingAudio=audio;}",
+        "if(!window.__kidbankChaChingUnlockSetup){",
+        "window.__kidbankChaChingUnlockSetup=true;",
+        "var unlock=function(){",
+        "if(window.__kidbankChaChingUnlocked){document.removeEventListener('touchstart',unlock);document.removeEventListener('click',unlock);return;}",
+        "var testAudio=window.__kidbankChaChingAudio;",
+        "if(!testAudio){return;}",
+        "var unlockPromise=testAudio.play();",
+        "if(unlockPromise&&typeof unlockPromise.then==='function'){",
+        "unlockPromise.then(function(){try{testAudio.pause();testAudio.currentTime=0;}catch(resetErr){}window.__kidbankChaChingUnlocked=true;}).catch(function(){});",
+        "}else{",
+        "window.__kidbankChaChingUnlocked=true;",
+        "}",
+        "if(window.__kidbankChaChingUnlocked){document.removeEventListener('touchstart',unlock);document.removeEventListener('click',unlock);}",
+        "};",
+        "window.__kidbankChaChingUnlock=unlock;",
+        "document.addEventListener('touchstart',unlock,{passive:true});",
+        "document.addEventListener('click',unlock);",
+        "}",
+        "try{if(!audio.paused){audio.pause();}audio.currentTime=0;}catch(seekErr){}",
+        "var playPromise=audio.play();",
+        "if(playPromise&&typeof playPromise.then==='function'){playPromise.then(function(){window.__kidbankChaChingUnlocked=true;}).catch(function(){});}",
+        "if(navigator.vibrate){navigator.vibrate([18,60,24]);}",
+        "}catch(e){}})();</script>",
+    ]
+    return "".join(script_parts)
 
 
 def _should_play_payout_sound(message: Optional[str], kind: str) -> bool:
